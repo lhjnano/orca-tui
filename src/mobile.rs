@@ -431,4 +431,162 @@ mod tests {
             "None branch must serialize to null"
         );
     }
+
+    // ---- WebSocket integration tests for `serve` ----
+    //
+    // These drive the real `serve` server over a real loopback TCP socket with
+    // a real `tokio_tungstenite` client. Every await is bounded by an explicit
+    // `tokio::time::timeout` so a bug can never hang the suite. The crate is a
+    // library (see `src/lib.rs`: `pub mod mobile;`), so these tests reach
+    // `serve`/`AgentSnapshot`/`Message` unqualified via `use super::*`.
+
+    use futures_util::StreamExt;
+    use std::time::Duration;
+    use tokio_tungstenite::connect_async;
+
+    /// Bind an ephemeral loopback port, read its address, then drop the listener
+    /// so `serve` can rebind it.
+    ///
+    /// There is a tiny window between the drop and `serve`'s rebind where
+    /// another process could in theory grab the port; in practice that never
+    /// happens on the loopback test runner and keeps the test dependency-free
+    /// (no port-allocator helper).
+    async fn bind_ephemeral() -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral listener");
+        let addr = listener.local_addr().expect("read ephemeral local_addr");
+        drop(listener);
+        addr
+    }
+
+    #[tokio::test]
+    async fn serve_broadcasts_snapshots_to_authorized_client() {
+        let (tx, rx) = mpsc::unbounded_channel::<Vec<AgentSnapshot>>();
+        let token = "testtoken123".to_string();
+        let addr = bind_ephemeral().await;
+
+        // Spawn the server. `serve` returns Ok(()) only once `tx` is dropped
+        // (graceful shutdown), which we trigger at the end of the test.
+        // `addr` is `Copy` so it survives the `async move`; `token` is not, so
+        // we hand the server its own owned clone and keep `token` for the URL.
+        let server_token = token.clone();
+        let handle = tokio::spawn(async move { serve(addr, server_token, rx).await });
+
+        // Publish a snapshot BEFORE connecting so `serve`'s `latest` is
+        // populated and the very first push to the client is the real data.
+        tx.send(vec![AgentSnapshot {
+            name: "claude".into(),
+            state: "Running".into(),
+            branch: None,
+        }])
+        .expect("publish initial snapshot");
+        // Yield a beat so `serve`'s select loop stores the snapshot as `latest`
+        // before the client's handshake races it.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Connect an authorized WS client. Bounded by a timeout so a broken
+        // server fails the test instead of hanging it.
+        let url = format!("ws://{addr}/?token={token}");
+        let (mut ws, _resp) = tokio::time::timeout(Duration::from_secs(2), connect_async(url))
+            .await
+            .expect("client connect timed out")
+            .expect("client connect succeeded");
+
+        // The first message must be the initial snapshot push (Text JSON).
+        // `ws.next()` yields `Option<Result<Message, Error>>`, so we unwrap
+        // the timeout, the Option, and the Result in turn.
+        let msg = tokio::time::timeout(Duration::from_secs(2), ws.next())
+            .await
+            .expect("receiving first message timed out")
+            .expect("stream produced a message before closing")
+            .expect("ws read must not error");
+        let parsed: Vec<AgentSnapshot> = match msg {
+            Message::Text(t) => serde_json::from_str(&t).expect("snapshot JSON parses"),
+            other => panic!("expected a Text snapshot, got {other:?}"),
+        };
+        assert_eq!(parsed.len(), 1, "exactly one snapshot was published");
+        assert_eq!(parsed[0].name, "claude");
+        assert_eq!(parsed[0].state, "Running");
+        assert!(
+            parsed[0].branch.is_none(),
+            "branch was None on the wire, must round-trip as None"
+        );
+
+        // Clean shutdown: drop the client + producer so `serve` returns Ok(()).
+        drop(ws);
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("serve must shut down promptly after the producer drops")
+            .expect("serve task must not panic")
+            .expect("serve must return Ok(()) on graceful shutdown");
+    }
+
+    #[tokio::test]
+    async fn serve_rejects_unauthorized_client() {
+        let (tx, rx) = mpsc::unbounded_channel::<Vec<AgentSnapshot>>();
+        let token = "goodtoken".to_string();
+        let addr = bind_ephemeral().await;
+        let handle = tokio::spawn(async move { serve(addr, token, rx).await });
+
+        // Hand the server a snapshot so an authorized path *would* push one —
+        // this makes the "no snapshot reaches the bad client" assertion
+        // meaningful rather than vacuously true.
+        tx.send(vec![AgentSnapshot {
+            name: "claude".into(),
+            state: "Running".into(),
+            branch: None,
+        }])
+        .expect("publish snapshot");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Connect with the WRONG token. The WS handshake callback always
+        // returns Ok (it only captures the path), so `connect_async` itself
+        // succeeds; auth is enforced AFTER the upgrade, after which the server
+        // immediately closes the stream. If the upgrade were refused outright,
+        // that also counts as "rejected" — accept it and pass.
+        let url = format!("ws://{addr}/?token=wrong");
+        // `connect` is `Result<Result<(_, _), tungstenite::Error>, Elapsed>`:
+        // outer = timeout, inner = the WS handshake. The handshake callback
+        // always returns Ok (it only captures the path), so a timeout or an
+        // inner error here means the connection was rejected/aborted — both
+        // count as "unauthorized" and let the test pass early.
+        let connect = tokio::time::timeout(Duration::from_secs(2), connect_async(url)).await;
+        let mut ws = match connect {
+            Ok(Ok((ws, _))) => ws,
+            Ok(Err(_)) | Err(_) => {
+                drop(tx);
+                let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+                return; // upgrade rejected / timed out — unauthorized, as expected.
+            }
+        };
+
+        // For up to 1s, no Text snapshot may arrive. A Close frame or stream
+        // end (None) means the server rejected us — pass. Any Text message is
+        // a leak and must fail.
+        let deadline = Duration::from_secs(1);
+        let start = std::time::Instant::now();
+        loop {
+            if start.elapsed() >= deadline {
+                break; // no snapshot within the window -> rejected as expected.
+            }
+            let remaining = deadline
+                .checked_sub(start.elapsed())
+                .unwrap_or(Duration::ZERO);
+            match tokio::time::timeout(remaining, ws.next()).await {
+                Err(_elapsed) => break, // timed out without a snapshot.
+                Ok(None) => break,      // stream closed without a snapshot.
+                Ok(Some(Err(_))) => break, // read error — treat as rejected.
+                Ok(Some(Ok(Message::Text(t)))) => {
+                    panic!("unauthorized client must not receive a snapshot, got: {t}");
+                }
+                Ok(Some(Ok(_))) => continue, // Ping/Pong/Close — keep draining.
+            }
+        }
+
+        drop(ws);
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
 }

@@ -791,4 +791,84 @@ mod tests {
             .map(|(s, _rx)| s)
             .ok()
     }
+
+    /// Flatten the TestBackend's buffer into a string (rows joined by `\n`) so
+    /// tests can assert on rendered content without computing exact cell coords.
+    fn buffer_text(app: &App<TestBackend>) -> String {
+        let buf = app.terminal.backend().buffer();
+        let area = buf.area();
+        let mut out = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn render_draws_pane_headers_content_and_footer() {
+        let mut app = App::for_test(vec![pane(0, "alpha"), pane(1, "beta")]);
+        app.panes[0].feed(b"hello-world");
+        app.render().expect("render into TestBackend");
+
+        let text = buffer_text(&app);
+        // Pane names appear in their bordered headers.
+        assert!(text.contains("alpha"), "pane 0 header rendered");
+        assert!(text.contains("beta"), "pane 1 header rendered");
+        // Fed agent output is painted into pane 0's body.
+        assert!(text.contains("hello-world"), "fed content rendered");
+        // The footer key-hints are drawn on the reserved last line.
+        assert!(text.contains("Tab"), "footer rendered");
+        assert!(text.contains("focus"));
+    }
+
+    #[test]
+    fn render_resizes_each_pane_viewport_to_its_inner_area() {
+        // Panes are created at 40×6; a single pane in an 80×24 terminal (minus
+        // the footer + 1-cell border) should be resized to a different size.
+        let mut app = App::for_test(vec![pane(0, "solo")]);
+        let before = app.panes[0].size();
+        app.render().expect("render");
+        let after = app.panes[0].size();
+        assert_ne!(after, before, "render reconciled the pane viewport");
+        // And the content is still present after the resize.
+        assert!(buffer_text(&app).contains("solo"));
+    }
+
+    #[test]
+    fn render_handles_many_panes_without_panic() {
+        // A grid of 5 panes must lay out and paint without index panics.
+        let panes: Vec<Pane> = (0..5).map(|i| pane(i, &format!("p{i}"))).collect();
+        let mut app = App::for_test(panes);
+        app.focus = 2;
+        app.render().expect("render 5 panes");
+        let text = buffer_text(&app);
+        for i in 0..5 {
+            assert!(text.contains(&format!("p{i}")), "pane {i} rendered");
+        }
+    }
+
+    #[test]
+    fn reap_exited_marks_done_and_takes_the_slot() {
+        // `reap_exited` polls each live child via try_wait and, on exit, feeds
+        // an Exit{Some(code)} back through apply_update. Spawn a child that
+        // exits immediately (code 0) and confirm reap transitions it to Done.
+        let mut app = App::for_test(vec![pane(0, "runner")]);
+        let (session, _rx) = PtySession::spawn(vec!["true".into()], None, 20, 3).expect("spawn true");
+        app.sessions[0] = Some(session);
+
+        let mut became_done = false;
+        for _ in 0..100 {
+            app.reap_exited();
+            if matches!(app.panes[0].state(), AgentState::Done(_)) {
+                became_done = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(became_done, "reap_exited should mark the exited child Done");
+        assert!(app.sessions[0].is_none(), "reap takes the session slot once");
+    }
 }
