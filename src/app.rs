@@ -28,7 +28,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use ratatui::backend::CrosstermBackend;
+use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::widgets::Paragraph;
@@ -55,13 +55,17 @@ const FOOTER: &str =
 /// Construct with [`App::spawn_agents`], then drive with [`App::run`]. Dropping
 /// an `App` restores the terminal (via [`App::setup_terminal`] tracking) and
 /// kills/joins every still-running agent PTY (via [`PtySession`]'s `Drop`).
-pub struct App {
+///
+/// Generic over the ratatui [`Backend`] so tests can use a `TestBackend` (no
+/// TTY required, runs identically on a dev machine and headless CI). The
+/// default `B = CrosstermBackend<Stdout>` is the real backend used by `run`.
+pub struct App<B: Backend = CrosstermBackend<Stdout>> {
     panes: Vec<Pane>,
     /// `None` once the session's child has exited and been reaped. Kept
     /// parallel to `panes` (same index == same agent).
     sessions: Vec<Option<PtySession>>,
     focus: usize,
-    terminal: Terminal<CrosstermBackend<Stdout>>,
+    terminal: Terminal<B>,
     bus_rx: AgentUpdateReceiver,
     quit: bool,
     /// True between [`App::setup_terminal`] and [`App::restore_terminal`] so
@@ -198,7 +202,12 @@ impl App {
             snapshot_tx: None,
         })
     }
+}
 
+// Everything below is generic over the backend so a `TestBackend` can be
+// injected in tests (no TTY required) — the production type is still
+// `App<CrosstermBackend<Stdout>>` via the default type parameter.
+impl<B: Backend> App<B> {
     /// Attach a mobile-companion snapshot publisher (Feature 10). Once set,
     /// [`App::main_loop`] publishes a `Vec<AgentSnapshot>` every frame; the
     /// WebSocket server drains it and broadcasts to connected clients.
@@ -594,7 +603,7 @@ impl App {
     }
 }
 
-impl Drop for App {
+impl<B: Backend> Drop for App<B> {
     fn drop(&mut self) {
         // Panic-safety: if `run` never restored (or panicked mid-loop), make
         // one best-effort attempt to give the user their terminal back. The
@@ -620,17 +629,20 @@ mod tests {
 
     use super::*;
     use crate::agent::AgentKind;
+    use ratatui::backend::TestBackend;
 
-    impl App {
+    impl App<TestBackend> {
         /// Build an `App` from pre-made panes with no live sessions and no raw
         /// mode — purely for exercising the decision logic under test.
         fn for_test(panes: Vec<Pane>) -> Self {
             let n = panes.len();
-            let backend = CrosstermBackend::new(io::stdout());
-            // `Terminal::new` may query the size; in a non-TTY test runner it
-            // can still construct (size is queried lazily on draw). If it
-            // genuinely cannot, the test fails loudly here rather than later.
-            let terminal = Terminal::new(backend).expect("test terminal backend");
+            // Use an in-memory TestBackend (NOT CrosstermBackend+stdout) so the
+            // tests run identically on a developer TTY and on a headless CI
+            // runner whose stdout is a pipe — `CrosstermBackend::new(stdout)`
+            // fails at `Terminal::new` when stdout isn't a TTY (it queries the
+            // size via an ioctl that errors). The decision logic under test
+            // never touches the terminal anyway.
+            let terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal backend");
             let (_tx, rx) = bus::channel();
             Self {
                 panes,
