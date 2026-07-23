@@ -254,7 +254,11 @@ fn try_main(cli: Cli) -> Result<()> {
                 if issues.is_empty() {
                     anyhow::bail!("no open issues in {repo_ref} to orchestrate");
                 }
-                issues.iter().map(integrations::issue_to_prompt).collect::<Vec<_>>().join("\n")
+                issues
+                    .iter()
+                    .map(integrations::issue_to_prompt)
+                    .collect::<Vec<_>>()
+                    .join("\n")
             } else if let Some(s) = spec {
                 s
             } else {

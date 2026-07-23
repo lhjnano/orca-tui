@@ -559,7 +559,11 @@ impl<B: Backend> App<B> {
                         .get(pane_id)
                         .map(|p| matches!(p.state(), AgentState::Failed(_)))
                         .unwrap_or(false);
-                    let summary = if failed { "failed".to_string() } else { "done".to_string() };
+                    let summary = if failed {
+                        "failed".to_string()
+                    } else {
+                        "done".to_string()
+                    };
                     if let Some(coord) = self.coordinator.as_mut() {
                         coord.report_done(tid, summary);
                     }
@@ -1137,7 +1141,8 @@ mod tests {
         // an Exit{Some(code)} back through apply_update. Spawn a child that
         // exits immediately (code 0) and confirm reap transitions it to Done.
         let mut app = App::for_test(vec![pane(0, "runner")]);
-        let (session, _rx) = PtySession::spawn(vec!["true".into()], None, 20, 3).expect("spawn true");
+        let (session, _rx) =
+            PtySession::spawn(vec!["true".into()], None, 20, 3).expect("spawn true");
         app.sessions[0] = Some(session);
 
         let mut became_done = false;
@@ -1150,7 +1155,10 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(became_done, "reap_exited should mark the exited child Done");
-        assert!(app.sessions[0].is_none(), "reap takes the session slot once");
+        assert!(
+            app.sessions[0].is_none(),
+            "reap takes the session slot once"
+        );
     }
 
     #[test]
@@ -1161,7 +1169,10 @@ mod tests {
         app.pane_command[0] = vec!["true".into()];
 
         // A dropped session schedules a reconnect instead of going terminal.
-        app.apply_update(AgentUpdate::Exit { pane_id: 0, code: Some(1) });
+        app.apply_update(AgentUpdate::Exit {
+            pane_id: 0,
+            code: Some(1),
+        });
         assert!(
             matches!(app.panes[0].state(), AgentState::Failed(f) if f.contains("reconnecting")),
             "reconnecting indicator shown"
@@ -1171,14 +1182,20 @@ mod tests {
 
         // Before the backoff deadline: pump is a no-op.
         app.pump_reconnect();
-        assert!(app.sessions[0].is_none(), "no respawn before backoff elapses");
+        assert!(
+            app.sessions[0].is_none(),
+            "no respawn before backoff elapses"
+        );
 
         // Force the deadline into the past → the next pump respawns the pane.
         app.reconnect_due[0] = Some(Instant::now() - Duration::from_secs(1));
         app.pump_reconnect();
         assert!(app.sessions[0].is_some(), "respawned after backoff");
         assert!(matches!(app.panes[0].state(), AgentState::Running));
-        assert!(app.reconnect_due[0].is_none(), "schedule cleared after respawn");
+        assert!(
+            app.reconnect_due[0].is_none(),
+            "schedule cleared after respawn"
+        );
 
         // Clean up the spawned child so the test doesn't leak a process.
         if let Some(s) = app.sessions[0].as_mut() {

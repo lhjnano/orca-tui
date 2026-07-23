@@ -575,8 +575,8 @@ mod tests {
                 .checked_sub(start.elapsed())
                 .unwrap_or(Duration::ZERO);
             match tokio::time::timeout(remaining, ws.next()).await {
-                Err(_elapsed) => break, // timed out without a snapshot.
-                Ok(None) => break,      // stream closed without a snapshot.
+                Err(_elapsed) => break,    // timed out without a snapshot.
+                Ok(None) => break,         // stream closed without a snapshot.
                 Ok(Some(Err(_))) => break, // read error — treat as rejected.
                 Ok(Some(Ok(Message::Text(t)))) => {
                     panic!("unauthorized client must not receive a snapshot, got: {t}");

@@ -226,11 +226,11 @@ impl GitHubSource {
     }
 }
 
- impl IssueSource for GitHubSource {
-     fn list_open(&self) -> Result<Vec<Issue>> {
-         list_issues(&self.repo)
-     }
- }
+impl IssueSource for GitHubSource {
+    fn list_open(&self) -> Result<Vec<Issue>> {
+        list_issues(&self.repo)
+    }
+}
 
 /// Best-effort Linear issue source (Feature 9). Linear's API needs an auth
 /// token and an HTTP client; to avoid pulling a network crate into this build,
