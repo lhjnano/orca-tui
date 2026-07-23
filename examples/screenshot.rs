@@ -1,21 +1,23 @@
 //! Render a representative orca-tui frame to the terminal using the REAL
-//! rendering pipeline (`Pane::render` + `split_panes`), via an in-memory
-//! `TestBackend`. The output is a faithful text "screenshot" of what the TUI
-//! looks like — used for the README and for visual regression.
+//! rendering pipeline (`Pane::render` + `split_panes` + `sidebar::render_sidebar`),
+//! via an in-memory `TestBackend`. The output is a faithful text "screenshot"
+//! of what the TUI looks like — used for the README and for visual regression.
 //!
 //! Run: `cargo run --example screenshot`
 
-use ratatui::backend::TestBackend;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::widgets::Paragraph;
-use ratatui::{Frame, Terminal};
+use ratatui::Terminal;
 
 use orca_tui::agent::AgentState;
+use orca_tui::config::Config;
 use orca_tui::layout::split_panes;
+use orca_tui::osc::AgentActivity;
 use orca_tui::pane::Pane;
+use orca_tui::sidebar;
 
-const WIDTH: u16 = 104;
+const WIDTH: u16 = 110;
 const HEIGHT: u16 = 30;
 
 const FOOTER: &str =
@@ -29,21 +31,80 @@ fn agent_pane(id: usize, name: &str, branch: &str, state: AgentState, output: &s
     p
 }
 
+fn sample_sidebar_entries() -> Vec<sidebar::SidebarEntry> {
+    vec![
+        sidebar::SidebarEntry {
+            name: "claude".into(),
+            state: AgentState::Running,
+            branch: Some("orca/claude-a1b2".into()),
+            activity: Some(AgentActivity {
+                state: "working".into(),
+                tool_name: Some("Edit".into()),
+                tool_input: Some("src/app.rs".into()),
+                model: Some("gpt-5".into()),
+                ..Default::default()
+            }),
+            focused: true,
+        },
+        sidebar::SidebarEntry {
+            name: "codex".into(),
+            state: AgentState::Running,
+            branch: Some("orca/codex-c3d4".into()),
+            activity: Some(AgentActivity {
+                state: "waiting".into(),
+                prompt: Some("Approve write to lib.rs?".into()),
+                model: Some("opus".into()),
+                ..Default::default()
+            }),
+            focused: false,
+        },
+        sidebar::SidebarEntry {
+            name: "opencode".into(),
+            state: AgentState::Done(Some(0)),
+            branch: Some("main".into()),
+            activity: None,
+            focused: false,
+        },
+        sidebar::SidebarEntry {
+            name: "gemini".into(),
+            state: AgentState::Failed("rate limit".into()),
+            branch: Some("orca/gemini-e5f6".into()),
+            activity: None,
+            focused: false,
+        },
+    ]
+}
+
 fn draw(panes: &[Pane], focus: usize) {
-    let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).expect("backend");
+    let config = Config::default();
+    let entries = sample_sidebar_entries();
+
+    let mut terminal =
+        Terminal::new(ratatui::backend::TestBackend::new(WIDTH, HEIGHT)).expect("backend");
     terminal
         .draw(|f| {
             let total = f.area();
-            // Reserve the last line for the footer, mirroring App::render.
             use ratatui::layout::{Constraint, Layout};
-            let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(total);
-            let pane_area = chunks[0];
-            let footer_area = chunks[1];
+            // [sidebar (26)] [main]
+            let h = Layout::horizontal([Constraint::Length(26), Constraint::Min(1)]).split(total);
+            let sidebar_area = h[0];
+            let main_area = h[1];
+            // main: [panes] [footer]
+            let v = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(main_area);
+            let pane_area = v[0];
+            let footer_area = v[1];
+
+            // Orca-style sidebar with status dots + live activity.
+            sidebar::render_sidebar(f, sidebar_area, &entries, &config.theme);
+
+            // Agent panes.
             let rects = split_panes(pane_area, panes.len());
             for (i, p) in panes.iter().enumerate() {
                 let area = rects.get(i).copied().unwrap_or_default();
                 p.render(f, area, i == focus);
             }
+
+            // Status bar / footer.
             f.render_widget(
                 Paragraph::new(FOOTER).style(Style::default().fg(Color::DarkGray)),
                 footer_area,
@@ -59,7 +120,6 @@ fn draw(panes: &[Pane], focus: usize) {
         for x in 0..area.width {
             out.push_str(buf[(x, y)].symbol());
         }
-        // Trim trailing spaces on each line for a cleaner embed.
         out.truncate(out.trim_end().len());
         out.push('\n');
     }
@@ -67,7 +127,6 @@ fn draw(panes: &[Pane], focus: usize) {
 }
 
 fn main() {
-    // Four agents in mid-flight: two running, one done, one failed.
     let panes = vec![
         agent_pane(
             0,
