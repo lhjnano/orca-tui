@@ -213,6 +213,35 @@ error    = "#f85149"
 - **Jump palette** — `/` fuzzy search to find and focus an agent (ppalla list widget)
 - **Tabs** — worktree/session tab strip at the top
 
+### Layout study: opencode + Orca GUI source analysis
+
+**opencode** (`github.com/sst/opencode`, `packages/tui/src/`):
+- TypeScript/React-based TUI (Ink-style component model)
+- `app.tsx` (37KB): top-level layout that splits the screen into clearly bordered regions
+- `component/`: individual region components (like our sidebar.rs / pane.rs)
+- `theme/`: dedicated theming system
+- `keymap.tsx`: keybinding mode system (similar to our InputMode)
+- `prompt/`: input handling (prompt bar / command mode)
+- `routes/`: page/view routing (tab/page switching)
+- **Takeaway**: each region is a self-contained component with its own border + style + state. The "꽉찬" (dense/full) feel comes from zero wasted space + consistent borders + background fills. Apply: denser sidebar (2-line entries), background fill on empty areas, consistent border style across all regions.
+
+**Orca GUI** (`github.com/stablyai/orca`, `src/shared/` + `src/renderer/src/components/`):
+- `agent-status-types.ts`: status states = `working | blocked | waiting | done` (4 states, NOT our Idle/Running/Done/Failed)
+- `AgentStateDot.tsx` (4KB): dedicated status-dot component with per-state color
+- `agent-status-osc.ts`: OSC 9999 parser (same protocol our OscScanner captures)
+- `AgentStatusEntry`: rich fields — state, prompt, agentType, model, toolName, toolInput, lastAssistantMessage, subagents[], orchestration context
+- `WorktreeJumpPalette.tsx` (91KB): fuzzy-search jump-to-worktree (Cmd+J)
+- Sidebar sections: "Pinned" / "In Progress (N)" with colored status dots + scrollable list
+- **Takeaway**: map our `AgentState` to Orca's 4-state model; enrich sidebar entries with `toolName: toolInput` display; add a jump palette.
+
+**Action items from the study:**
+1. Map `AgentState` → `working/blocked/waiting/done` (align with Orca + OSC 9999 payloads)
+2. Denser sidebar: 2-line entries (`name + model` / `tool: toolInput`) on wide terminals
+3. Background fill on pane empty areas (dim `~` or blank with theme.bg)
+4. Consistent Double border on sidebar + panes + footer (visual unity)
+5. Jump palette (`/` key) — ppalla list widget with fuzzy filter
+6. Sidebar "Pinned" section (agents the user marks as important)
+
 ### Medium
 - Linear real implementation (reqwest + GraphQL + LINEAR_API_KEY)
 - README rewrite with screenshot + install instructions (cargo install / binstall / brew / binary)
