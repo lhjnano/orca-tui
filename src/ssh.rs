@@ -325,8 +325,7 @@ mod tests {
 
     // Helper: does `argv` contain the adjacent pair (flag, value)?
     fn has_pair(argv: &[String], flag: &str, val: &str) -> bool {
-        argv.windows(2)
-            .any(|w| w[0] == flag && w[1] == val)
+        argv.windows(2).any(|w| w[0] == flag && w[1] == val)
     }
 
     // ---- SshTarget::parse -------------------------------------------------
@@ -375,7 +374,10 @@ mod tests {
     #[test]
     fn parse_empty_or_whitespace_errors() {
         assert!(SshTarget::parse("").is_err(), "empty string must error");
-        assert!(SshTarget::parse("   ").is_err(), "whitespace-only must error");
+        assert!(
+            SshTarget::parse("   ").is_err(),
+            "whitespace-only must error"
+        );
     }
 
     #[test]
@@ -401,8 +403,15 @@ mod tests {
     fn command_vec_starts_with_ssh_and_has_tt() {
         let t = SshTarget::parse("alice@box").unwrap();
         let argv = t.command_vec();
-        assert_eq!(argv.first().map(String::as_str), Some("ssh"), "first element must be ssh");
-        assert!(argv.iter().any(|a| a == "-tt"), "-tt must always be present");
+        assert_eq!(
+            argv.first().map(String::as_str),
+            Some("ssh"),
+            "first element must be ssh"
+        );
+        assert!(
+            argv.iter().any(|a| a == "-tt"),
+            "-tt must always be present"
+        );
     }
 
     #[test]
@@ -436,14 +445,19 @@ mod tests {
         );
 
         let bare = SshTarget::parse("box").unwrap().command_vec();
-        assert!(bare.iter().any(|a| a == "box"), "target must be host when no user");
+        assert!(
+            bare.iter().any(|a| a == "box"),
+            "target must be host when no user"
+        );
     }
 
     #[test]
     fn command_vec_remote_command_words_in_order_at_tail() {
-        let t = SshTarget::parse("alice@box")
-            .unwrap()
-            .with_command(vec!["claude".into(), "--model".into(), "x".into()]);
+        let t = SshTarget::parse("alice@box").unwrap().with_command(vec![
+            "claude".into(),
+            "--model".into(),
+            "x".into(),
+        ]);
         let argv = t.command_vec();
         let len = argv.len();
         assert!(len >= 3, "argv should contain the remote command words");
@@ -482,7 +496,15 @@ mod tests {
         let t = SshTarget::parse("box").unwrap();
         assert_eq!(
             t.command_vec(),
-            vec!["ssh", "-tt", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "box"]
+            vec![
+                "ssh",
+                "-tt",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                "box"
+            ]
         );
     }
 
@@ -490,7 +512,10 @@ mod tests {
 
     #[test]
     fn display_formats() {
-        assert_eq!(SshTarget::parse("alice@box").unwrap().display(), "alice@box");
+        assert_eq!(
+            SshTarget::parse("alice@box").unwrap().display(),
+            "alice@box"
+        );
         assert_eq!(
             SshTarget::parse("alice@box:2222").unwrap().display(),
             "alice@box:2222"
@@ -512,18 +537,30 @@ mod tests {
     #[test]
     fn backoff_for_attempt_1_is_base_2_is_double() {
         let p = ReconnectPolicy::default(); // base 1s
-        assert_eq!(p.backoff_for(1), Duration::from_secs(1), "attempt 1 == base");
-        assert_eq!(p.backoff_for(2), Duration::from_secs(2), "attempt 2 == double");
+        assert_eq!(
+            p.backoff_for(1),
+            Duration::from_secs(1),
+            "attempt 1 == base"
+        );
+        assert_eq!(
+            p.backoff_for(2),
+            Duration::from_secs(2),
+            "attempt 2 == double"
+        );
         assert_eq!(p.backoff_for(3), Duration::from_secs(4));
     }
 
     #[test]
     fn backoff_for_capped_at_max() {
         let p = ReconnectPolicy::default(); // max 30s; base 1s
-        // 1,2,4,8,16,32 -> 32 caps to 30.
+                                            // 1,2,4,8,16,32 -> 32 caps to 30.
         assert_eq!(p.backoff_for(5), Duration::from_secs(16));
         assert_eq!(p.backoff_for(6), Duration::from_secs(30), "32s caps to max");
-        assert_eq!(p.backoff_for(100), Duration::from_secs(30), "absurd attempt still caps");
+        assert_eq!(
+            p.backoff_for(100),
+            Duration::from_secs(30),
+            "absurd attempt still caps"
+        );
     }
 
     #[test]
@@ -601,7 +638,7 @@ mod tests {
         let mut s = ReconnectSession::new(tiny_policy());
         let t0 = Instant::now();
         s.record_failure(t0); // attempt 1 -> backoff 100ms
-        // Immediately after the failure: the full backoff still remains.
+                              // Immediately after the failure: the full backoff still remains.
         assert_eq!(s.next_retry_in(t0), Some(Duration::from_millis(100)));
     }
 
@@ -610,8 +647,10 @@ mod tests {
         let mut s = ReconnectSession::new(tiny_policy());
         let t0 = Instant::now();
         s.record_failure(t0); // backoff 100ms
-        // Halfway through the backoff window: ~50ms remains.
-        let half = t0.checked_add(Duration::from_millis(50)).expect("checked_add");
+                              // Halfway through the backoff window: ~50ms remains.
+        let half = t0
+            .checked_add(Duration::from_millis(50))
+            .expect("checked_add");
         let remaining = s.next_retry_in(half).expect("Some");
         // Exact arithmetic: (t0 + 50ms) - t0 == 50ms, so 100ms - 50ms == 50ms.
         assert_eq!(remaining, Duration::from_millis(50));
@@ -622,11 +661,13 @@ mod tests {
         let mut s = ReconnectSession::new(tiny_policy());
         let t0 = Instant::now();
         s.record_failure(t0); // backoff 100ms
-        // Before the window elapses -> not yet.
+                              // Before the window elapses -> not yet.
         assert!(!s.should_retry_now(t0));
         assert_ne!(s.next_retry_in(t0), Some(Duration::ZERO));
         // Exactly at the backoff boundary -> time to retry.
-        let ready = t0.checked_add(Duration::from_millis(100)).expect("checked_add");
+        let ready = t0
+            .checked_add(Duration::from_millis(100))
+            .expect("checked_add");
         assert_eq!(s.next_retry_in(ready), Some(Duration::ZERO));
         assert!(s.should_retry_now(ready));
     }
@@ -637,7 +678,9 @@ mod tests {
         let mut s = ReconnectSession::new(tiny_policy());
         let t0 = Instant::now();
         s.record_failure(t0);
-        let way_past = t0.checked_add(Duration::from_secs(60)).expect("checked_add");
+        let way_past = t0
+            .checked_add(Duration::from_secs(60))
+            .expect("checked_add");
         assert_eq!(s.next_retry_in(way_past), Some(Duration::ZERO));
         assert!(s.should_retry_now(way_past));
     }
@@ -674,7 +717,10 @@ mod tests {
         assert!(!s.exhausted(), "max_attempts = u32::MAX");
         // No panic, and the result is clamped/capped (<= max_backoff).
         let remaining = s.next_retry_in(t0).expect("Some");
-        assert!(remaining <= Duration::from_millis(10), "capped at max_backoff");
+        assert!(
+            remaining <= Duration::from_millis(10),
+            "capped at max_backoff"
+        );
     }
 
     #[test]

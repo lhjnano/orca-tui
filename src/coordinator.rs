@@ -168,9 +168,10 @@ impl Coordinator {
     /// untouched.
     pub fn dispatch_next(&mut self, available_agents: &[String]) -> Option<Dispatch> {
         let agent = available_agents.first()?;
-        let found = self.tasks.iter().find(|t| {
-            t.status == TaskStatus::Pending && self.deps_all_done(&t.deps)
-        })?;
+        let found = self
+            .tasks
+            .iter()
+            .find(|t| t.status == TaskStatus::Pending && self.deps_all_done(&t.deps))?;
         let task_id = found.id;
         // Re-borrow mutably to flip the status and record the assignee. Safe:
         // `task_id` is a dense index that stays valid for the coordinator's
@@ -244,10 +245,7 @@ impl Coordinator {
     /// if `id` is out of range.
     pub fn ask(&mut self, id: TaskId, question: impl Into<String>) -> DecisionGate {
         let question = question.into();
-        let task = self
-            .tasks
-            .get_mut(id)
-            .expect("ask: task id out of range");
+        let task = self.tasks.get_mut(id).expect("ask: task id out of range");
         task.status = TaskStatus::AwaitingDecision;
         DecisionGate {
             task_id: id,
@@ -301,9 +299,7 @@ impl Coordinator {
     /// Vacuously `true` when there are no tasks.
     #[must_use]
     pub fn all_done(&self) -> bool {
-        self.tasks
-            .iter()
-            .all(|t| t.status.is_terminal())
+        self.tasks.iter().all(|t| t.status.is_terminal())
     }
 
     /// `true` iff every id in `deps` resolves to a task whose status is
@@ -356,9 +352,7 @@ mod tests {
         for s in specs {
             coord.add_task(*s, Vec::new());
         }
-        let agents = (0..specs.len())
-            .map(|i| format!("a{i}"))
-            .collect();
+        let agents = (0..specs.len()).map(|i| format!("a{i}")).collect();
         (coord, agents)
     }
 

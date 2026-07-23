@@ -188,7 +188,11 @@ pub fn list_issues(repo: &RepoRef) -> Result<Vec<Issue>> {
 /// it is present and non-empty (whitespace-only bodies are treated as empty).
 pub fn issue_to_prompt(issue: &Issue) -> String {
     let mut out = format!("#{} {}", issue.number, issue.title);
-    let body = issue.body.as_deref().map(str::trim).filter(|b| !b.is_empty());
+    let body = issue
+        .body
+        .as_deref()
+        .map(str::trim)
+        .filter(|b| !b.is_empty());
     if let Some(body) = body {
         out.push_str("\n\n");
         out.push_str(body);
@@ -311,7 +315,10 @@ mod tests {
         let prompt = issue_to_prompt(&issue);
 
         // Number + title are always present.
-        assert!(prompt.contains("1337"), "prompt must include the number: {prompt}");
+        assert!(
+            prompt.contains("1337"),
+            "prompt must include the number: {prompt}"
+        );
         assert!(
             prompt.contains("Refactor the scheduler"),
             "prompt must include the title: {prompt}"

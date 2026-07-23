@@ -161,7 +161,11 @@ impl Pane {
     /// then paints the emulator's cell grid into the inner area. `focused`
     /// brightens the border.
     pub fn render(&self, frame: &mut Frame<'_>, area: Rect, focused: bool) {
-        let border_color = if focused { Color::Cyan } else { Color::DarkGray };
+        let border_color = if focused {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        };
         let title = Line::from(self.header()).style(Style::default().fg(self.state.color()));
         let block = Block::default()
             .borders(Borders::ALL)
@@ -180,7 +184,10 @@ impl Pane {
         let location = self.branch.as_deref().unwrap_or("\u{2014}"); // —
         format!(
             " {} \u{00B7} {} \u{00B7} {} {} ",
-            self.name, location, self.state.icon(), self.state.label()
+            self.name,
+            location,
+            self.state.icon(),
+            self.state.label()
         )
     }
 
@@ -384,9 +391,17 @@ mod tests {
         // Inner area starts at (1,1) due to the 1-cell rounded border.
         // Row 0 inner col 0 should be 'A', col 1 'B'.
         let cell_a = &buf[(1, 1)];
-        assert!(cell_a.symbol().contains('A'), "expected 'A' at (1,1), got {:?}", cell_a.symbol());
+        assert!(
+            cell_a.symbol().contains('A'),
+            "expected 'A' at (1,1), got {:?}",
+            cell_a.symbol()
+        );
         let cell_b = &buf[(2, 1)];
-        assert!(cell_b.symbol().contains('B'), "expected 'B' at (2,1), got {:?}", cell_b.symbol());
+        assert!(
+            cell_b.symbol().contains('B'),
+            "expected 'B' at (2,1), got {:?}",
+            cell_b.symbol()
+        );
     }
 
     #[test]

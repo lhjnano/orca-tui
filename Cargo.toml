@@ -13,6 +13,10 @@ categories = ["command-line-utilities", "development-tools"]
 name = "orca-tui"
 path = "src/main.rs"
 
+[[bench]]
+name = "orca"
+harness = false
+
 [dependencies]
 # TUI rendering primitives — pinned to match ratatui-ppalla 0.0.2's requirements
 # (ppalla 0.0.2 requires ratatui ^0.29 and crossterm ^0.28; pinning the exact
@@ -58,3 +62,12 @@ tokio-tungstenite = "0.24"
 # addressable). Already resolved transitively at 0.3.x via tokio-tungstenite,
 # so pinning it adds no new version to the graph and disturbs nothing above.
 futures-util = "0.3"
+
+[dev-dependencies]
+# Benchmarking only — `cargo bench --bench orca`. `default-features = false`
+# drops the unused `rayon` (parallel sample analysis) to keep the dep graph
+# lean; `plotters` keeps the HTML reports under `target/criterion/`, and
+# `cargo_bench_support` keeps the `cargo bench` entry point. Resolves cleanly
+# alongside the pinned ratatui 0.29 / crossterm 0.28 / tokio 1 stack — criterion
+# 0.5 shares no overlapping deps at incompatible versions.
+criterion = { version = "0.5", default-features = false, features = ["plotters", "cargo_bench_support"] }

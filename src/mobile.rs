@@ -268,10 +268,7 @@ async fn handle_connection(
 
     // On connect, push the latest snapshot so the client doesn't render empty
     // until the next broadcast.
-    let init = latest
-        .lock()
-        .map(|guard| guard.clone())
-        .unwrap_or_default();
+    let init = latest.lock().map(|guard| guard.clone()).unwrap_or_default();
     if ws.send(Message::Text(snapshot_json(&init))).await.is_err() {
         return;
     }
@@ -280,7 +277,8 @@ async fn handle_connection(
     loop {
         match snap_rx.recv().await {
             Ok(snapshots) => {
-                if ws.send(Message::Text(snapshot_json(&snapshots)))
+                if ws
+                    .send(Message::Text(snapshot_json(&snapshots)))
                     .await
                     .is_err()
                 {
@@ -316,7 +314,8 @@ mod tests {
             t.len()
         );
         assert!(
-            t.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            t.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
             "token must be lowercase hex, got {t:?}"
         );
     }
@@ -343,7 +342,10 @@ mod tests {
     fn check_auth_rejects_mismatched_token() {
         assert!(!check_auth("/ws?token=abc", "zzz"));
         assert!(!check_auth("/ws?token=", "abc"));
-        assert!(!check_auth("/ws?token=ABC", "abc"), "comparison is case-sensitive");
+        assert!(
+            !check_auth("/ws?token=ABC", "abc"),
+            "comparison is case-sensitive"
+        );
     }
 
     #[test]

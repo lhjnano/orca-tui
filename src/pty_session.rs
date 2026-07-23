@@ -19,7 +19,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread::{self, JoinHandle};
 
 use anyhow::{Context, Result};
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 
 /// Size of the blocking-read buffer in the reader thread.
 const READ_CHUNK: usize = 8 * 1024;
@@ -272,7 +272,11 @@ mod tests {
     #[test]
     fn spawn_printf_and_capture_cells() {
         let (mut session, rx) = PtySession::spawn(
-            vec![sh().to_string(), "-c".to_string(), "printf 'hello\\nworld'".to_string()],
+            vec![
+                sh().to_string(),
+                "-c".to_string(),
+                "printf 'hello\\nworld'".to_string(),
+            ],
             None,
             20,
             3,

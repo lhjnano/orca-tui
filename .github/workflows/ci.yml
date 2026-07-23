@@ -1,0 +1,54 @@
+name: ci
+
+# Always render cargo output in color in the CI logs.
+env:
+  CARGO_TERM_COLOR: always
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+# Cancel a superseded run when a newer push lands on the same branch.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt,clippy
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      # git is preinstalled on ubuntu runners, but the WorktreeManager
+      # integration tests shell out to it — be explicit and minimal.
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y git
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      # Evolving public API legitimately triggers dead_code on not-yet-wired
+      # items. Do NOT use `-D warnings` — it would fail CI on these intentional
+      # warnings. `-A dead_code` tolerates the known ones while keeping the
+      # signal for every other real lint.
+      - name: Clippy (tolerate evolving-API dead_code)
+        run: cargo clippy --all-targets -- -A dead_code
+
+      - name: Run unit tests
+        run: cargo test --all
+
+      # Criterion benches live in benches/orca.rs (added by a parallel task).
+      # `--no-run` only verifies they compile. This is safe even before the
+      # benches land: cargo falls back to compiling the default libtest bench
+      # harnesses and exits 0 when there are no criterion targets yet.
+      - name: Verify benches compile
+        run: cargo bench --no-run

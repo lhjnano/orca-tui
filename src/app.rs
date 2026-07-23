@@ -41,8 +41,8 @@ use crate::mobile::AgentSnapshot;
 use crate::pane::Pane;
 use crate::pty_session::PtySession;
 use crate::scheduler::{FrameScheduler, TARGET_FRAME_60FPS};
-use crate::worktree::{OwnedWorktrees, WorktreeManager};
 use crate::terminal_emu::{MIN_COLS, MIN_ROWS};
+use crate::worktree::{OwnedWorktrees, WorktreeManager};
 
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -98,11 +98,7 @@ impl App {
     ///
     /// Returns an error only if the ratatui terminal/backend cannot be
     /// constructed.
-    pub fn spawn_agents(
-        specs: Vec<AgentSpec>,
-        cwd: Option<&Path>,
-        isolate: bool,
-    ) -> Result<Self> {
+    pub fn spawn_agents(specs: Vec<AgentSpec>, cwd: Option<&Path>, isolate: bool) -> Result<Self> {
         // Size the PTYs from the real terminal so the agent's first frame is
         // already correct once we enter raw mode + alt screen in `run`.
         // `unwrap_or` only covers the error path; a freshly spawned PTY (or a
@@ -123,7 +119,10 @@ impl App {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
             let manager = WorktreeManager::open(&base).with_context(|| {
-                format!("opening git repo for worktree isolation at {}", base.display())
+                format!(
+                    "opening git repo for worktree isolation at {}",
+                    base.display()
+                )
             })?;
             Some(OwnedWorktrees::new(manager))
         } else {
@@ -407,10 +406,8 @@ impl App {
                     // existing, more-informed state avoids downgrading a
                     // `Failed(non-zero)` back to a bland `Done(None)` (or vice
                     // versa). Only transition a pane that is still non-terminal.
-                    let already_terminal = matches!(
-                        pane.state(),
-                        AgentState::Done(_) | AgentState::Failed(_)
-                    );
+                    let already_terminal =
+                        matches!(pane.state(), AgentState::Done(_) | AgentState::Failed(_));
                     if !already_terminal {
                         // code 0 / unknown => Done; a non-zero exit is a failure.
                         let state = match code {
@@ -447,8 +444,7 @@ impl App {
         // area and the footer render is skipped below.
         let reserve_footer = total.height >= 3;
         let (pane_area, footer_area) = if reserve_footer {
-            let chunks =
-                Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(total);
+            let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(total);
             (chunks[0], chunks[1])
         } else {
             (total, Rect::default())
@@ -758,8 +754,7 @@ mod tests {
         app.panes[1].set_state(AgentState::Done(None));
         app.panes[0].set_branch(Some("orca/main".into()));
 
-        let (tx, mut rx) =
-            tokio::sync::mpsc::unbounded_channel::<Vec<AgentSnapshot>>();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<AgentSnapshot>>();
         app.set_snapshot_sender(tx);
         app.publish_snapshot();
 

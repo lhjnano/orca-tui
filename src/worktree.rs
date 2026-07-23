@@ -436,8 +436,10 @@ mod tests {
 
             // Local identity so `git commit` works in CI without any global
             // git config (the spec's `git -c user.name=...` intent).
-            for (k, v) in [("user.name", "orca-tui test"), ("user.email", "test@orca-tui.local")]
-            {
+            for (k, v) in [
+                ("user.name", "orca-tui test"),
+                ("user.email", "test@orca-tui.local"),
+            ] {
                 let cfg = Command::new("git")
                     .arg("-C")
                     .arg(&dir)
@@ -599,7 +601,8 @@ mod tests {
         let wt = mgr.create_for("gemini").expect("create");
         mgr.remove(&wt.path).expect("first remove");
         // Second remove: path is already gone — must not error.
-        mgr.remove(&wt.path).expect("remove of already-gone worktree");
+        mgr.remove(&wt.path)
+            .expect("remove of already-gone worktree");
     }
 
     #[cfg(unix)]
@@ -630,7 +633,11 @@ mod tests {
 
         let path = {
             let kept = owned.drain_into();
-            assert_eq!(kept.len(), 1, "drain_into should yield the tracked worktree");
+            assert_eq!(
+                kept.len(),
+                1,
+                "drain_into should yield the tracked worktree"
+            );
             kept[0].path.clone()
         }; // `kept` dropped here, but Worktree has no Drop -> stays on disk
 

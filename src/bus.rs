@@ -34,21 +34,12 @@ use crate::agent::AgentState;
 #[derive(Debug, Clone)]
 pub enum AgentUpdate {
     /// Raw PTY bytes for `pane_id`. Feed verbatim into the pane's emulator.
-    Output {
-        pane_id: usize,
-        bytes: Vec<u8>,
-    },
+    Output { pane_id: usize, bytes: Vec<u8> },
     /// An out-of-band lifecycle state change (e.g. set to `Running` at spawn).
-    State {
-        pane_id: usize,
-        state: AgentState,
-    },
+    State { pane_id: usize, state: AgentState },
     /// The agent process behind `pane_id` has exited. `code` is the raw exit
     /// code if it could be determined, else `None`.
-    Exit {
-        pane_id: usize,
-        code: Option<i32>,
-    },
+    Exit { pane_id: usize, code: Option<i32> },
 }
 
 /// Sending half of the AgentBus. Cloning is cheap and intended: one clone per
@@ -101,13 +92,7 @@ pub fn forward_session(pane_id: usize, rx: Receiver<Vec<u8>>, tx: AgentUpdateSen
     loop {
         match rx.recv() {
             Ok(bytes) => {
-                if tx
-                    .send(AgentUpdate::Output {
-                        pane_id,
-                        bytes,
-                    })
-                    .is_err()
-                {
+                if tx.send(AgentUpdate::Output { pane_id, bytes }).is_err() {
                     // UI receiver gone — stop pumping.
                     break;
                 }
@@ -231,11 +216,20 @@ mod tests {
             "first must be the Output, got {first:?}"
         );
         assert!(
-            matches!(second, AgentUpdate::Exit { pane_id: 3, code: Some(0) }),
+            matches!(
+                second,
+                AgentUpdate::Exit {
+                    pane_id: 3,
+                    code: Some(0)
+                }
+            ),
             "second must be the Exit, got {second:?}"
         );
         // Channel drained — third recv errors (Empty, since `tx` was moved and
         // dropped inside the thread).
-        assert!(rx.try_recv().is_err(), "channel should be empty after drain");
+        assert!(
+            rx.try_recv().is_err(),
+            "channel should be empty after drain"
+        );
     }
 }

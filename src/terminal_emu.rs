@@ -223,7 +223,8 @@ mod tests {
             .cell(col, row)
             .unwrap_or_else(|| panic!("cell ({col},{row}) out of bounds"));
         assert_eq!(
-            cell.chars, expected.to_string(),
+            cell.chars,
+            expected.to_string(),
             "at ({col},{row}) expected '{expected}' got {:?}",
             cell.chars
         );

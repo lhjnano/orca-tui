@@ -161,7 +161,10 @@ mod tests {
         assert!(s.should_render(due), "one frame later → due");
         // And strictly before the boundary, still not due.
         let just_before = t0 + Duration::from_nanos(16_000_000); // ~16.0 ms < 16.6 ms
-        assert!(!s.should_render(just_before), "before the boundary → not due");
+        assert!(
+            !s.should_render(just_before),
+            "before the boundary → not due"
+        );
     }
 
     #[test]
@@ -237,7 +240,8 @@ mod tests {
         s.note_skipped();
         assert_eq!(s.frames_skipped(), 3);
         assert_eq!(
-            s.frames_rendered(), 0,
+            s.frames_rendered(),
+            0,
             "skipping must not count as rendering"
         );
 

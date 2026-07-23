@@ -71,7 +71,12 @@ mod tests {
         for n in [1usize, 2, 3, 4, 5, 6, 9, 12] {
             let a = area();
             let rects = split_panes(a, n);
-            assert_eq!(rects.len(), n, "n={n}: expected {n} rects, got {}", rects.len());
+            assert_eq!(
+                rects.len(),
+                n,
+                "n={n}: expected {n} rects, got {}",
+                rects.len()
+            );
 
             for (i, r) in rects.iter().enumerate() {
                 assert!(
@@ -122,8 +127,14 @@ mod tests {
             rects[0].y, rects[1].y,
             "row 0 pair should start at the same y"
         );
-        assert_eq!(rects[2].y, rects[3].y, "row 1 pair should start at the same y");
-        assert!(rects[2].y > rects[0].y, "second row should sit below the first");
+        assert_eq!(
+            rects[2].y, rects[3].y,
+            "row 1 pair should start at the same y"
+        );
+        assert!(
+            rects[2].y > rects[0].y,
+            "second row should sit below the first"
+        );
         // Columns: rect 0 left of rect 1.
         assert!(rects[0].right() <= rects[1].x);
         assert!(rects[2].right() <= rects[3].x);

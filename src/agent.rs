@@ -141,9 +141,9 @@ impl AgentState {
     #[must_use]
     pub fn icon(&self) -> &'static str {
         match self {
-            Self::Idle => "\u{25CB}", // ○
-            Self::Running => "\u{25CF}", // ●
-            Self::Done(_) => "\u{2713}", // ✓
+            Self::Idle => "\u{25CB}",      // ○
+            Self::Running => "\u{25CF}",   // ●
+            Self::Done(_) => "\u{2713}",   // ✓
             Self::Failed(_) => "\u{2717}", // ✗
         }
     }
@@ -296,7 +296,11 @@ mod tests {
         let known = AgentKind::all_known();
         for k in &installed {
             assert!(known.contains(k), "{k:?} not a known kind");
-            assert!(binary_on_path(k.binary()), "{} not actually on PATH", k.binary());
+            assert!(
+                binary_on_path(k.binary()),
+                "{} not actually on PATH",
+                k.binary()
+            );
         }
         // Canonical ordering preserved (stable filter).
         let mut sorted_by_known: Vec<AgentKind> = installed.clone();
@@ -322,7 +326,8 @@ mod tests {
 
     #[test]
     fn from_command_unknown_is_generic_with_basename_name() {
-        let spec = AgentSpec::from_command(vec!["/opt/weird/my-agent".to_owned(), "--flag".to_owned()]);
+        let spec =
+            AgentSpec::from_command(vec!["/opt/weird/my-agent".to_owned(), "--flag".to_owned()]);
         assert_eq!(spec.kind, AgentKind::Generic);
         assert_eq!(spec.name, "my-agent");
         assert_eq!(spec.command.len(), 2);
