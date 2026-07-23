@@ -190,7 +190,7 @@ impl Pane {
         let title = Line::from(self.header()).style(Style::default().fg(self.state.color()));
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
+            .border_type(BorderType::Double)
             .border_style(Style::default().fg(border_color))
             .title(title);
 

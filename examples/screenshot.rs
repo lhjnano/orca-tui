@@ -83,7 +83,14 @@ fn draw(panes: &[Pane], focus: usize) {
         Terminal::new(ratatui::backend::TestBackend::new(WIDTH, HEIGHT)).expect("backend");
     terminal
         .draw(|f| {
-            let total = f.area();
+            let full = f.area();
+            // 1-cell margin around the whole app.
+            let total = Rect::new(
+                1,
+                1,
+                full.width.saturating_sub(2),
+                full.height.saturating_sub(2),
+            );
             use ratatui::layout::{Constraint, Layout};
             // [sidebar (26)] [main]
             let h = Layout::horizontal([Constraint::Length(26), Constraint::Min(1)]).split(total);

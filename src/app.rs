@@ -724,7 +724,14 @@ impl<B: Backend> App<B> {
     /// the agent process agree on dimensions.
     fn render(&mut self) -> Result<()> {
         let size = self.terminal.size()?;
-        let total = Rect::new(0, 0, size.width, size.height);
+        // 1-cell margin around the whole app — breathing room from the terminal
+        // edge so content doesn't sit flush against the screen border.
+        let total = Rect::new(
+            1,
+            1,
+            size.width.saturating_sub(2).max(MIN_COLS),
+            size.height.saturating_sub(2).max(MIN_ROWS),
+        );
 
         // Reserve the left sidebar (Orca-style agent list with status dots +
         // live activity from OSC 9999). Hidden when sidebar_width is 0 or the
