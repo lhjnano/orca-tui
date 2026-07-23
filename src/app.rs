@@ -36,12 +36,14 @@ use ratatui::Terminal;
 
 use crate::agent::{AgentSpec, AgentState};
 use crate::bus::{self, AgentUpdate, AgentUpdateReceiver, AgentUpdateSender};
+use crate::config::Config;
 use crate::coordinator::{self, Coordinator};
 use crate::layout::split_panes;
 use crate::mobile::AgentSnapshot;
 use crate::pane::Pane;
 use crate::pty_session::PtySession;
 use crate::scheduler::{FrameScheduler, TARGET_FRAME_60FPS};
+use crate::sidebar;
 use crate::ssh;
 use crate::terminal_emu::{MIN_COLS, MIN_ROWS};
 use crate::worktree::{OwnedWorktrees, WorktreeManager};
@@ -114,6 +116,8 @@ pub struct App<B: Backend = CrosstermBackend<Stdout>> {
     /// Feature 8: when non-`None`, the pane is awaiting a backoff-scheduled
     /// respawn at this `Instant`. Drained by [`App::pump_reconnect`].
     reconnect_due: Vec<Option<Instant>>,
+    /// User configuration (theme, layout, default agent).
+    config: Config,
 }
 
 impl App {
@@ -246,6 +250,7 @@ impl App {
             pane_command,
             reconnect,
             reconnect_due,
+            config: Config::load_or_default(),
         })
     }
 }
@@ -718,30 +723,33 @@ impl<B: Backend> App<B> {
     /// reconciled here (before the immutable draw closure) so the emulator and
     /// the agent process agree on dimensions.
     fn render(&mut self) -> Result<()> {
-        // `Terminal::size` returns a `Size` in ratatui 0.29; `Layout::split`
-        // wants a `Rect`, so wrap it at the origin.
         let size = self.terminal.size()?;
         let total = Rect::new(0, 0, size.width, size.height);
 
-        // Reserve the last line for the footer — but only when there is enough
-        // vertical room that the panes aren't starved to a 0-line band on a
-        // degenerate (tiny) terminal. With no footer, the panes get the whole
-        // area and the footer render is skipped below.
-        let reserve_footer = total.height >= 3;
+        // Reserve the left sidebar (Orca-style agent list with status dots +
+        // live activity from OSC 9999). Hidden when sidebar_width is 0 or the
+        // terminal is too narrow for panes to be usable.
+        let sidebar_w = self.config.layout.sidebar_width;
+        let show_sidebar = sidebar_w > 0 && total.width > sidebar_w + 20;
+        let (sidebar_area, content_area) = if show_sidebar {
+            let h = Layout::horizontal([Constraint::Length(sidebar_w), Constraint::Min(1)])
+                .split(total);
+            (Some(h[0]), h[1])
+        } else {
+            (None, total)
+        };
+
+        let reserve_footer = total.height >= 3 && self.config.layout.show_status_bar;
         let (pane_area, footer_area) = if reserve_footer {
-            let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(total);
+            let chunks =
+                Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(content_area);
             (chunks[0], chunks[1])
         } else {
-            (total, Rect::default())
+            (content_area, Rect::default())
         };
 
         let rects = split_panes(pane_area, self.panes.len());
 
-        // Resize pass: align each pane's emulator and PTY to its new inner area
-        // (a 1-cell border on every side). Done outside the draw closure so we
-        // can mutate `self`. Inner dims are clamped to the emulator minimum so
-        // a pane starved by a tiny area never feeds `vt100` a `0` (which would
-        // underflow at `grid.rs:26`).
         for (i, pane) in self.panes.iter_mut().enumerate() {
             let Some(&rect) = rects.get(i) else { continue };
             let inner_w = rect.width.saturating_sub(2).max(MIN_COLS);
@@ -750,22 +758,36 @@ impl<B: Backend> App<B> {
             if (cur_w, cur_h) != (inner_w, inner_h) {
                 pane.resize_viewport(inner_w, inner_h);
                 if let Some(Some(session)) = self.sessions.get_mut(i) {
-                    // PTY resize is best-effort: a dead child's fd may reject it.
                     let _ = session.resize(inner_w, inner_h);
                 }
             }
         }
 
+        // Build sidebar entries (owned Vec, no borrow held across the closure).
+        let sidebar_entries: Vec<sidebar::SidebarEntry> = self
+            .panes
+            .iter()
+            .enumerate()
+            .map(|(i, p)| sidebar::SidebarEntry {
+                name: p.name().to_string(),
+                state: p.state().clone(),
+                branch: p.branch().map(String::from),
+                activity: p.activity().cloned(),
+                focused: i == self.focus,
+            })
+            .collect();
+
         let focus = self.focus;
         let panes = &self.panes;
+        let theme = &self.config.theme;
         self.terminal.draw(|f| {
+            if let Some(sb) = sidebar_area {
+                sidebar::render_sidebar(f, sb, &sidebar_entries, theme);
+            }
             for (i, pane) in panes.iter().enumerate() {
                 let area = rects.get(i).copied().unwrap_or_default();
                 pane.render(f, area, i == focus);
             }
-            // Skip the footer entirely on a degenerate terminal (the zero-sized
-            // `footer_area` would be a no-op anyway, but being explicit avoids
-            // relying on Paragraph's zero-area behavior).
             if reserve_footer {
                 f.render_widget(
                     Paragraph::new(FOOTER).style(Style::default().fg(Color::DarkGray)),
@@ -940,6 +962,7 @@ mod tests {
                 pane_command: (0..n).map(|_| Vec::new()).collect(),
                 reconnect: (0..n).map(|_| None).collect(),
                 reconnect_due: (0..n).map(|_| None).collect(),
+                config: Config::default(),
             }
         }
     }

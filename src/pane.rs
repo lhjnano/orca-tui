@@ -42,6 +42,10 @@ pub struct Pane {
     branch: Option<String>,
     /// Lines scrolled back from the bottom (0 = pinned to the latest line).
     scroll: usize,
+    /// OSC 9999 scanner — intercepts agent status from the PTY byte stream.
+    osc_scanner: crate::osc::OscScanner,
+    /// Last captured agent activity (from OSC 9999), if any.
+    activity: Option<crate::osc::AgentActivity>,
 }
 
 impl fmt::Debug for Pane {
@@ -71,6 +75,8 @@ impl Pane {
             state: AgentState::Idle,
             branch: None,
             scroll: 0,
+            osc_scanner: crate::osc::OscScanner::new(),
+            activity: None,
         }
     }
 
@@ -86,9 +92,16 @@ impl Pane {
         &self.name
     }
 
-    /// Feed raw PTY bytes into the emulator.
+    /// Feed raw PTY bytes into the emulator. OSC 9999 agent-status sequences
+    /// are intercepted by the [`OscScanner`](crate::osc::OscScanner) before
+    /// reaching the terminal emulator, so they don't corrupt the display and
+    /// their structured payload is captured as [`activity`](Pane::activity).
     pub fn feed(&mut self, bytes: &[u8]) {
-        self.emu.feed(bytes);
+        let (clean, activities) = self.osc_scanner.process(bytes);
+        if let Some(act) = activities.into_iter().last() {
+            self.activity = Some(act);
+        }
+        self.emu.feed(&clean);
     }
 
     /// Resize the emulator viewport (PTY-side resize is Task 4's job).
@@ -126,6 +139,14 @@ impl Pane {
     #[must_use]
     pub fn branch(&self) -> Option<&str> {
         self.branch.as_deref()
+    }
+
+    /// The last OSC 9999 agent activity captured from the PTY stream, if any.
+    /// This carries structured status (state, tool, prompt) that agents like
+    /// Claude Code emit — the data source for the sidebar's per-agent summary.
+    #[must_use]
+    pub fn activity(&self) -> Option<&crate::osc::AgentActivity> {
+        self.activity.as_ref()
     }
 
     /// Scroll back `n` lines (towards older output). Saturates; never panics.
