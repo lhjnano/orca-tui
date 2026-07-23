@@ -1,0 +1,356 @@
+//! # Agent registry
+//!
+//! Kinds of supported coding agents (Claude Code, Codex, OpenCode, Gemini,
+//! Amp, Cursor), their discovery via `$PATH` lookup, and the per-agent launch
+//! spec. This is the data layer behind the agent picker / pane model
+//! (Feature 3 of the roadmap).
+//!
+//! The split mirrors Orca GUI's "run any CLI agent, each in its own
+//! worktree": an [`AgentSpec`] carries the verbatim command plus an optional
+//! worktree path, and [`AgentKind`] classifies it so the UI can show a
+//! recognizable icon/name and offer the installed set in a picker.
+
+use std::fmt;
+use std::path::{Path, PathBuf};
+
+use ratatui::style::Color;
+
+/// Supported agent kinds.
+///
+/// `Generic` is the fallback for any command that doesn't match a known agent
+/// binary; it has no fixed binary name (the verbatim command is used as-is).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentKind {
+    /// Anthropic's `claude` CLI ("Claude Code").
+    ClaudeCode,
+    /// OpenAI's `codex` CLI.
+    Codex,
+    /// OpenCode (`opencode`).
+    OpenCode,
+    /// Google's `gemini` CLI.
+    Gemini,
+    /// Sourcegraph's `amp` CLI.
+    Amp,
+    /// Cursor CLI (`cursor`).
+    Cursor,
+    /// Anything else; resolved from the verbatim command.
+    Generic,
+}
+
+impl AgentKind {
+    /// Human-readable display name shown in the UI.
+    #[must_use]
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "Claude Code",
+            Self::Codex => "Codex",
+            Self::OpenCode => "OpenCode",
+            Self::Gemini => "Gemini",
+            Self::Amp => "Amp",
+            Self::Cursor => "Cursor",
+            Self::Generic => "Custom",
+        }
+    }
+
+    /// The CLI binary name looked up on `$PATH` (empty for `Generic`).
+    #[must_use]
+    pub fn binary(&self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claude",
+            Self::Codex => "codex",
+            Self::OpenCode => "opencode",
+            Self::Gemini => "gemini",
+            Self::Amp => "amp",
+            Self::Cursor => "cursor",
+            Self::Generic => "",
+        }
+    }
+
+    /// The six concrete agent kinds (excludes [`Generic`]) in canonical order.
+    #[must_use]
+    pub fn all_known() -> &'static [AgentKind] {
+        &[
+            Self::ClaudeCode,
+            Self::Codex,
+            Self::OpenCode,
+            Self::Gemini,
+            Self::Amp,
+            Self::Cursor,
+        ]
+    }
+
+    /// Scan `$PATH` for installed agents and return the subset present, in
+    /// canonical order. `Generic` is never returned.
+    ///
+    /// Uses [`std::env::split_paths`] which handles the OS-specific path
+    /// separator (`:` on unix, `;` on windows) and quoted entries correctly.
+    #[must_use]
+    pub fn detect_installed() -> Vec<AgentKind> {
+        Self::all_known()
+            .iter()
+            .copied()
+            .filter(|kind| binary_on_path(kind.binary()))
+            .collect()
+    }
+
+    /// Classify a kind from a binary name or path. Falls back to [`Generic`].
+    /// Comparison is on the basename so `./claude` and `/usr/bin/claude` both
+    /// match `ClaudeCode`.
+    fn from_binary(name_or_path: &str) -> Self {
+        let base = basename(name_or_path);
+        Self::all_known()
+            .iter()
+            .copied()
+            .find(|k| k.binary() == base)
+            .unwrap_or(Self::Generic)
+    }
+}
+
+impl fmt::Display for AgentKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.display_name())
+    }
+}
+
+/// Lifecycle state of an agent process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentState {
+    /// Not yet started.
+    Idle,
+    /// Process is running.
+    Running,
+    /// Process exited. Carries the exit code, if known.
+    Done(Option<i32>),
+    /// Process failed to start or exited with an error. Carries a message.
+    Failed(String),
+}
+
+impl AgentState {
+    /// Short label for the pane header.
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Idle => "Idle",
+            Self::Running => "Running",
+            Self::Done(_) => "Done",
+            Self::Failed(_) => "Failed",
+        }
+    }
+
+    /// Single-glyph icon for the pane header.
+    #[must_use]
+    pub fn icon(&self) -> &'static str {
+        match self {
+            Self::Idle => "\u{25CB}", // ○
+            Self::Running => "\u{25CF}", // ●
+            Self::Done(_) => "\u{2713}", // ✓
+            Self::Failed(_) => "\u{2717}", // ✗
+        }
+    }
+
+    /// Color used to tint the pane header / border for this state.
+    #[must_use]
+    pub fn color(&self) -> Color {
+        match self {
+            Self::Idle => Color::DarkGray,
+            Self::Running => Color::Green,
+            Self::Done(_) => Color::Cyan,
+            Self::Failed(_) => Color::Red,
+        }
+    }
+}
+
+/// Launch specification for one agent.
+///
+/// `command[0]` is the binary (classified into [`AgentKind`]); the rest are its
+/// args. `worktree` is the optional per-agent git worktree (Orca GUI model).
+#[derive(Debug, Clone)]
+pub struct AgentSpec {
+    /// Classified agent kind.
+    pub kind: AgentKind,
+    /// Display name (defaults to the kind's name, or the binary basename for
+    /// [`AgentKind::Generic`]).
+    pub name: String,
+    /// Verbatim invocation; `command[0]` is the binary.
+    pub command: Vec<String>,
+    /// Optional per-agent git worktree directory.
+    pub worktree: Option<PathBuf>,
+}
+
+impl AgentSpec {
+    /// Build a spec from a verbatim command vector.
+    ///
+    /// `command[0]` is matched against the known agent binaries to pick
+    /// [`AgentKind`]; an unknown binary yields [`AgentKind::Generic`]. The
+    /// display name defaults to the matched kind's name, or for `Generic` the
+    /// binary basename.
+    ///
+    /// Returns a `Generic` spec with an empty command if the slice is empty.
+    #[must_use]
+    pub fn from_command(command: Vec<String>) -> Self {
+        let kind = command
+            .first()
+            .map(|bin| AgentKind::from_binary(bin))
+            .unwrap_or(AgentKind::Generic);
+        let name = match kind {
+            AgentKind::Generic => command
+                .first()
+                .map(|b| basename(b))
+                .unwrap_or_else(|| AgentKind::Generic.display_name().to_owned()),
+            _ => kind.display_name().to_owned(),
+        };
+        Self {
+            kind,
+            name,
+            command,
+            worktree: None,
+        }
+    }
+}
+
+/// Return the basename of a path-like string (no directory component).
+fn basename(s: &str) -> String {
+    Path::new(s)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or(s)
+        .to_owned()
+}
+
+/// True if `binary` exists as an executable file somewhere on `$PATH`.
+fn binary_on_path(binary: &str) -> bool {
+    if binary.is_empty() {
+        return false;
+    }
+    let path = match std::env::var_os("PATH") {
+        Some(p) => p,
+        None => return false,
+    };
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(binary);
+        if is_executable(&candidate) {
+            return true;
+        }
+        #[cfg(windows)]
+        if is_executable(&dir.join(format!("{binary}.exe"))) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether a path is an executable regular file (unix: any execute bit set).
+fn is_executable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        match std::fs::metadata(path) {
+            Ok(md) => md.is_file() && (md.permissions().mode() & 0o111 != 0),
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::metadata(path)
+            .map(|m| m.is_file())
+            .unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn known_binary_names() {
+        assert_eq!(AgentKind::ClaudeCode.binary(), "claude");
+        assert_eq!(AgentKind::Codex.binary(), "codex");
+        assert_eq!(AgentKind::OpenCode.binary(), "opencode");
+        assert_eq!(AgentKind::Gemini.binary(), "gemini");
+        assert_eq!(AgentKind::Amp.binary(), "amp");
+        assert_eq!(AgentKind::Cursor.binary(), "cursor");
+        assert_eq!(AgentKind::Generic.binary(), "");
+    }
+
+    #[test]
+    fn display_names() {
+        assert_eq!(AgentKind::ClaudeCode.display_name(), "Claude Code");
+        assert_eq!(AgentKind::Generic.display_name(), "Custom");
+        // Display impl delegates to display_name.
+        assert_eq!(format!("{}", AgentKind::Codex), "Codex");
+    }
+
+    #[test]
+    fn all_known_excludes_generic() {
+        let known = AgentKind::all_known();
+        assert_eq!(known.len(), 6);
+        assert!(!known.contains(&AgentKind::Generic));
+        // Canonical order: Claude Code first.
+        assert_eq!(known[0], AgentKind::ClaudeCode);
+    }
+
+    #[test]
+    fn detect_installed_returns_subset_and_never_panics() {
+        let installed = AgentKind::detect_installed();
+        // Must be a subset of all_known, in canonical order, no duplicates.
+        let known = AgentKind::all_known();
+        for k in &installed {
+            assert!(known.contains(k), "{k:?} not a known kind");
+            assert!(binary_on_path(k.binary()), "{} not actually on PATH", k.binary());
+        }
+        // Canonical ordering preserved (stable filter).
+        let mut sorted_by_known: Vec<AgentKind> = installed.clone();
+        sorted_by_known.sort_by_key(|k| known.iter().position(|x| x == k).unwrap());
+        assert_eq!(installed, sorted_by_known);
+    }
+
+    #[test]
+    fn from_command_matches_known_binary() {
+        let spec = AgentSpec::from_command(vec!["claude".to_owned()]);
+        assert_eq!(spec.kind, AgentKind::ClaudeCode);
+        assert_eq!(spec.name, "Claude Code");
+        assert_eq!(spec.command, vec!["claude".to_owned()]);
+        assert!(spec.worktree.is_none());
+    }
+
+    #[test]
+    fn from_command_matches_basename_for_paths() {
+        let spec = AgentSpec::from_command(vec!["/usr/local/bin/codex".to_owned()]);
+        assert_eq!(spec.kind, AgentKind::Codex);
+        assert_eq!(spec.name, "Codex");
+    }
+
+    #[test]
+    fn from_command_unknown_is_generic_with_basename_name() {
+        let spec = AgentSpec::from_command(vec!["/opt/weird/my-agent".to_owned(), "--flag".to_owned()]);
+        assert_eq!(spec.kind, AgentKind::Generic);
+        assert_eq!(spec.name, "my-agent");
+        assert_eq!(spec.command.len(), 2);
+    }
+
+    #[test]
+    fn from_command_empty_is_generic() {
+        let spec = AgentSpec::from_command(vec![]);
+        assert_eq!(spec.kind, AgentKind::Generic);
+        assert!(spec.command.is_empty());
+    }
+
+    #[test]
+    fn state_colors_and_icons() {
+        assert_eq!(AgentState::Idle.color(), Color::DarkGray);
+        assert_eq!(AgentState::Running.color(), Color::Green);
+        assert_eq!(AgentState::Done(None).color(), Color::Cyan);
+        assert_eq!(AgentState::Done(Some(0)).color(), Color::Cyan);
+        assert_eq!(AgentState::Failed("boom".to_owned()).color(), Color::Red);
+
+        assert_eq!(AgentState::Idle.icon(), "\u{25CB}");
+        assert_eq!(AgentState::Running.icon(), "\u{25CF}");
+        assert_eq!(AgentState::Done(None).icon(), "\u{2713}");
+        assert_eq!(AgentState::Failed("x".to_owned()).icon(), "\u{2717}");
+
+        assert_eq!(AgentState::Idle.label(), "Idle");
+        assert_eq!(AgentState::Running.label(), "Running");
+        assert_eq!(AgentState::Done(Some(2)).label(), "Done");
+        assert_eq!(AgentState::Failed("e".to_owned()).label(), "Failed");
+    }
+}
