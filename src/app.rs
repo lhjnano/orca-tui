@@ -20,7 +20,7 @@
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -42,6 +42,7 @@ use crate::mobile::AgentSnapshot;
 use crate::pane::Pane;
 use crate::pty_session::PtySession;
 use crate::scheduler::{FrameScheduler, TARGET_FRAME_60FPS};
+use crate::ssh;
 use crate::terminal_emu::{MIN_COLS, MIN_ROWS};
 use crate::worktree::{OwnedWorktrees, WorktreeManager};
 
@@ -104,6 +105,15 @@ pub struct App<B: Backend = CrosstermBackend<Stdout>> {
     /// bus mid-run. Completion is detected via [`App::all_sessions_gone`], not
     /// channel disconnect, so retaining this sender is safe.
     bus_tx: AgentUpdateSender,
+    /// The argv each pane was launched with (captured so a dropped remote
+    /// session can be re-spawned verbatim by Feature 8 reconnect).
+    pane_command: Vec<Vec<String>>,
+    /// Feature 8: per-pane reconnect state. `Some` when the pane is eligible
+    /// for auto-reconnect (`--reconnect`); `None` otherwise.
+    reconnect: Vec<Option<ssh::ReconnectSession>>,
+    /// Feature 8: when non-`None`, the pane is awaiting a backoff-scheduled
+    /// respawn at this `Instant`. Drained by [`App::pump_reconnect`].
+    reconnect_due: Vec<Option<Instant>>,
 }
 
 impl App {
@@ -154,9 +164,13 @@ impl App {
         let mut panes = Vec::with_capacity(specs.len());
         let mut sessions = Vec::with_capacity(specs.len());
         let mut pane_task: Vec<Option<coordinator::TaskId>> = Vec::with_capacity(specs.len());
+        let mut pane_command: Vec<Vec<String>> = Vec::with_capacity(specs.len());
+        let mut reconnect: Vec<Option<ssh::ReconnectSession>> = Vec::with_capacity(specs.len());
+        let mut reconnect_due: Vec<Option<Instant>> = Vec::with_capacity(specs.len());
 
         for (idx, spec) in specs.into_iter().enumerate() {
             let name = spec.name.clone();
+            let command = spec.command.clone();
             // Per-agent cwd + header branch: an isolated worktree when in
             // worktree mode (each agent runs in its own worktree, header shows
             // the isolation branch); else the shared `cwd` + any spec label.
@@ -172,7 +186,7 @@ impl App {
                         spec.worktree.as_ref().map(|p| p.display().to_string()),
                     )
                 };
-            match PtySession::spawn(spec.command.clone(), agent_cwd.as_deref(), cols, rows) {
+            match PtySession::spawn(command.clone(), agent_cwd.as_deref(), cols, rows) {
                 Ok((session, rx)) => {
                     let mut pane = Pane::new(idx, &name, cols, rows);
                     pane.set_state(AgentState::Running);
@@ -199,8 +213,11 @@ impl App {
                     sessions.push(None);
                 }
             }
-            // Plain `run` panes are not coordinated.
+            // Plain `run` panes are not coordinated; reconnect is opt-in later.
             pane_task.push(None);
+            pane_command.push(command);
+            reconnect.push(None);
+            reconnect_due.push(None);
         }
 
         // NOTE: we keep `bus_tx` (stored on the App) rather than dropping it,
@@ -226,6 +243,9 @@ impl App {
             cols,
             rows,
             bus_tx,
+            pane_command,
+            reconnect,
+            reconnect_due,
         })
     }
 }
@@ -352,6 +372,10 @@ impl<B: Backend> App<B> {
             // and so newly-freed dependents keep the loop alive.
             self.pump_orchestration();
 
+            // Feature 8: fire any backoff-scheduled remote-session reconnects
+            // whose wait has elapsed (non-blocking).
+            self.pump_reconnect();
+
             // Poll with the scheduler-chosen timeout: ~remaining-to-next-frame
             // when active, the longer idle interval when nothing is happening.
             if event::poll(self.scheduler.poll_timeout(now))? {
@@ -361,9 +385,12 @@ impl<B: Backend> App<B> {
                 self.handle_event(ev);
             }
             // Auto-exit once no agent process remains AND orchestration has no
-            // pending/running tasks left to dispatch. A user can also quit
-            // explicitly with Esc / Ctrl+C.
-            if self.all_sessions_gone() && self.orchestration_drained() {
+            // pending/running tasks left AND no reconnect is awaiting its
+            // backoff. A user can also quit explicitly with Esc / Ctrl+C.
+            if self.all_sessions_gone()
+                && self.orchestration_drained()
+                && self.reconnect_due.iter().all(|d| d.is_none())
+            {
                 break;
             }
         }
@@ -460,6 +487,41 @@ impl<B: Backend> App<B> {
                 }
             }
             AgentUpdate::Exit { pane_id, code } => {
+                // Feature 8: if this pane is reconnect-eligible and still has
+                // retries left, schedule a backoff respawn instead of marking
+                // it terminal. (Reconnect is for `run --remote`, not orchestrate,
+                // so skipping report_done here is correct.)
+                let schedule_reconnect = self
+                    .reconnect
+                    .get(pane_id)
+                    .and_then(|o| o.as_ref())
+                    .is_some_and(|rs| !rs.exhausted());
+                if schedule_reconnect {
+                    let now = Instant::now();
+                    if let Some(Some(rs)) = self.reconnect.get_mut(pane_id) {
+                        rs.record_failure(now);
+                        // Just-failed → full backoff for this attempt.
+                        let backoff = rs.next_retry_in(now).unwrap_or(Duration::ZERO);
+                        if let Some(d) = self.reconnect_due.get_mut(pane_id) {
+                            *d = Some(now + backoff);
+                        }
+                    }
+                    if let Some(pane) = self.panes.get_mut(pane_id) {
+                        let attempt = self
+                            .reconnect
+                            .get(pane_id)
+                            .and_then(|o| o.as_ref())
+                            .map(|rs| rs.attempts())
+                            .unwrap_or(0);
+                        pane.set_state(AgentState::Failed(format!(
+                            "reconnecting (attempt {attempt})…"
+                        )));
+                    }
+                    if let Some(slot) = self.sessions.get_mut(pane_id) {
+                        slot.take();
+                    }
+                    return;
+                }
                 if let Some(pane) = self.panes.get_mut(pane_id) {
                     // Idempotent: once a pane is in a terminal state (Done /
                     // Failed) it must not be overwritten by a later Exit. The
@@ -511,6 +573,7 @@ impl<B: Backend> App<B> {
     fn spawn_one(&mut self, spec: AgentSpec) -> usize {
         let idx = self.panes.len();
         let name = spec.name.clone();
+        let command = spec.command.clone();
         let cols = self.cols;
         let rows = self.rows;
         match PtySession::spawn(spec.command, None, cols, rows) {
@@ -533,7 +596,89 @@ impl<B: Backend> App<B> {
             }
         }
         self.pane_task.push(None);
+        self.pane_command.push(command);
+        self.reconnect.push(None);
+        self.reconnect_due.push(None);
         idx
+    }
+
+    /// Feature 8: mark every current pane eligible for auto-reconnect (used
+    /// with `--remote --reconnect`). A dropped remote session is then re-spawned
+    /// on its own pane after an exponential backoff, up to the policy's max.
+    pub fn enable_reconnect(&mut self) {
+        let policy = ssh::ReconnectPolicy::default();
+        for slot in &mut self.reconnect {
+            *slot = Some(ssh::ReconnectSession::new(policy.clone()));
+        }
+    }
+
+    /// Feature 8: re-spawn pane `i`'s command into the same pane (preserving
+    /// its emulator/scrollback), used when a scheduled reconnect comes due.
+    fn respawn(&mut self, i: usize) {
+        let Some(command) = self.pane_command.get(i).cloned() else {
+            return;
+        };
+        let cols = self.cols;
+        let rows = self.rows;
+        match PtySession::spawn(command, None, cols, rows) {
+            Ok((session, rx)) => {
+                if let Some(slot) = self.sessions.get_mut(i) {
+                    *slot = Some(session);
+                }
+                if let Some(pane) = self.panes.get_mut(i) {
+                    pane.set_state(AgentState::Running);
+                }
+                let tx = self.bus_tx.clone();
+                let _ = thread::Builder::new()
+                    .name(format!("orca-reconnect({i})"))
+                    .spawn(move || bus::forward_session(i, rx, tx));
+            }
+            Err(err) => {
+                eprintln!("orca-tui: reconnect spawn failed: {err:#}");
+                if let Some(pane) = self.panes.get_mut(i) {
+                    pane.set_state(AgentState::Failed(format!("reconnect failed: {err:#}")));
+                }
+            }
+        }
+    }
+
+    /// Feature 8: fire any backoff-scheduled reconnects whose wait has elapsed
+    /// and that haven't exhausted their retry budget. Non-blocking — the loop
+    /// keeps rendering other panes while a remote one waits to come back.
+    fn pump_reconnect(&mut self) {
+        let now = Instant::now();
+        // Collect indices due for respawn first to avoid borrow conflicts.
+        let mut due: Vec<usize> = Vec::new();
+        for (i, slot) in self.reconnect.iter_mut().enumerate() {
+            let Some(rs) = slot.as_mut() else {
+                continue;
+            };
+            let Some(&deadline) = self.reconnect_due.get(i).and_then(|o| o.as_ref()) else {
+                continue;
+            };
+            if now >= deadline {
+                if rs.exhausted() {
+                    // Give up: clear the schedule, leave the pane terminal.
+                    if let Some(d) = self.reconnect_due.get_mut(i) {
+                        d.take();
+                    }
+                } else {
+                    due.push(i);
+                }
+            }
+        }
+        for i in due {
+            // Respawn resets the attempt counter for the next drop.
+            if let Some(slot) = self.reconnect.get_mut(i) {
+                if let Some(rs) = slot.as_mut() {
+                    rs.record_success();
+                }
+            }
+            if let Some(d) = self.reconnect_due.get_mut(i) {
+                d.take();
+            }
+            self.respawn(i);
+        }
     }
 
     /// Feature 7: release every dependency-gated task the coordinator can
@@ -788,6 +933,9 @@ mod tests {
                 cols: 80,
                 rows: 24,
                 bus_tx,
+                pane_command: (0..n).map(|_| Vec::new()).collect(),
+                reconnect: (0..n).map(|_| None).collect(),
+                reconnect_due: (0..n).map(|_| None).collect(),
             }
         }
     }
@@ -1003,5 +1151,38 @@ mod tests {
         }
         assert!(became_done, "reap_exited should mark the exited child Done");
         assert!(app.sessions[0].is_none(), "reap takes the session slot once");
+    }
+
+    #[test]
+    fn reconnect_schedules_then_respawns_after_backoff() {
+        let mut app = App::for_test(vec![pane(0, "remote")]);
+        app.enable_reconnect();
+        // for_test seeds empty commands; give the pane a real one to respawn.
+        app.pane_command[0] = vec!["true".into()];
+
+        // A dropped session schedules a reconnect instead of going terminal.
+        app.apply_update(AgentUpdate::Exit { pane_id: 0, code: Some(1) });
+        assert!(
+            matches!(app.panes[0].state(), AgentState::Failed(f) if f.contains("reconnecting")),
+            "reconnecting indicator shown"
+        );
+        assert!(app.sessions[0].is_none(), "dead session taken");
+        assert!(app.reconnect_due[0].is_some(), "respawn scheduled");
+
+        // Before the backoff deadline: pump is a no-op.
+        app.pump_reconnect();
+        assert!(app.sessions[0].is_none(), "no respawn before backoff elapses");
+
+        // Force the deadline into the past → the next pump respawns the pane.
+        app.reconnect_due[0] = Some(Instant::now() - Duration::from_secs(1));
+        app.pump_reconnect();
+        assert!(app.sessions[0].is_some(), "respawned after backoff");
+        assert!(matches!(app.panes[0].state(), AgentState::Running));
+        assert!(app.reconnect_due[0].is_none(), "schedule cleared after respawn");
+
+        // Clean up the spawned child so the test doesn't leak a process.
+        if let Some(s) = app.sessions[0].as_mut() {
+            let _ = s.kill();
+        }
     }
 }

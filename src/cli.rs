@@ -70,6 +70,11 @@ enum Command {
         #[arg(long, value_name = "HOST")]
         remote: Option<String>,
 
+        /// With `--remote`: auto-reconnect a dropped remote session on the same
+        /// pane after an exponential backoff, up to a few attempts (Feature 8).
+        #[arg(long)]
+        reconnect: bool,
+
         /// Start the mobile-companion WebSocket server (Feature 10) alongside
         /// the agents, broadcasting live pane status to a phone/PWA. The URL
         /// and one-time token are printed at startup.
@@ -141,6 +146,7 @@ fn try_main(cli: Cli) -> Result<()> {
             cwd,
             worktree,
             remote,
+            reconnect,
             mobile,
             command,
         } => {
@@ -183,6 +189,12 @@ fn try_main(cli: Cli) -> Result<()> {
             }
 
             let mut app = App::spawn_agents(specs, cwd.as_deref(), worktree)?;
+
+            // Feature 8: mark every pane reconnect-eligible so a dropped remote
+            // session is re-spawned after a backoff (harmless without --remote).
+            if reconnect {
+                app.enable_reconnect();
+            }
 
             // Feature 10: optionally start the mobile-companion WebSocket
             // server on a dedicated tokio runtime thread and feed it live
