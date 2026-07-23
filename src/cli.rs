@@ -97,12 +97,18 @@ enum Command {
     /// `--parallel` to fan every task out at once. Each task's description is
     /// passed to the agent as its prompt argument.
     Orchestrate {
-        /// Newline-separated task spec. Use a quoted multi-line string.
+        /// Newline-separated task spec. Use a quoted multi-line string. Ignored
+        /// when `--issues` is given.
         #[arg(long)]
-        spec: String,
+        spec: Option<String>,
         /// Fan every task out in parallel instead of running them sequentially.
         #[arg(long)]
         parallel: bool,
+        /// Source tasks from a GitHub repo's open issues via `gh`
+        /// (`owner/name`); each issue becomes one task (Feature 9). Overrides
+        /// `--spec`.
+        #[arg(long, value_name = "REPO")]
+        issues: Option<String>,
     },
 
     /// List open pull requests for a GitHub repo via `gh` (Feature 9).
@@ -212,12 +218,15 @@ fn try_main(cli: Cli) -> Result<()> {
             Ok(())
         }
 
-        Command::Orchestrate { spec, parallel } => {
-            // Feature 7 — dependency-gated LIVE DISPATCH. Plan the spec into
-            // tasks, then hand a Coordinator to the App: its main loop pumps
-            // `dispatch_next` each tick, spawning one new agent pane per
-            // released task as its dependencies complete. Sequential (chain)
-            // by default; `--parallel` fans every task out at once.
+        Command::Orchestrate {
+            spec,
+            parallel,
+            issues,
+        } => {
+            // Feature 7 + 9 — dependency-gated LIVE DISPATCH. Tasks come either
+            // from `--spec` (free-form lines) or `--issues <owner/name>` (each
+            // open GitHub issue → one task, via `gh`). Then a Coordinator drives
+            // the App: sequential chain by default, --parallel fans out.
             let detected = AgentKind::detect_installed();
             let agent_bin = detected
                 .first()
@@ -225,15 +234,31 @@ fn try_main(cli: Cli) -> Result<()> {
                 .unwrap_or("claude")
                 .to_string();
 
-            let coord = if parallel {
-                coordinator::plan_from_spec(&spec, &[agent_bin.clone()])
+            // Resolve the task list to a newline spec the planner consumes.
+            let task_spec: String = if let Some(repo) = &issues {
+                let repo_ref = RepoRef::parse(repo)
+                    .with_context(|| format!("parsing --issues repo {repo:?}"))?;
+                let issues = integrations::list_issues(&repo_ref)?;
+                if issues.is_empty() {
+                    anyhow::bail!("no open issues in {repo_ref} to orchestrate");
+                }
+                issues.iter().map(integrations::issue_to_prompt).collect::<Vec<_>>().join("\n")
+            } else if let Some(s) = spec {
+                s
             } else {
-                coordinator::plan_chain(&spec, &[agent_bin.clone()])
+                anyhow::bail!("orchestrate needs --spec <text> or --issues <owner/name>");
             };
+
+            let coord = if parallel {
+                coordinator::plan_from_spec(&task_spec, &[agent_bin.clone()])
+            } else {
+                coordinator::plan_chain(&task_spec, &[agent_bin.clone()])
+            };
+            let source = if issues.is_some() { "issues" } else { "spec" };
             let mode = if parallel { "parallel" } else { "sequential" };
             println!(
-                "orca-tui: orchestrating {} task(s) via agent `{agent_bin}` ({mode}, \
-                 task spec passed as the prompt):",
+                "orca-tui: orchestrating {} task(s) via agent `{agent_bin}` \
+                 ({mode}, source: {source}, task text passed as the prompt):",
                 coord.tasks().len()
             );
             for task in coord.tasks() {

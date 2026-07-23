@@ -226,14 +226,47 @@ impl GitHubSource {
     }
 }
 
-impl IssueSource for GitHubSource {
-    fn list_open(&self) -> Result<Vec<Issue>> {
-        list_issues(&self.repo)
+ impl IssueSource for GitHubSource {
+     fn list_open(&self) -> Result<Vec<Issue>> {
+         list_issues(&self.repo)
+     }
+ }
+
+/// Best-effort Linear issue source (Feature 9). Linear's API needs an auth
+/// token and an HTTP client; to avoid pulling a network crate into this build,
+/// the actual GraphQL call is deferred. This impl is **wired but inert**:
+///
+/// - If `LINEAR_API_KEY` is unset, `list_open` returns an empty list (Linear
+///   simply contributes no tasks) — the orchestration pipeline keeps working
+///   with GitHub alone.
+/// - If `LINEAR_API_KEY` IS set, `list_open` returns a clear "not yet wired"
+///   error so a user who configures a token is told precisely what is missing
+///   rather than silently getting nothing.
+///
+/// Enabling real Linear means adding an HTTP client (e.g. `reqwest`) and
+/// implementing the GraphQL query here — no other plumbing changes.
+pub struct LinearSource;
+
+impl LinearSource {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
     }
 }
-// TODO: LinearSource — implement IssueSource against the Linear REST API.
-// Needs an API token (env var) and an HTTP client (a crate decision deferred to
-// when Linear support is actually built out; do NOT add an HTTP crate now).
+
+impl IssueSource for LinearSource {
+    fn list_open(&self) -> Result<Vec<Issue>> {
+        if std::env::var_os("LINEAR_API_KEY").is_some() {
+            anyhow::bail!(
+                "Linear token is set but the HTTP client is not yet wired — \
+                 implement the GraphQL query in integrations::LinearSource \
+                 (add an HTTP crate) to enable it"
+            );
+        }
+        // Token absent: Linear is disabled, contribute no issues.
+        Ok(Vec::new())
+    }
+}
 
 #[cfg(test)]
 mod tests {
