@@ -341,6 +341,30 @@ pub fn plan_from_spec(spec: &str, agents: &[String]) -> Coordinator {
     coord
 }
 
+/// Build a [`Coordinator`] from a multi-line spec where each task depends on
+/// the **previous** one (a linear chain), so [`Coordinator::dispatch_next`]
+/// releases exactly one task at a time — true sequential dispatch.
+///
+/// Contrast with [`plan_from_spec`], which fans every task out in parallel.
+/// `agents` is accepted for API symmetry with [`plan_from_spec`] and is not
+/// otherwise consumed.
+#[must_use]
+pub fn plan_chain(spec: &str, agents: &[String]) -> Coordinator {
+    let _ = agents;
+    let mut coord = Coordinator::new();
+    let mut prev: Option<TaskId> = None;
+    for line in spec.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let deps = prev.into_iter().collect();
+        let id = coord.add_task(trimmed, deps);
+        prev = Some(id);
+    }
+    coord
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -611,6 +635,32 @@ mod tests {
         let coord = plan_from_spec("", &[]);
         assert!(coord.tasks().is_empty());
         assert!(coord.all_done(), "vacuously done");
+    }
+
+    #[test]
+    fn plan_chain_makes_each_task_depend_on_the_previous() {
+        // Sequential plan: task 1 depends on 0, task 2 depends on 1, … so only
+        // ONE task is dispatchable at a time (true sequential dispatch).
+        let mut coord = plan_chain("a\nb\nc", &[]);
+        let tasks = coord.tasks();
+        assert_eq!(tasks.len(), 3);
+        assert!(tasks[0].deps.is_empty(), "first task has no deps");
+        assert_eq!(tasks[1].deps, vec![tasks[0].id], "second depends on first");
+        assert_eq!(tasks[2].deps, vec![tasks[1].id], "third depends on second");
+
+        let agent = ["bot".to_string()];
+        let (id0, id1, id2) = (tasks[0].id, tasks[1].id, tasks[2].id);
+
+        // Only the first task dispatches initially.
+        assert_eq!(coord.dispatch_next(&agent).unwrap().task_id, id0);
+        // While it is merely Dispatched (not Done), nothing else is ready.
+        assert!(coord.dispatch_next(&agent).is_none());
+        // Completing it releases the second; completing that releases the third.
+        coord.report_done(id0, "done");
+        assert_eq!(coord.dispatch_next(&agent).unwrap().task_id, id1);
+        assert!(coord.dispatch_next(&agent).is_none());
+        coord.report_done(id1, "done");
+        assert_eq!(coord.dispatch_next(&agent).unwrap().task_id, id2);
     }
 
     #[test]

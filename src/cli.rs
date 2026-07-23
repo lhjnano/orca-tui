@@ -91,12 +91,18 @@ enum Command {
 
     /// Plan multi-agent orchestration from a spec (Feature 7).
     ///
-    /// Splits the spec into tasks (one per non-empty line) and dispatches one
-    /// agent pane per task, passing the task description as the agent's prompt.
+    /// Splits the spec into tasks (one per non-empty line) and dispatches them
+    /// to agents dependency-gated: by default tasks run **sequentially** (each
+    /// depends on the previous), so only one is in flight at a time; pass
+    /// `--parallel` to fan every task out at once. Each task's description is
+    /// passed to the agent as its prompt argument.
     Orchestrate {
         /// Newline-separated task spec. Use a quoted multi-line string.
         #[arg(long)]
         spec: String,
+        /// Fan every task out in parallel instead of running them sequentially.
+        #[arg(long)]
+        parallel: bool,
     },
 
     /// List open pull requests for a GitHub repo via `gh` (Feature 9).
@@ -206,11 +212,12 @@ fn try_main(cli: Cli) -> Result<()> {
             Ok(())
         }
 
-        Command::Orchestrate { spec } => {
-            // Feature 7 — LIVE DISPATCH: plan the spec into tasks, then spawn
-            // one agent pane per task, passing the task description as the
-            // agent's prompt argument. Dependency-gated / sequential dispatch
-            // is a future refinement; v1 fans every task out in parallel.
+        Command::Orchestrate { spec, parallel } => {
+            // Feature 7 — dependency-gated LIVE DISPATCH. Plan the spec into
+            // tasks, then hand a Coordinator to the App: its main loop pumps
+            // `dispatch_next` each tick, spawning one new agent pane per
+            // released task as its dependencies complete. Sequential (chain)
+            // by default; `--parallel` fans every task out at once.
             let detected = AgentKind::detect_installed();
             let agent_bin = detected
                 .first()
@@ -218,10 +225,15 @@ fn try_main(cli: Cli) -> Result<()> {
                 .unwrap_or("claude")
                 .to_string();
 
-            let coord = coordinator::plan_from_spec(&spec, &[agent_bin.clone()]);
+            let coord = if parallel {
+                coordinator::plan_from_spec(&spec, &[agent_bin.clone()])
+            } else {
+                coordinator::plan_chain(&spec, &[agent_bin.clone()])
+            };
+            let mode = if parallel { "parallel" } else { "sequential" };
             println!(
-                "orca-tui: dispatching {} task(s) to agent `{agent_bin}` \
-                 (one pane each, task spec passed as the prompt):",
+                "orca-tui: orchestrating {} task(s) via agent `{agent_bin}` ({mode}, \
+                 task spec passed as the prompt):",
                 coord.tasks().len()
             );
             for task in coord.tasks() {
@@ -229,18 +241,9 @@ fn try_main(cli: Cli) -> Result<()> {
             }
             println!();
 
-            // Build one AgentSpec per planned task: `[<agent> "<task spec>"]`.
-            let specs: Vec<AgentSpec> = coord
-                .tasks()
-                .iter()
-                .map(|t| {
-                    let mut s = AgentSpec::from_command(vec![agent_bin.clone(), t.spec.clone()]);
-                    s.name = format!("task-{}", t.id);
-                    s
-                })
-                .collect();
-
-            let mut app = App::spawn_agents(specs, None, false)?;
+            // Start empty; the loop's pump spawns tasks as their deps allow.
+            let mut app = App::spawn_agents(Vec::new(), None, false)?;
+            app.set_orchestration(coord, agent_bin);
             app.run()?;
             Ok(())
         }

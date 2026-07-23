@@ -35,7 +35,8 @@ use ratatui::widgets::Paragraph;
 use ratatui::Terminal;
 
 use crate::agent::{AgentSpec, AgentState};
-use crate::bus::{self, AgentUpdate, AgentUpdateReceiver};
+use crate::bus::{self, AgentUpdate, AgentUpdateReceiver, AgentUpdateSender};
+use crate::coordinator::{self, Coordinator};
 use crate::layout::split_panes;
 use crate::mobile::AgentSnapshot;
 use crate::pane::Pane;
@@ -86,6 +87,23 @@ pub struct App<B: Backend = CrosstermBackend<Stdout>> {
     /// every frame so a mobile-companion WebSocket server can broadcast live
     /// agent status. `None` when no companion is attached.
     snapshot_tx: Option<UnboundedSender<Vec<AgentSnapshot>>>,
+    /// Feature 7: orchestration state. When `Some`, [`App::main_loop`] pumps
+    /// the coordinator each tick — dispatching the next dependency-gated task
+    /// to a fresh pane as previous tasks finish. `None` for the plain `run`
+    /// path (all agents spawned up front).
+    coordinator: Option<Coordinator>,
+    /// The agent binary used to run orchestrated tasks (e.g. `claude`).
+    orch_agent: Option<String>,
+    /// `pane_task[i]` is the coordinator task id pane `i` is running (`None`
+    /// for non-orchestrated panes). Kept parallel to `panes`/`sessions`.
+    pane_task: Vec<Option<coordinator::TaskId>>,
+    /// PTY size captured at construction, reused by [`App::spawn_one`].
+    cols: u16,
+    rows: u16,
+    /// Kept (not dropped) so [`App::spawn_one`] can fan new sessions onto the
+    /// bus mid-run. Completion is detected via [`App::all_sessions_gone`], not
+    /// channel disconnect, so retaining this sender is safe.
+    bus_tx: AgentUpdateSender,
 }
 
 impl App {
@@ -135,6 +153,7 @@ impl App {
 
         let mut panes = Vec::with_capacity(specs.len());
         let mut sessions = Vec::with_capacity(specs.len());
+        let mut pane_task: Vec<Option<coordinator::TaskId>> = Vec::with_capacity(specs.len());
 
         for (idx, spec) in specs.into_iter().enumerate() {
             let name = spec.name.clone();
@@ -180,11 +199,12 @@ impl App {
                     sessions.push(None);
                 }
             }
+            // Plain `run` panes are not coordinated.
+            pane_task.push(None);
         }
 
-        // Drop our own sender clone so disconnect is observable once every
-        // forwarder has exited.
-        drop(bus_tx);
+        // NOTE: we keep `bus_tx` (stored on the App) rather than dropping it,
+        // so `spawn_one` can add orchestrated panes mid-run.
 
         let backend = CrosstermBackend::new(io::stdout());
         let terminal = Terminal::new(backend).context("building ratatui terminal")?;
@@ -200,6 +220,12 @@ impl App {
             worktrees: owned,
             scheduler: FrameScheduler::new(TARGET_FRAME_60FPS, Instant::now()),
             snapshot_tx: None,
+            coordinator: None,
+            orch_agent: None,
+            pane_task,
+            cols,
+            rows,
+            bus_tx,
         })
     }
 }
@@ -213,6 +239,16 @@ impl<B: Backend> App<B> {
     /// WebSocket server drains it and broadcasts to connected clients.
     pub fn set_snapshot_sender(&mut self, tx: UnboundedSender<Vec<AgentSnapshot>>) {
         self.snapshot_tx = Some(tx);
+    }
+
+    /// Feature 7: attach a coordinator + agent binary so the loop dispatches
+    /// tasks dependency-gated (one new pane per released task, as its deps
+    /// complete). Call after [`App::spawn_agents`] (typically with an empty
+    /// spec list — the initial tasks are spawned by the first loop tick) and
+    /// before [`App::run`].
+    pub fn set_orchestration(&mut self, coordinator: Coordinator, agent: String) {
+        self.coordinator = Some(coordinator);
+        self.orch_agent = Some(agent);
     }
 
     /// Publish the current per-pane snapshot if a companion is attached.
@@ -310,6 +346,12 @@ impl<B: Backend> App<B> {
             // mobile-companion channel (no-op when none is attached).
             self.publish_snapshot();
 
+            // Feature 7: pump orchestration — dispatch any tasks whose deps
+            // just completed. Done BEFORE the all-sessions-gone check so the
+            // initial tasks spawn on tick 1 (an orchestrated App starts empty)
+            // and so newly-freed dependents keep the loop alive.
+            self.pump_orchestration();
+
             // Poll with the scheduler-chosen timeout: ~remaining-to-next-frame
             // when active, the longer idle interval when nothing is happening.
             if event::poll(self.scheduler.poll_timeout(now))? {
@@ -318,13 +360,25 @@ impl<B: Backend> App<B> {
                 self.scheduler.record_activity(Instant::now());
                 self.handle_event(ev);
             }
-            // Auto-exit once no agent process remains (all Exit updates
-            // applied). A user can also quit explicitly with Esc / Ctrl+C.
-            if self.all_sessions_gone() {
+            // Auto-exit once no agent process remains AND orchestration has no
+            // pending/running tasks left to dispatch. A user can also quit
+            // explicitly with Esc / Ctrl+C.
+            if self.all_sessions_gone() && self.orchestration_drained() {
                 break;
             }
         }
         Ok(())
+    }
+
+    /// True when orchestration is inactive (plain `run`) or the coordinator
+    /// has no non-terminal tasks left (everything Done/Failed). Combined with
+    /// [`App::all_sessions_gone`] this is the orchestrated run's completion
+    /// signal: nothing left to spawn and nothing still running.
+    fn orchestration_drained(&self) -> bool {
+        match &self.coordinator {
+            None => true,
+            Some(coord) => coord.tasks().iter().all(|t| t.status.is_terminal()),
+        }
     }
 
     /// Drain every pending [`AgentUpdate`] into the panes in one batch.
@@ -434,6 +488,79 @@ impl<B: Backend> App<B> {
                 if let Some(slot) = self.sessions.get_mut(pane_id) {
                     slot.take();
                 }
+                // Feature 7: if this pane ran an orchestrated task, report its
+                // completion to the coordinator so dependent tasks can be
+                // dispatched on the next pump.
+                if let Some(tid) = self.pane_task.get(pane_id).copied().flatten() {
+                    let failed = self
+                        .panes
+                        .get(pane_id)
+                        .map(|p| matches!(p.state(), AgentState::Failed(_)))
+                        .unwrap_or(false);
+                    let summary = if failed { "failed".to_string() } else { "done".to_string() };
+                    if let Some(coord) = self.coordinator.as_mut() {
+                        coord.report_done(tid, summary);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Append a new agent pane mid-run (Feature 7 orchestration). Spawns the
+    /// PTY, wires it onto the bus, and returns the new pane index.
+    fn spawn_one(&mut self, spec: AgentSpec) -> usize {
+        let idx = self.panes.len();
+        let name = spec.name.clone();
+        let cols = self.cols;
+        let rows = self.rows;
+        match PtySession::spawn(spec.command, None, cols, rows) {
+            Ok((session, rx)) => {
+                let mut pane = Pane::new(idx, &name, cols, rows);
+                pane.set_state(AgentState::Running);
+                self.panes.push(pane);
+                let tx = self.bus_tx.clone();
+                let _ = thread::Builder::new()
+                    .name(format!("orca-bus-fwd({name})"))
+                    .spawn(move || bus::forward_session(idx, rx, tx));
+                self.sessions.push(Some(session));
+            }
+            Err(err) => {
+                eprintln!("orca-tui: failed to spawn {name:?}: {err:#}");
+                let mut pane = Pane::new(idx, &name, cols, rows);
+                pane.set_state(AgentState::Failed(format!("{err:#}")));
+                self.panes.push(pane);
+                self.sessions.push(None);
+            }
+        }
+        self.pane_task.push(None);
+        idx
+    }
+
+    /// Feature 7: release every dependency-gated task the coordinator can
+    /// dispatch right now, each to its own new pane. Called once per loop tick
+    /// so a task whose dependencies just completed spawns on the next frame.
+    fn pump_orchestration(&mut self) {
+        if self.coordinator.is_none() {
+            return;
+        }
+        let agent = self.orch_agent.clone().unwrap_or_default();
+        loop {
+            let dispatch = self
+                .coordinator
+                .as_mut()
+                .and_then(|c| c.dispatch_next(&[agent.clone()]));
+            let Some(dispatch) = dispatch else {
+                break;
+            };
+            let tid = dispatch.task_id;
+            let mut spec = AgentSpec::from_command(vec![agent.clone(), dispatch.prompt.clone()]);
+            spec.name = format!("task-{tid}");
+            if let Some(c) = self.coordinator.as_mut() {
+                c.mark_in_progress(tid);
+            }
+            let pane_id = self.spawn_one(spec);
+            if let Some(slot) = self.pane_task.get_mut(pane_id) {
+                *slot = Some(tid);
             }
         }
     }
@@ -643,7 +770,7 @@ mod tests {
             // size via an ioctl that errors). The decision logic under test
             // never touches the terminal anyway.
             let terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal backend");
-            let (_tx, rx) = bus::channel();
+            let (bus_tx, rx) = bus::channel();
             Self {
                 panes,
                 sessions: (0..n).map(|_| None::<PtySession>).collect(),
@@ -655,6 +782,12 @@ mod tests {
                 worktrees: None,
                 scheduler: FrameScheduler::new(TARGET_FRAME_60FPS, Instant::now()),
                 snapshot_tx: None,
+                coordinator: None,
+                orch_agent: None,
+                pane_task: (0..n).map(|_| None).collect(),
+                cols: 80,
+                rows: 24,
+                bus_tx,
             }
         }
     }
