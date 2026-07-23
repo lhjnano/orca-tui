@@ -52,11 +52,10 @@ pub fn render_sidebar(
     entries: &[SidebarEntry],
     theme: &ThemeConfig,
 ) {
-    let block = Block::default()
-        .borders(Borders::RIGHT)
-        .border_style(Style::default().fg(theme.fg()).add_modifier(Modifier::DIM))
-        .style(Style::default().bg(theme.bg()));
-    // `block.inner` does not mutate; compute before rendering the block.
+    // No border — the 1-cell gap between sidebar and panes (from app.rs
+    // Layout::horizontal().spacing(1)) provides visual separation, and the
+    // panes' own Double borders form the boundary. A background fill is enough.
+    let block = Block::default().style(Style::default().bg(theme.bg()));
     let inner = block.inner(area);
     frame.render_widget(&block, area);
 

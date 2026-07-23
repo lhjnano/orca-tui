@@ -737,9 +737,13 @@ impl<B: Backend> App<B> {
         // live activity from OSC 9999). Hidden when sidebar_width is 0 or the
         // terminal is too narrow for panes to be usable.
         let sidebar_w = self.config.layout.sidebar_width;
-        let show_sidebar = sidebar_w > 0 && total.width > sidebar_w + 20;
+        let show_sidebar = sidebar_w > 0 && total.width > sidebar_w + 22;
         let (sidebar_area, content_area) = if show_sidebar {
+            // spacing(1) adds a 1-cell gap between the sidebar and the pane
+            // area — the panes' own Double borders provide the visual boundary,
+            // so the sidebar needs no right border of its own.
             let h = Layout::horizontal([Constraint::Length(sidebar_w), Constraint::Min(1)])
+                .spacing(1)
                 .split(total);
             (Some(h[0]), h[1])
         } else {
