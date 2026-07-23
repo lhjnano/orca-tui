@@ -74,7 +74,7 @@ pub fn render_sidebar(
     buf.set_stringn(
         inner.x,
         inner.y,
-        " \u{1F433} orca-tui ",
+        "\u{25B8} orca-tui",
         usize::from(inner.width),
         Style::default().fg(theme.accent()).bg(bg),
     );

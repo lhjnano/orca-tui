@@ -183,7 +183,7 @@ impl Pane {
     /// brightens the border.
     pub fn render(&self, frame: &mut Frame<'_>, area: Rect, focused: bool) {
         let border_color = if focused {
-            Color::Cyan
+            Color::LightBlue
         } else {
             Color::DarkGray
         };

@@ -23,7 +23,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -50,9 +53,26 @@ use crate::worktree::{OwnedWorktrees, WorktreeManager};
 
 use tokio::sync::mpsc::UnboundedSender;
 
-/// One-line footer shown at the bottom of the screen with the keybindings.
-const FOOTER: &str =
-    " Tab: focus \u{00B7} Shift+Tab: prev \u{00B7} Alt+\u{2191}\u{2193}: scroll \u{00B7} Ctrl+C / Esc: quit \u{00B7} type to send ";
+/// Input mode — zellij-style. Normal = passthrough, Pane = focus nav.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum InputMode {
+    #[default]
+    Normal,
+    Pane,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FocusDir {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+const FOOTER_NORMAL: &str =
+    " NORMAL \u{00B7} Ctrl+P: panes \u{00B7} Ctrl+Q: quit \u{00B7} mouse: scroll ";
+const FOOTER_PANE: &str =
+    " PANE \u{00B7} arrows/hjkl: focus \u{00B7} Tab: next \u{00B7} Esc: back ";
 
 /// The interactive Orca TUI application.
 ///
@@ -118,6 +138,8 @@ pub struct App<B: Backend = CrosstermBackend<Stdout>> {
     reconnect_due: Vec<Option<Instant>>,
     /// User configuration (theme, layout, default agent).
     config: Config,
+    /// Current input mode (Normal = passthrough, Pane = focus navigation).
+    mode: InputMode,
 }
 
 impl App {
@@ -251,6 +273,7 @@ impl App {
             reconnect,
             reconnect_due,
             config: Config::load_or_default(),
+            mode: InputMode::Normal,
         })
     }
 }
@@ -318,7 +341,8 @@ impl<B: Backend> App<B> {
     fn setup_terminal(&mut self) -> Result<()> {
         enable_raw_mode().context("enabling raw mode")?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen).context("entering alternate screen")?;
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
+            .context("entering alt screen + mouse")?;
         self.raw_mode_active = true;
         Ok(())
     }
@@ -724,14 +748,10 @@ impl<B: Backend> App<B> {
     /// the agent process agree on dimensions.
     fn render(&mut self) -> Result<()> {
         let size = self.terminal.size()?;
-        // 1-cell margin around the whole app — breathing room from the terminal
-        // edge so content doesn't sit flush against the screen border.
-        let total = Rect::new(
-            1,
-            1,
-            size.width.saturating_sub(2).max(MIN_COLS),
-            size.height.saturating_sub(2).max(MIN_ROWS),
-        );
+        // Edge-to-edge — no outer margin, so the layout fills the terminal and
+        // feels dense ("꽉찬") like opencode. Double borders on panes provide
+        // the visual separation that the margin/spacing previously gave.
+        let total = Rect::new(0, 0, size.width, size.height);
 
         // Reserve the left sidebar (Orca-style agent list with status dots +
         // live activity from OSC 9999). Hidden when sidebar_width is 0 or the
@@ -801,7 +821,18 @@ impl<B: Backend> App<B> {
             }
             if reserve_footer {
                 f.render_widget(
-                    Paragraph::new(FOOTER).style(Style::default().fg(Color::DarkGray)),
+                    Paragraph::new(if self.mode == InputMode::Pane {
+                        FOOTER_PANE
+                    } else {
+                        FOOTER_NORMAL
+                    })
+                    .style(Style::default().fg(
+                        if self.mode == InputMode::Pane {
+                            self.config.theme.accent()
+                        } else {
+                            Color::DarkGray
+                        },
+                    )),
                     footer_area,
                 );
             }
@@ -813,56 +844,127 @@ impl<B: Backend> App<B> {
     fn handle_event(&mut self, ev: Event) {
         match ev {
             Event::Key(key) => {
-                // On unix crossterm emits both Press and Release; only act on
-                // Press to avoid firing every binding twice.
                 if key.kind == KeyEventKind::Press {
                     self.handle_key(key);
                 }
             }
-            Event::Resize(_, _) => {
-                // No explicit action: the next `render()` re-reads the terminal
-                // size and reconciles each pane/PTY to its new rect.
-            }
+            Event::Mouse(mouse) => self.handle_mouse(mouse),
+            Event::Resize(_, _) => {}
             _ => {}
         }
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        // Global hotkeys (any mode): Ctrl+P → pane mode, Ctrl+Q → quit.
+        if ctrl && key.code == KeyCode::Char('p') {
+            self.mode = InputMode::Pane;
+            return;
+        }
+        if ctrl && key.code == KeyCode::Char('q') {
+            self.quit = true;
+            return;
+        }
+        match self.mode {
+            InputMode::Normal => self.forward_key_to_agent(key),
+            InputMode::Pane => match key.code {
+                KeyCode::Esc => self.mode = InputMode::Normal,
+                KeyCode::Tab => self.focus_next(),
+                KeyCode::BackTab => self.focus_prev(),
+                KeyCode::Up | KeyCode::Char('k') => self.focus_directional(FocusDir::Up),
+                KeyCode::Down | KeyCode::Char('j') => self.focus_directional(FocusDir::Down),
+                KeyCode::Left | KeyCode::Char('h') => self.focus_directional(FocusDir::Left),
+                KeyCode::Right | KeyCode::Char('l') => self.focus_directional(FocusDir::Right),
+                _ => {}
+            },
+        }
+    }
 
+    /// Normal-mode passthrough: forward the key to the focused agent's PTY as
+    /// raw bytes / VT escape sequences. The agent receives everything — Tab,
+    /// Esc, Ctrl+C, arrows — exactly as if it were a real terminal.
+    fn forward_key_to_agent(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
-            // --- Quit -----------------------------------------------------
-            // Esc always quits; Ctrl+C quits (plain `c` is forwarded below so
-            // agents like a shell still receive it).
-            KeyCode::Esc => self.quit = true,
-            KeyCode::Char('c') if ctrl => self.quit = true,
-            // --- Focus switching -----------------------------------------
-            KeyCode::Tab => self.focus_next(),
-            KeyCode::BackTab => self.focus_prev(),
-            // --- Per-pane scroll -----------------------------------------
-            KeyCode::Up if alt => {
+            KeyCode::Char(c) if ctrl => {
+                let byte = (c as u8).to_ascii_lowercase().wrapping_sub(b'a' - 1);
+                self.send_to_focused(&[byte]);
+            }
+            KeyCode::Char(c) if !ctrl && !alt => self.send_to_focused(&[c as u8]),
+            KeyCode::Enter if !ctrl && !alt => self.send_to_focused(b"\r"),
+            KeyCode::Backspace if !ctrl && !alt => self.send_to_focused(&[0x7f]),
+            KeyCode::Tab if !ctrl && !alt => self.send_to_focused(b"\t"),
+            KeyCode::Esc => self.send_to_focused(b"\x1b"),
+            KeyCode::Up => self.send_to_focused(b"\x1b[A"),
+            KeyCode::Down => self.send_to_focused(b"\x1b[B"),
+            KeyCode::Right => self.send_to_focused(b"\x1b[C"),
+            KeyCode::Left => self.send_to_focused(b"\x1b[D"),
+            KeyCode::Home => self.send_to_focused(b"\x1b[H"),
+            KeyCode::End => self.send_to_focused(b"\x1b[F"),
+            KeyCode::PageUp => self.send_to_focused(b"\x1b[5~"),
+            KeyCode::PageDown => self.send_to_focused(b"\x1b[6~"),
+            KeyCode::Delete => self.send_to_focused(b"\x1b[3~"),
+            KeyCode::BackTab => self.send_to_focused(b"\x1b[Z"),
+            _ => {}
+        }
+    }
+
+    /// Mouse scroll: move the focused pane's scrollback (3 lines per notch).
+    fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
                 if let Some(p) = self.focused_pane_mut() {
-                    p.scroll_up(1);
+                    p.scroll_up(3);
                 }
             }
-            KeyCode::Down if alt => {
+            MouseEventKind::ScrollDown => {
                 if let Some(p) = self.focused_pane_mut() {
-                    p.scroll_down(1);
+                    p.scroll_down(3);
                 }
-            }
-            // --- Forward to the focused PTY ------------------------------
-            KeyCode::Char(c) if !ctrl && !alt => {
-                self.send_to_focused(&[c as u8]);
-            }
-            KeyCode::Enter if !ctrl && !alt => {
-                self.send_to_focused(b"\r");
-            }
-            KeyCode::Backspace if !ctrl && !alt => {
-                self.send_to_focused(&[0x7f]);
             }
             _ => {}
         }
+    }
+
+    /// Grid-aware directional focus (Pane mode: arrows / hjkl).
+    fn focus_directional(&mut self, dir: FocusDir) {
+        let n = self.panes.len();
+        if n == 0 {
+            return;
+        }
+        let cols = ((n as f64).sqrt().ceil() as usize).max(1);
+        self.focus = match dir {
+            FocusDir::Right => {
+                let row_end = (self.focus / cols + 1) * cols;
+                if self.focus + 1 < row_end.min(n) {
+                    self.focus + 1
+                } else {
+                    self.focus
+                }
+            }
+            FocusDir::Left => {
+                if self.focus % cols > 0 {
+                    self.focus - 1
+                } else {
+                    self.focus
+                }
+            }
+            FocusDir::Down => {
+                if self.focus + cols < n {
+                    self.focus + cols
+                } else {
+                    self.focus
+                }
+            }
+            FocusDir::Up => {
+                if self.focus >= cols {
+                    self.focus - cols
+                } else {
+                    self.focus
+                }
+            }
+        };
     }
 
     fn focus_next(&mut self) {
@@ -919,7 +1021,7 @@ impl<B: Backend> Drop for App<B> {
         // `PtySession` drops below kill+join any still-running agents.
         if self.raw_mode_active {
             let mut stdout = io::stdout();
-            let _ = execute!(stdout, LeaveAlternateScreen);
+            let _ = execute!(stdout, LeaveAlternateScreen, DisableMouseCapture);
             let _ = disable_raw_mode();
             let _ = self.terminal.show_cursor();
             self.raw_mode_active = false;
@@ -974,6 +1076,7 @@ mod tests {
                 reconnect: (0..n).map(|_| None).collect(),
                 reconnect_due: (0..n).map(|_| None).collect(),
                 config: Config::default(),
+                mode: InputMode::Normal,
             }
         }
     }
@@ -1063,20 +1166,33 @@ mod tests {
     }
 
     #[test]
-    fn handle_key_esc_and_ctrl_c_quit_tab_focuses() {
+    fn handle_key_mode_switch_ctrl_q_quit_and_pane_focus() {
         let mut app = App::for_test(vec![pane(0, "a"), pane(1, "b")]);
+        assert_eq!(app.mode, InputMode::Normal);
         assert!(!app.quit);
-        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(app.quit, "Esc quits");
 
-        app.quit = false;
-        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
-        assert!(app.quit, "Ctrl+C quits");
+        // Ctrl+Q quits from any mode.
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
+        assert!(app.quit, "Ctrl+Q quits");
 
+        // Ctrl+P enters pane mode.
         app.quit = false;
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert_eq!(app.mode, InputMode::Pane, "Ctrl+P enters pane mode");
+
+        // In pane mode: Tab advances focus.
         app.focus = 0;
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(app.focus, 1, "Tab advances focus");
+        assert_eq!(app.focus, 1, "Tab advances focus in pane mode");
+
+        // Esc exits pane mode back to normal.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.mode, InputMode::Normal, "Esc exits pane mode");
+
+        // In normal mode: Tab is forwarded to the agent, NOT focus switching.
+        app.focus = 0;
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.focus, 0, "Tab in normal mode does NOT switch focus");
     }
 
     #[test]
@@ -1139,8 +1255,8 @@ mod tests {
         // Fed agent output is painted into pane 0's body.
         assert!(text.contains("hello-world"), "fed content rendered");
         // The footer key-hints are drawn on the reserved last line.
-        assert!(text.contains("Tab"), "footer rendered");
-        assert!(text.contains("focus"));
+        assert!(text.contains("Ctrl+P"), "footer rendered");
+        assert!(text.contains("quit"));
     }
 
     #[test]

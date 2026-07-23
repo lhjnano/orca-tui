@@ -30,10 +30,10 @@ pub fn split_panes(area: Rect, n: usize) -> Vec<Rect> {
     let cols = ((n as f64).sqrt().ceil() as usize).max(1);
     let rows = n.div_ceil(cols);
 
-    // Even vertical split into `rows` rows, with a 1-cell gap between rows
-    // for visual separation (Double borders + gap = readable multi-pane layout).
+    // Tight grid — panes share Double borders (drawn by Pane::render) for
+    // separation. No spacing gap so the layout feels dense.
     let v: Vec<Constraint> = (0..rows).map(|_| Constraint::Min(1)).collect();
-    let row_rects = Layout::vertical(v).spacing(1).split(area);
+    let row_rects = Layout::vertical(v).split(area);
 
     let mut out = Vec::with_capacity(n);
     let mut idx = 0usize;
@@ -44,7 +44,7 @@ pub fn split_panes(area: Rect, n: usize) -> Vec<Rect> {
         let remaining = n - idx;
         let in_row = remaining.min(cols);
         let h: Vec<Constraint> = (0..in_row).map(|_| Constraint::Min(1)).collect();
-        let cell_rects = Layout::horizontal(h).spacing(1).split(row_rects[r]);
+        let cell_rects = Layout::horizontal(h).split(row_rects[r]);
         for c in 0..in_row {
             // `cell_rects` is an Rc<[Rect]>; index it directly.
             out.push(cell_rects[c]);
