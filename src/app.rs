@@ -68,7 +68,7 @@ enum InputMode {
 /// The daemon connection state — drives the sidebar indicator + error handling.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ConnectionState {
-    /// No daemon — orca-tui manages PTYs directly (the default/legacy mode).
+    /// No daemon — orcatui manages PTYs directly (the default/legacy mode).
     #[default]
     Standalone,
     /// Connected to a daemon — panes are backed by daemon sessions.
@@ -314,7 +314,7 @@ impl App {
                     sessions.push(Some(session));
                 }
                 Err(err) => {
-                    eprintln!("orca-tui: failed to spawn {name:?}: {err:#}");
+                    eprintln!("orcatui: failed to spawn {name:?}: {err:#}");
                     let mut pane = Pane::new(idx, &name, cols, rows);
                     pane.set_state(AgentState::Failed(format!("{err:#}")));
                     panes.push(pane);
@@ -427,7 +427,7 @@ impl<B: Backend> App<B> {
             if result.is_ok() {
                 return Err(restore_err);
             }
-            eprintln!("orca-tui: terminal restore failed: {restore_err:#}");
+            eprintln!("orcatui: terminal restore failed: {restore_err:#}");
         }
         result
     }
@@ -758,7 +758,7 @@ impl<B: Backend> App<B> {
         let cols = self.cols;
         let rows = self.rows;
         let session_id = format!(
-            "orca-tui-{}-{}",
+            "orcatui-{}-{}",
             idx,
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

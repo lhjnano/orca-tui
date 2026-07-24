@@ -2,7 +2,7 @@
 //!
 //! Orca GUI runs a background daemon (`src/main/daemon/`) that manages agent
 //! PTYs, headless terminal emulators, and session history. This module lets
-//! orca-tui connect to that daemon as a TUI client — giving it session
+//! orcatui connect to that daemon as a TUI client — giving it session
 //! persistence, structured agent status, and multi-client (GUI + TUI) support.
 //!
 //! ## Protocol (from the open-source daemon code)

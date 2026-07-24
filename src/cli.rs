@@ -1,6 +1,6 @@
 //! # CLI
 //!
-//! Argument parsing and subcommand dispatch for the `orca-tui` binary. Kept in
+//! Argument parsing and subcommand dispatch for the `orcatui` binary. Kept in
 //! the library (not `main.rs`) so the dispatch logic is unit-testable and the
 //! binary stays a one-line entry point.
 
@@ -28,7 +28,7 @@ pub fn run() -> Result<()> {
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "orca-tui",
+    name = "orcatui",
     version = VERSION,
     about = "Terminal multi-agent coding orchestrator (TUI port of Orca GUI)"
 )]
@@ -44,8 +44,8 @@ enum Command {
     /// The trailing command list is split into per-agent commands on the
     /// literal `::` separator, and each command gets its own pane, e.g.
     ///
-    /// - `orca-tui run -- claude codex opencode` → three side-by-side panes.
-    /// - `orca-tui run -- claude :: codex --model x :: opencode` → three panes;
+    /// - `orcatui run -- claude codex opencode` → three side-by-side panes.
+    /// - `orcatui run -- claude :: codex --model x :: opencode` → three panes;
     ///   the middle agent's command is `codex --model x`.
     ///
     /// **Splitting rule:** if any `::` is present the list is split into the
@@ -172,7 +172,7 @@ fn try_main(cli: Cli) -> Result<()> {
             if commands.is_empty() {
                 anyhow::bail!(
                     "no agent command given — usage: \
-                     orca-tui run [--cwd <DIR>] [--worktree] [--remote <HOST>] -- <command>...  \
+                     orcatui run [--cwd <DIR>] [--worktree] [--remote <HOST>] -- <command>...  \
                      (separate per-agent commands with '::')"
                 );
             }
@@ -234,7 +234,7 @@ fn try_main(cli: Cli) -> Result<()> {
                         ));
                     })?;
                 eprintln!(
-                    "orca-tui: mobile companion — ws://{addr}?token={token} \
+                    "orcatui: mobile companion — ws://{addr}?token={token} \
                      (live pane status while the agents run)"
                 );
                 app.set_snapshot_sender(snap_tx);
@@ -287,7 +287,7 @@ fn try_main(cli: Cli) -> Result<()> {
             let source = if issues.is_some() { "issues" } else { "spec" };
             let mode = if parallel { "parallel" } else { "sequential" };
             println!(
-                "orca-tui: orchestrating {} task(s) via agent `{agent_bin}` \
+                "orcatui: orchestrating {} task(s) via agent `{agent_bin}` \
                  ({mode}, source: {source}, task text passed as the prompt):",
                 coord.tasks().len()
             );
@@ -307,7 +307,7 @@ fn try_main(cli: Cli) -> Result<()> {
             let repo = RepoRef::parse(&repo)?;
             let prs = integrations::list_pull_requests(&repo)?;
             if prs.is_empty() {
-                println!("orca-tui: no open pull requests for {repo}");
+                println!("orcatui: no open pull requests for {repo}");
             }
             for pr in prs {
                 match &pr.branch {
@@ -322,7 +322,7 @@ fn try_main(cli: Cli) -> Result<()> {
             let repo = RepoRef::parse(&repo)?;
             let issues = integrations::list_issues(&repo)?;
             if issues.is_empty() {
-                println!("orca-tui: no open issues for {repo}");
+                println!("orcatui: no open issues for {repo}");
             }
             for iss in issues {
                 println!("#{}  {}", iss.number, iss.title);
@@ -337,7 +337,7 @@ fn try_main(cli: Cli) -> Result<()> {
             // the server is up and accepting connections (clients hold socket).
             let (_snapshot_tx, snapshot_rx) =
                 tokio::sync::mpsc::unbounded_channel::<Vec<mobile::AgentSnapshot>>();
-            println!("orca-tui: mobile companion server");
+            println!("orcatui: mobile companion server");
             println!("  listen: ws://{addr}");
             println!("  token: {token}");
             println!("  (connect a mobile client to ws://{addr}?token={token})");
@@ -477,7 +477,7 @@ mod tests {
     #[test]
     fn parse_run_with_all_flags() {
         let cli = Cli::try_parse_from([
-            "orca-tui",
+            "orcatui",
             "run",
             "--cwd",
             "/tmp",
@@ -517,7 +517,7 @@ mod tests {
     #[test]
     fn parse_run_defaults_when_flags_absent() {
         // Only the required trailing command is given; every flag defaults.
-        let cli = Cli::try_parse_from(["orca-tui", "run", "claude"]).expect("minimal run parses");
+        let cli = Cli::try_parse_from(["orcatui", "run", "claude"]).expect("minimal run parses");
         match cli.command {
             Command::Run {
                 cwd,
@@ -543,7 +543,7 @@ mod tests {
     #[test]
     fn parse_orchestrate_spec_and_parallel() {
         let cli = Cli::try_parse_from([
-            "orca-tui",
+            "orcatui",
             "orchestrate",
             "--spec",
             "task one\ntask two",
@@ -566,7 +566,7 @@ mod tests {
 
     #[test]
     fn parse_orchestrate_issues_overrides_spec() {
-        let cli = Cli::try_parse_from(["orca-tui", "orchestrate", "--issues", "owner/name"])
+        let cli = Cli::try_parse_from(["orcatui", "orchestrate", "--issues", "owner/name"])
             .expect("orchestrate --issues parses");
         match cli.command {
             Command::Orchestrate {
@@ -585,13 +585,13 @@ mod tests {
     #[test]
     fn parse_prs_and_issues_repo() {
         let prs =
-            Cli::try_parse_from(["orca-tui", "prs", "octocat/hello-world"]).expect("prs parses");
+            Cli::try_parse_from(["orcatui", "prs", "octocat/hello-world"]).expect("prs parses");
         match prs.command {
             Command::Prs { repo } => assert_eq!(repo, "octocat/hello-world"),
             other => panic!("expected Prs, got {other:?}"),
         }
 
-        let issues = Cli::try_parse_from(["orca-tui", "issues", "octocat/hello-world"])
+        let issues = Cli::try_parse_from(["orcatui", "issues", "octocat/hello-world"])
             .expect("issues parses");
         match issues.command {
             Command::Issues { repo } => assert_eq!(repo, "octocat/hello-world"),
@@ -601,14 +601,14 @@ mod tests {
 
     #[test]
     fn parse_mobile_default_and_custom_port() {
-        let default = Cli::try_parse_from(["orca-tui", "mobile"]).expect("mobile parses");
+        let default = Cli::try_parse_from(["orcatui", "mobile"]).expect("mobile parses");
         match default.command {
             Command::Mobile { port } => assert_eq!(port, 0, "port defaults to 0"),
             other => panic!("expected Mobile, got {other:?}"),
         }
 
         let custom =
-            Cli::try_parse_from(["orca-tui", "mobile", "--port", "9090"]).expect("mobile --port");
+            Cli::try_parse_from(["orcatui", "mobile", "--port", "9090"]).expect("mobile --port");
         match custom.command {
             Command::Mobile { port } => assert_eq!(port, 9090),
             other => panic!("expected Mobile, got {other:?}"),
@@ -619,7 +619,7 @@ mod tests {
     fn version_flag_is_recognized() {
         // clap handles `--version` by yielding a DisplayVersion error (in the
         // real binary it would print + exit). Assert the flag is wired up.
-        let err = Cli::try_parse_from(["orca-tui", "--version"])
+        let err = Cli::try_parse_from(["orcatui", "--version"])
             .expect_err("--version is a display action, not a normal parse");
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
     }
@@ -628,7 +628,7 @@ mod tests {
     fn run_captures_separator_tokens_verbatim() {
         // Everything after `--` is captured verbatim, including `::`.
         let cli = Cli::try_parse_from([
-            "orca-tui", "run", "--", "claude", "::", "codex", "--model", "x", "::", "opencode",
+            "orcatui", "run", "--", "claude", "::", "codex", "--model", "x", "::", "opencode",
         ])
         .expect("trailing capture parses");
         let command = match cli.command {
@@ -662,7 +662,7 @@ mod tests {
         // command vec. The "no agent command given" guard lives in `try_main`
         // (split_agents + bail), NOT in the parser — this test pins that
         // contract so the runtime guard is never accidentally removed.
-        let cli = Cli::try_parse_from(["orca-tui", "run"])
+        let cli = Cli::try_parse_from(["orcatui", "run"])
             .expect("clap accepts an empty trailing-var-arg list");
         let command = match cli.command {
             Command::Run { command, .. } => command,
@@ -676,13 +676,13 @@ mod tests {
     #[test]
     fn prs_without_repo_is_a_required_arg_error() {
         let err =
-            Cli::try_parse_from(["orca-tui", "prs"]).expect_err("prs requires the repo positional");
+            Cli::try_parse_from(["orcatui", "prs"]).expect_err("prs requires the repo positional");
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
     }
 
     #[test]
     fn unknown_subcommand_is_an_error() {
-        let err = Cli::try_parse_from(["orca-tui", "frobnicate"])
+        let err = Cli::try_parse_from(["orcatui", "frobnicate"])
             .expect_err("unknown subcommand rejected");
         assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand);
     }

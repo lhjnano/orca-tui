@@ -1,10 +1,10 @@
 //! # SSH remote — remote-agent PTY over `ssh` (Feature 8)
 //!
-//! orca-tui normally spawns a coding agent in a *local* PTY via
+//! orcatui normally spawns a coding agent in a *local* PTY via
 //! [`crate::pty_session::PtySession::spawn`]. Feature 8 runs an agent on a
 //! *remote* box: the remote agent is conceptually the same
 //! [`PtySession::spawn`] call, only the argv is an `ssh` invocation that
-//! requests a remote PTY and attaches the agent's stdout to it. orca-tui
+//! requests a remote PTY and attaches the agent's stdout to it. orcatui
 //! shells out to the `ssh` CLI binary (via [`crate::pty_session`]); **no Rust
 //! SSH crate is added**.
 //!

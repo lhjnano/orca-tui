@@ -90,7 +90,7 @@ impl PtySession {
         // capabilities and may not render at all.
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
-        cmd.env("TERM_PROGRAM", "orca-tui");
+        cmd.env("TERM_PROGRAM", "orcatui");
 
         let child = pair
             .slave

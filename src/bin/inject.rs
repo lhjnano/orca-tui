@@ -1,27 +1,27 @@
-//! # orca-inject — record / replay / snapshot tool for orca-tui's terminal pipeline
+//! # orcatui-inject — record / replay / snapshot tool for orcatui's terminal pipeline
 //!
 //! A companion debugger modeled on `ratatui-ppalla`'s `tui-inject`: drive
-//! orca-tui's terminal-emulation + query-responder + render pipeline with
+//! orcatui's terminal-emulation + query-responder + render pipeline with
 //! **deterministic, recorded PTY byte streams** instead of a live terminal, so
 //! rendering bugs (e.g. an agent that draws blank) can be reproduced, inspected,
 //! and bisected without the flakiness of live debugging.
 //!
-//! Where tui-inject injects *keyboard events* into a widget loop, orca-inject
-//! injects *agent output bytes* into [`orca_tui::terminal_emu::TerminalEmulator`]
-//! (+ [`orca_tui::query::QueryResponder`]), because that byte stream is what
+//! Where tui-inject injects *keyboard events* into a widget loop, orcatui-inject
+//! injects *agent output bytes* into [`orcatui::terminal_emu::TerminalEmulator`]
+//! (+ [`orcatui::query::QueryResponder`]), because that byte stream is what
 //! determines whether an agent renders.
 //!
 //! ## Commands
 //!
 //! ```text
-//! orca-inject record [--for 10] [--out recording.bin] -- <agent> [args...]
-//! orca-inject replay <file> [--size WxH] [--resize WxH@chunk] [--chunk N] [--render]
+//! orcatui-inject record [--for 10] [--out recording.bin] -- <agent> [args...]
+//! orcatui-inject replay <file> [--size WxH] [--resize WxH@chunk] [--chunk N] [--render]
 //! ```
 //!
 //! - `record` spawns a real agent in a PTY and saves its raw output bytes.
 //! - `replay` feeds those bytes through the emulator (+ query responder) at a
 //!   chosen size, optionally simulating a mid-stream resize, and dumps the
-//!   resulting emulator grid as text — so you can see exactly what orca-tui's
+//!   resulting emulator grid as text — so you can see exactly what orcatui's
 //!   vt100 produced (logo present? blank? misaligned?). `--render` additionally
 //!   renders a real pane frame (with border + theme) to show what the user sees.
 
@@ -31,16 +31,16 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 
-use orca_tui::config::ThemeConfig;
-use orca_tui::pane::Pane;
-use orca_tui::pty_session::PtySession;
-use orca_tui::query::QueryResponder;
-use orca_tui::terminal_emu::TerminalEmulator;
+use orcatui::config::ThemeConfig;
+use orcatui::pane::Pane;
+use orcatui::pty_session::PtySession;
+use orcatui::query::QueryResponder;
+use orcatui::terminal_emu::TerminalEmulator;
 
 #[derive(Parser)]
 #[command(
-    name = "orca-inject",
-    about = "Record/replay/snapshot orca-tui's terminal pipeline (tui-inject for PTY bytes)"
+    name = "orcatui-inject",
+    about = "Record/replay/snapshot orcatui's terminal pipeline (tui-inject for PTY bytes)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -61,7 +61,7 @@ enum Cmd {
         #[arg(long, default_value = "80x24")]
         size: String,
         /// Mid-recording PTY resize `WxH@secs`: resize the agent's PTY after
-        /// `secs` seconds (reproduces orca-tui spawning then resizing). The
+        /// `secs` seconds (reproduces orcatui spawning then resizing). The
         /// byte offset of the resize is printed to stderr.
         #[arg(long)]
         resize: Option<String>,
@@ -140,7 +140,7 @@ fn record(
 ) -> Result<()> {
     if agent.is_empty() {
         return Err(anyhow!(
-            "record requires an agent command after `--`, e.g. `orca-inject record -- opencode`"
+            "record requires an agent command after `--`, e.g. `orcatui-inject record -- opencode`"
         ));
     }
     let (cols, rows) = parse_size(size)?;
@@ -155,7 +155,7 @@ fn record(
         if let Some((rw, rh, at_secs)) = pending_resize {
             if std::time::Instant::now() >= start + Duration::from_secs(at_secs as u64) {
                 let _ = session.resize(rw, rh);
-                eprintln!("orca-inject: resized PTY → {rw}x{rh} at byte offset {total}");
+                eprintln!("orcatui-inject: resized PTY → {rw}x{rh} at byte offset {total}");
                 pending_resize = None;
             }
         }
@@ -169,7 +169,7 @@ fn record(
         }
     }
     let _ = session.kill();
-    eprintln!("orca-inject: recorded {total} bytes → {out}");
+    eprintln!("orcatui-inject: recorded {total} bytes → {out}");
     Ok(())
 }
 
@@ -199,7 +199,7 @@ fn replay(
             response_bytes += resp.len();
             response_chunks += 1;
             if verbose {
-                eprintln!("orca-inject: chunk {i}: +{} response bytes", resp.len());
+                eprintln!("orcatui-inject: chunk {i}: +{} response bytes", resp.len());
             }
         }
         emu.feed(chunk_bytes);
@@ -207,7 +207,7 @@ fn replay(
             if i + 1 == at {
                 emu.resize(rw, rh);
                 if verbose {
-                    eprintln!("orca-inject: resized → {rw}x{rh} after chunk {}", i + 1);
+                    eprintln!("orcatui-inject: resized → {rw}x{rh} after chunk {}", i + 1);
                 }
             }
         }
@@ -253,7 +253,7 @@ fn replay(
     }
 
     eprintln!(
-        "orca-inject: {f_b} bytes @ {w}x{h} → {nonempty} non-empty cells; {response_chunks} query chunks ({response_bytes} response bytes)",
+        "orcatui-inject: {f_b} bytes @ {w}x{h} → {nonempty} non-empty cells; {response_chunks} query chunks ({response_bytes} response bytes)",
         f_b = bytes.len(),
     );
     Ok(())

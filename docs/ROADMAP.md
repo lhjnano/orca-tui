@@ -5,7 +5,7 @@ Multi-agent coding orchestration in the terminal · Built on
 Target: **20 agents @ 60 fps @ ≤100 ms response**.
 
 > Last updated: 2026-07-24 · 226 tests · 56% coverage · CI green ·
-> [github.com/lhjnano/orca-tui](https://github.com/lhjnano/orca-tui)
+> [github.com/lhjnano/orcatui](https://github.com/lhjnano/orcatui)
 
 ---
 
@@ -56,7 +56,7 @@ cells — near-zero GPU cost.
 |---------|--------|---------|
 | **OSC 9999 capture** | `osc.rs` | OscScanner DFA — intercepts `\x1b]9999;{json}` from PTY stream, extracts `AgentActivity` (state/tool/toolInput/prompt/model), passes all other bytes through |
 | **Orca-style sidebar** | `sidebar.rs` | `render_sidebar` — brand header, `IN PROGRESS (N)`, colored status dots (●green/✗red/○amber/✓gray), agent name + activity + branch |
-| **Config system** | `config.rs` | TOML (`~/.config/orca-tui/config.toml`) — theme (hex colors), layout (sidebar_width, show_status_bar), default_agent |
+| **Config system** | `config.rs` | TOML (`~/.config/orcatui/config.toml`) — theme (hex colors), layout (sidebar_width, show_status_bar), default_agent |
 | **Mode system** | `app.rs` | zellij-style: `Normal` (passthrough — all keys → agent) / `Ctrl+P` `Pane` (arrows/hjkl/Tab focus) / `Ctrl+Q` quit |
 | **Mouse scroll** | `app.rs` | `EnableMouseCapture` + scroll up/down → focused pane scrollback (1000 lines, 3/notch) |
 | **Focused pane color** | `pane.rs` | themed borders — `border_active` when focused, `border` when not (was LightBlue/DarkGray) |
@@ -65,13 +65,13 @@ cells — near-zero GPU cost.
 ### opencode-style box form (session 2026-07-23)
 
 Derived from analyzing `sst/opencode` `packages/tui/src/` (see §8 for the full
-study + what was blocked). Applied the box-panel aesthetic to orca-tui's chrome:
+study + what was blocked). Applied the box-panel aesthetic to orcatui's chrome:
 
 | Feature | Module | Details |
 |---------|--------|---------|
 | **Unified `AgentStatus`** | `agent.rs` | Orca 4-state model (`working/blocked/waiting/done/failed/idle`) — single `derive(state, osc_state)` reused by sidebar + (future) auto-scroll/jump |
 | **opencode theme palette** | `config.rs` | 3-level bg (`background`/`background_panel`/`background_element`) + `border`/`border_active` + `text_muted` (GitHub-dark) |
-| **Bordered sidebar panel box** | `sidebar.rs` | `Borders::ALL` + `theme.border()` + `theme.panel()` fill + `orca-tui` title (opencode `backgroundPanel` aesthetic) |
+| **Bordered sidebar panel box** | `sidebar.rs` | `Borders::ALL` + `theme.border()` + `theme.panel()` fill + `orcatui` title (opencode `backgroundPanel` aesthetic) |
 | **2-line sidebar entries** | `sidebar.rs` | on wide sidebars (≥36 cols): `name + model/branch` / `tool: input`; 1-line fallback below |
 | **Pinned section** | `sidebar.rs` + `app.rs` | `PINNED (n)` section above `IN PROGRESS`; `pinned: Vec<bool>`, Pane-mode `p` toggles focused agent |
 | **Themed footer strip** | `app.rs` | footer on `theme.panel()` bg with `accent`/`muted` fg (was hardcoded DarkGray) |
@@ -98,28 +98,28 @@ where they earn their keep on the hot path:
 ### Agent rendering compatibility (session 2026-07-23)
 
 A naive PTY + vt100 embedder shows **blank/flickering panes** for sophisticated
-TUI agents (opencode/OpenTUI, and any agent using synchronized output). orca-tui
+TUI agents (opencode/OpenTUI, and any agent using synchronized output). orcatui
 now handles the three things they need:
 
 | Layer | Module | What it does |
 |-------|--------|--------------|
-| **`TERM` injection** | `pty_session.rs` | Child PTY gets `TERM=xterm-256color` + `COLORTERM=truecolor` + `TERM_PROGRAM=orca-tui`, so the agent emits sequences the vt100 emulator understands. |
+| **`TERM` injection** | `pty_session.rs` | Child PTY gets `TERM=xterm-256color` + `COLORTERM=truecolor` + `TERM_PROGRAM=orcatui`, so the agent emits sequences the vt100 emulator understands. |
 | **Query responder** | `query.rs` | A stateful DFA answers the agent's capability probes — OSC 10/11/12 color, DECRQM private modes, DA1/DA2, DCS terminfo — synthesized from `ThemeConfig`. Without replies a probing agent can't determine the terminal and renders blank. |
 | **Synchronized output** | `sync.rs` | Buffers `ESC[?2026h … clear+redraw … ESC[?2026l` batches and flushes them to the emulator **atomically**, so a render that fires mid-batch sees the previous frame, not the half-cleared intermediate (the "blank pane" symptom). **General** — fixes any agent using mode 2026. |
 
-**`orca-inject`** (second binary, `src/bin/inject.rs`) — a `record` / `replay`
+**`orcatui-inject`** (second binary, `src/bin/inject.rs`) — a `record` / `replay`
 tool that captures an agent's raw PTY bytes and feeds them through the emulator +
 responder + sync batcher at a chosen size (`--resize` reproduces a live
 spawn-then-resize). This is what isolated the opencode blank-pane bug
 deterministically: it proved the emulator / alt-screen / size / resize / responder
-were all fine and pinned the cause on mode 2026. `ORCA_DEBUG_LOG=1` on `orca-tui`
+were all fine and pinned the cause on mode 2026. `ORCA_DEBUG_LOG=1` on `orcatui`
 logs per-chunk byte/cell counts + resize events to `/tmp/orca-live.log`.
 
 **Test count 183 → 226 (+43: query 11, sync 7, toast 5, orca_daemon 12, render/spawn 2, config 6). Build: 0 errors.**
 
 ### Orca daemon client (session 2026-07-24)
 
-orca-tui can now connect to a running **Orca GUI daemon** (`--daemon` flag) for
+orcatui can now connect to a running **Orca GUI daemon** (`--daemon` flag) for
 session persistence, multi-client (GUI + TUI), and auto-reconnect.
 
 | Component | Module | What it does |
@@ -228,12 +228,12 @@ Gaps (TTY/IO-bound):        app.rs main_loop/run (19%), cli.rs handlers (9%),
 ## 6. CLI reference
 
 ```
-orca-tui run [--cwd DIR] [--worktree] [--remote HOST] [--reconnect] [--mobile PORT] -- <agent> [:: <agent> ...]
-orca-tui orchestrate [--spec TEXT | --issues OWNER/NAME] [--parallel]
-orca-tui prs <owner/name>
-orca-tui issues <owner/name>
-orca-tui mobile [--port PORT]
-orca-tui --version
+orcatui run [--cwd DIR] [--worktree] [--remote HOST] [--reconnect] [--mobile PORT] -- <agent> [:: <agent> ...]
+orcatui orchestrate [--spec TEXT | --issues OWNER/NAME] [--parallel]
+orcatui prs <owner/name>
+orcatui issues <owner/name>
+orcatui mobile [--port PORT]
+orcatui --version
 ```
 
 ### Key bindings
@@ -241,7 +241,7 @@ orca-tui --version
 | Key | Mode | Action |
 |-----|------|--------|
 | `Ctrl+P` | any | Enter Pane mode |
-| `Ctrl+Q` | any | Quit orca-tui |
+| `Ctrl+Q` | any | Quit orcatui |
 | `Ctrl+N` | any | Spawn a new agent pane (auto-detects an installed agent) |
 | `←↑↓→` / `hjkl` | Pane | Grid-aware focus switch |
 | `Tab` / `Shift+Tab` | Pane | Sequential focus next/prev |
@@ -250,7 +250,7 @@ orca-tui --version
 | Mouse scroll | any | Scroll focused pane scrollback |
 | [any key] | Normal | Forwarded to focused agent's PTY |
 
-### Config file (`~/.config/orca-tui/config.toml`)
+### Config file (`~/.config/orcatui/config.toml`)
 
 ```toml
 default_agent = "claude"
@@ -337,17 +337,17 @@ this session: `app.tsx` (provider stack + route switch), `routes/session/index.t
 
 ---
 
-#### Session 2026-07-23 — what was APPLIED (opencode → orca-tui)
+#### Session 2026-07-23 — what was APPLIED (opencode → orcatui)
 
 > Goal stated by the user: convert the **text-based layout** into an
 > **opencode-style "box form"** (bordered panel boxes with panel backgrounds).
 > Sidebar position is **unchanged** (kept on the LEFT — orchestrator convention).
 
-| # | opencode / Orca-GUI pattern | Applied to orca-tui | Files |
+| # | opencode / Orca-GUI pattern | Applied to orcatui | Files |
 |---|-----------------------------|---------------------|-------|
 | 1 | Orca 4-state `working/blocked/waiting/done` vocabulary | `AgentStatus` enum — single `derive(state, osc_state)` source of truth; sidebar `status_style`/`is_active` delegate to it (glyphs/colors byte-identical) | `agent.rs` (+202), `sidebar.rs` |
 | 2 | opencode 3-level bg (`background`/`backgroundPanel`/`backgroundElement`) + `border`/`borderActive` + `textMuted` | 5 new `ThemeConfig` fields + accessors `panel()/element()/border()/border_active()/muted()` (GitHub-dark values) | `config.rs` (+89) |
-| 3 | opencode `backgroundPanel` box aesthetic | Sidebar → bordered **panel box**: `Borders::ALL` + `theme.border()` + `theme.panel()` fill + `"orca-tui"` title; brand row removed (now the title) | `sidebar.rs` |
+| 3 | opencode `backgroundPanel` box aesthetic | Sidebar → bordered **panel box**: `Borders::ALL` + `theme.border()` + `theme.panel()` fill + `"orcatui"` title; brand row removed (now the title) | `sidebar.rs` |
 | 4 | opencode denser multi-line region content | Sidebar **2-line entries** on wide sidebars (≥36 cols): `name + model/branch` / `tool: input`; 1-line fallback below 36 (existing tests stay green) | `sidebar.rs` |
 | 5 | Orca "Pinned" / "In Progress (N)" sections | Sidebar **PINNED section** above IN PROGRESS; `pinned: Vec<bool>` on `App`, Pane-mode `p` toggles the focused agent | `sidebar.rs`, `app.rs` |
 | 6 | Consistent box framing across regions | Pane borders themed (`border_active` focused / `border` unfocused); footer → **panel strip** (`theme.panel()` bg + `accent`/`muted` fg). No more hardcoded `LightBlue`/`DarkGray` | `pane.rs`, `app.rs` |
@@ -358,14 +358,14 @@ this session: `app.tsx` (provider stack + route switch), `routes/session/index.t
 
 | Item | Status | Reason |
 |------|--------|--------|
-| **ppalla box rendering** | ✅ resolved (0.0.3) | ppalla 0.0.2's `style` module does not apply borders (was blocked). **0.0.3 added `PreparedBlock`** (cached border drawing) — orca-tui now uses it for pane borders. The sidebar box still uses ratatui `Block` until the sidebar→`List` rewrite. |
+| **ppalla box rendering** | ✅ resolved (0.0.3) | ppalla 0.0.2's `style` module does not apply borders (was blocked). **0.0.3 added `PreparedBlock`** (cached border drawing) — orcatui now uses it for pane borders. The sidebar box still uses ratatui `Block` until the sidebar→`List` rewrite. |
 | **Pane empty-area bg fill** (action #3) | ⚠️ partial | Panes are **live vt100 terminals** — the inner area IS the emulator cell grid, so there is no "empty area" to fill like a chat bubble. Pane frame bg is `theme.bg()`; uncovered emulator cells stay terminal-transparent (`Color::Reset`). |
-| **Sidebar position (opencode = RIGHT)** | ⏭️ intentionally not applied | orca-tui keeps the sidebar on the **LEFT** (Orca GUI / Claude Squad convention for multi-agent orchestrators). Box *form* applied; *position* preserved. |
-| **Padding / density (opencode paddingLeft/Right=2)** | ⏭️ intentionally not applied | orca-tui is deliberately **edge-to-edge** ("꽉찬") for density; box separation comes from panel-bg contrast + borders, not outer padding. |
-| **opencode chat-message model** | ➖ N/A | opencode is a **chat interface** (messages + prompt); orca-tui panes show **live terminal output**. Box-form applies to the chrome (sidebar/footer/framing), not the pane content. |
-| **opencode footer (space-between: cwd \| LSP·MCP·/status)** | 🔜 future | orca-tui footer kept as a themed key-hint panel strip. Evolving it into a space-between status bar (cwd \| `●N working · ✗N failed`) is a follow-up. |
+| **Sidebar position (opencode = RIGHT)** | ⏭️ intentionally not applied | orcatui keeps the sidebar on the **LEFT** (Orca GUI / Claude Squad convention for multi-agent orchestrators). Box *form* applied; *position* preserved. |
+| **Padding / density (opencode paddingLeft/Right=2)** | ⏭️ intentionally not applied | orcatui is deliberately **edge-to-edge** ("꽉찬") for density; box separation comes from panel-bg contrast + borders, not outer padding. |
+| **opencode chat-message model** | ➖ N/A | opencode is a **chat interface** (messages + prompt); orcatui panes show **live terminal output**. Box-form applies to the chrome (sidebar/footer/framing), not the pane content. |
+| **opencode footer (space-between: cwd \| LSP·MCP·/status)** | 🔜 future | orcatui footer kept as a themed key-hint panel strip. Evolving it into a space-between status bar (cwd \| `●N working · ✗N failed`) is a follow-up. |
 | **Jump palette** (action #5, `/`) | ✅ done | `/` in Pane mode opens a centered overlay: type to filter agents by name (case-insensitive substring), ↑↓ to select, Enter to focus. |
-| **ppalla adoption (List/viewport/text_input)** | 🔜 opportunity | ppalla's real value here is the **Preparable pattern** (perf caching) + **stateful widgets**, *not* box styling. Candidates: sidebar → ppalla `List` (replace hand-painted windowing), jump palette → `List`+`text_input`, scrollback → `viewport`. Currently orca-tui uses ppalla only nominally (referenced in comments). |
+| **ppalla adoption (List/viewport/text_input)** | 🔜 opportunity | ppalla's real value here is the **Preparable pattern** (perf caching) + **stateful widgets**, *not* box styling. Candidates: sidebar → ppalla `List` (replace hand-painted windowing), jump palette → `List`+`text_input`, scrollback → `viewport`. Currently orcatui uses ppalla only nominally (referenced in comments). |
 
 #### Action items — status
 1. ✅ Map `AgentState` → `working/blocked/waiting/done` → `AgentStatus`
@@ -393,7 +393,7 @@ this session: `app.tsx` (provider stack + route switch), `routes/session/index.t
 ## 9. Resuming in a new session
 
 ```bash
-cd ~/source/project/orca-tui
+cd ~/source/project/orcatui
 cargo build          # 0 errors
 cargo test           # 226 passed
 cargo bench --bench orca   # 3 hot paths

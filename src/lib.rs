@@ -1,11 +1,11 @@
-//! # orca-tui (library)
+//! # orcatui (library)
 //!
 //! Terminal multi-agent coding orchestrator — a TUI port of
 //! [Orca GUI](https://github.com/stablyai/orca). Runs N coding agents
 //! (Claude Code, Codex, OpenCode, …) side-by-side in split terminal panes,
 //! each in its own PTY / git worktree, monitored from one screen.
 //!
-//! The `orca-tui` **binary** is a thin wrapper around [`cli::run`]; every piece
+//! The `orcatui` **binary** is a thin wrapper around [`cli::run`]; every piece
 //! of logic lives in this library crate so it can be unit-tested, benchmarked
 //! (`benches/`), and reused as a dependency. Built on
 //! [`ratatui-ppalla`](https://crates.io/crates/ratatui-ppalla).

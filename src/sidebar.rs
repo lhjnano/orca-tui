@@ -51,7 +51,7 @@ pub struct SidebarEntry {
 ///
 /// Layout (top to bottom): the sidebar sits inside a fully **bordered** panel
 /// box (raised `theme.panel()` background, `theme.border()` edges) whose top
-/// border carries the ` orca-tui ` title. Inside the box: an optional `PINNED`
+/// border carries the ` orcatui ` title. Inside the box: an optional `PINNED`
 /// section, then the `IN PROGRESS (n)` section header, then one row per entry
 /// (windowed to the latest entries when they overflow).
 ///
@@ -73,7 +73,7 @@ pub fn render_sidebar(
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme.border()))
         .style(Style::default().bg(theme.panel()))
-        .title(Line::from(" orca-tui ").style(Style::default().fg(theme.accent())));
+        .title(Line::from(" orcatui ").style(Style::default().fg(theme.accent())));
     let inner = block.inner(area);
     frame.render_widget(&block, area);
 
@@ -574,7 +574,7 @@ mod tests {
             .expect("draw");
 
         let text = buffer_text(terminal.backend().buffer());
-        assert!(text.contains("orca-tui"), "brand header missing:\n{text}");
+        assert!(text.contains("orcatui"), "brand header missing:\n{text}");
         assert!(
             text.contains("IN PROGRESS (2)"),
             "section header wrong:\n{text}"
@@ -640,7 +640,7 @@ mod tests {
             .expect("draw");
 
         let text = buffer_text(terminal.backend().buffer());
-        assert!(text.contains("orca-tui"), "brand header missing:\n{text}");
+        assert!(text.contains("orcatui"), "brand header missing:\n{text}");
         assert!(
             text.contains("IN PROGRESS (0)"),
             "zero-count header wrong:\n{text}"
@@ -680,7 +680,7 @@ mod tests {
         let buf = terminal.backend().buffer();
         // Border offset: the sidebar is now a fully bordered panel box
         // (`Borders::ALL`), so `inner` begins at (1,1). Row 0 is the top border
-        // carrying the ` orca-tui ` title; row 1 is the `IN PROGRESS` header;
+        // carrying the ` orcatui ` title; row 1 is the `IN PROGRESS` header;
         // the first entry is row 2. `inner.x` is 1, so the focus marker sits at
         // column 1 and the name (marker + dot + space = 3 cols in) at column 4.
         // Focused "claude" name cell is accent; its focus marker is accent.

@@ -1,12 +1,12 @@
 //! # Configuration (Feature: settings)
 //!
-//! User configuration loaded from `~/.config/orca-tui/config.toml` (or
-//! `$XDG_CONFIG_HOME/orca-tui/config.toml`). Everything has a built-in default,
-//! so orca-tui runs with zero configuration; the file only overrides what the
+//! User configuration loaded from `~/.config/orcatui/config.toml` (or
+//! `$XDG_CONFIG_HOME/orcatui/config.toml`). Everything has a built-in default,
+//! so orcatui runs with zero configuration; the file only overrides what the
 //! user sets.
 //!
 //! ```toml
-//! # ~/.config/orca-tui/config.toml
+//! # ~/.config/orcatui/config.toml
 //! default_agent = "claude"
 //!
 //! [layout]
@@ -75,7 +75,7 @@ impl Config {
             Ok(text) => match toml::from_str::<Config>(&text) {
                 Ok(cfg) => cfg,
                 Err(err) => {
-                    eprintln!("orca-tui: ignoring bad config at {}: {err}", path.display());
+                    eprintln!("orcatui: ignoring bad config at {}: {err}", path.display());
                     Self::default()
                 }
             },
@@ -239,14 +239,14 @@ impl ThemeConfig {
     }
 }
 
-/// Resolve the config file path: `$XDG_CONFIG_HOME/orca-tui/config.toml`, else
-/// `$HOME/.config/orca-tui/config.toml`. `None` if neither env var is set.
+/// Resolve the config file path: `$XDG_CONFIG_HOME/orcatui/config.toml`, else
+/// `$HOME/.config/orcatui/config.toml`. `None` if neither env var is set.
 #[must_use]
 pub fn config_path() -> Option<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
-        return Some(PathBuf::from(xdg).join("orca-tui").join("config.toml"));
+        return Some(PathBuf::from(xdg).join("orcatui").join("config.toml"));
     }
-    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/orca-tui/config.toml"))
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/orcatui/config.toml"))
 }
 
 /// Parse a `#rrggbb` / `#rgb` hex string into a ratatui RGB color.
@@ -445,7 +445,7 @@ border = "#abcdef"
         let xdg_prev = std::env::var_os("XDG_CONFIG_HOME");
         let temp = std::env::temp_dir().join(format!("orca-cfg-xdg-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp);
-        std::fs::create_dir_all(temp.join("orca-tui")).unwrap();
+        std::fs::create_dir_all(temp.join("orcatui")).unwrap();
         std::env::set_var("XDG_CONFIG_HOME", &temp);
 
         // line 247: XDG set → path resolves under it.
@@ -456,7 +456,7 @@ border = "#abcdef"
 
         // lines 75-76: valid file present → parsed config returned.
         std::fs::write(
-            temp.join("orca-tui").join("config.toml"),
+            temp.join("orcatui").join("config.toml"),
             "default_agent = \"claude\"\n[theme]\naccent = \"#aabbcc\"\n",
         )
         .unwrap();
@@ -464,7 +464,7 @@ border = "#abcdef"
 
         // lines 77-79: unparseable file → logged + replaced with default.
         std::fs::write(
-            temp.join("orca-tui").join("config.toml"),
+            temp.join("orcatui").join("config.toml"),
             "this is = = not valid toml [[[",
         )
         .unwrap();
@@ -479,7 +479,7 @@ border = "#abcdef"
 
         assert_eq!(
             path_xdg,
-            Some(temp.join("orca-tui").join("config.toml")),
+            Some(temp.join("orcatui").join("config.toml")),
             "line 247: XDG_CONFIG_HOME drives the path"
         );
         assert_eq!(

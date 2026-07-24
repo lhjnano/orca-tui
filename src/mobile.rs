@@ -1,12 +1,12 @@
 //! # Mobile companion WebSocket server (Feature 10)
 //!
 //! A small WS server the TUI runs locally so a phone/PWA can connect, see live
-//! agent status, and (eventually) send follow-ups. The orca-tui side here is
+//! agent status, and (eventually) send follow-ups. The orcatui side here is
 //! the **server**; a mobile client app is out of scope for this binary.
 //!
 //! ## Threading model
 //!
-//! The main orca-tui app is synchronous; this server is spawned on its own
+//! The main orcatui app is synchronous; this server is spawned on its own
 //! dedicated tokio runtime by a later wiring step. [`serve`] owns the runtime's
 //! `state_rx` (an unbounded mpsc the app feeds `Vec<AgentSnapshot>` into) and
 //! fans every update out to all connected WS clients via a

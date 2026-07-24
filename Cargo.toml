@@ -1,20 +1,20 @@
 [package]
-name = "orca-tui"
+name = "orcatui"
 version = "0.1.0"
 edition = "2021"
 description = "Terminal multi-agent coding orchestrator — TUI port of Orca GUI (stablyai/orca). Runs N coding agents side-by-side in split panes, monitored from one screen."
 license = "MIT OR Apache-2.0"
 authors = ["HeonJe LEE <lhjnano@gmail.com>"]
-repository = "https://github.com/lhjnano/orca-tui"
+repository = "https://github.com/lhjnano/orcatui"
 keywords = ["tui", "ratatui", "ai", "agent", "orchestration"]
 categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
-name = "orca-tui"
+name = "orcatui"
 path = "src/main.rs"
 
 [[bin]]
-name = "orca-inject"
+name = "orcatui-inject"
 path = "src/bin/inject.rs"
 
 [[bench]]

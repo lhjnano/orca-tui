@@ -289,13 +289,13 @@ impl Drop for OwnedWorktrees {
         for wt in &self.entries {
             if let Err(e) = self.manager.remove(&wt.path) {
                 eprintln!(
-                    "orca-tui: worktree cleanup: failed to remove {}: {e:#}",
+                    "orcatui: worktree cleanup: failed to remove {}: {e:#}",
                     wt.path.display()
                 );
             }
             if let Err(e) = self.manager.delete_branch(&wt.branch) {
                 eprintln!(
-                    "orca-tui: worktree cleanup: failed to delete branch {}: {e:#}",
+                    "orcatui: worktree cleanup: failed to delete branch {}: {e:#}",
                     wt.branch
                 );
             }
@@ -420,7 +420,7 @@ mod tests {
         fn new() -> Result<Self> {
             let mut dir = std::env::temp_dir();
             dir.push(format!(
-                "orca-tui-test-{}-{}",
+                "orcatui-test-{}-{}",
                 std::process::id(),
                 short_id()
             ));
@@ -437,8 +437,8 @@ mod tests {
             // Local identity so `git commit` works in CI without any global
             // git config (the spec's `git -c user.name=...` intent).
             for (k, v) in [
-                ("user.name", "orca-tui test"),
-                ("user.email", "test@orca-tui.local"),
+                ("user.name", "orcatui test"),
+                ("user.email", "test@orcatui.local"),
             ] {
                 let cfg = Command::new("git")
                     .arg("-C")
@@ -515,7 +515,7 @@ mod tests {
     fn open_errors_on_non_git_directory() {
         let mut dir = std::env::temp_dir();
         dir.push(format!(
-            "orca-tui-nongit-{}-{}",
+            "orcatui-nongit-{}-{}",
             std::process::id(),
             short_id()
         ));

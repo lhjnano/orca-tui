@@ -1,6 +1,6 @@
 //! # Frame scheduler
 //!
-//! Frame-budget policy for the main render loop. orca-tui's loop currently
+//! Frame-budget policy for the main render loop. orcatui's loop currently
 //! drains the [`crate::bus`] AgentBus, renders, and polls input with a fixed
 //! 20 ms sleep. [`FrameScheduler`] turns that into:
 //!

@@ -10,7 +10,7 @@
 //! - `CSI c` / `CSI > c` — DA1 / DA2 (primary / secondary device attributes)
 //! - `DCS + q <hex>` — Request Terminfo String (xterm)
 //!
-//! A real terminal answers these; orca-tui's PTY does not, so a probing agent
+//! A real terminal answers these; orcatui's PTY does not, so a probing agent
 //! cannot determine the terminal and renders blank or minimally (the "opencode
 //! shows rarely, feels overwritten" symptom). [`QueryResponder`] runs alongside
 //! the vt100 emulator: it detects these query sequences in the PTY byte stream
@@ -22,7 +22,7 @@
 //! byte vector. Unrecognized / non-query sequences are ignored (the vt100
 //! emulator still receives every byte unchanged).
 //!
-//! Responses use the theme's actual fg/bg colors so the agent picks up orca-tui
+//! Responses use the theme's actual fg/bg colors so the agent picks up orcatui
 //! `ThemeConfig`.
 
 use ratatui::style::Color;

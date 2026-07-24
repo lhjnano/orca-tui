@@ -1,4 +1,4 @@
-//! Criterion benchmarks for orca-tui's three hot paths.
+//! Criterion benchmarks for orcatui's three hot paths.
 //!
 //! Mirrors the `#[ignore]`d timing probes in `src/perf_probe.rs`, but as
 //! proper criterion benches so `cargo bench` yields stable, comparable numbers
@@ -23,10 +23,10 @@ use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criteri
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 
-use orca_tui::layout::split_panes;
-use orca_tui::pane::Pane;
-use orca_tui::scheduler::{FrameScheduler, TARGET_FRAME_60FPS};
-use orca_tui::terminal_emu::TerminalEmulator;
+use orcatui::layout::split_panes;
+use orcatui::pane::Pane;
+use orcatui::scheduler::{FrameScheduler, TARGET_FRAME_60FPS};
+use orcatui::terminal_emu::TerminalEmulator;
 
 /// Build ~`mb` megabytes of realistic agent-ish output: text lines, a palette
 /// color SGR flip every chunk, and CRLFs. Identical to
@@ -143,12 +143,7 @@ fn n_pane_render(c: &mut Criterion) {
                             let rects = split_panes(f.area(), n);
                             for (i, p) in panes.iter_mut().enumerate() {
                                 let area = rects.get(i).copied().unwrap_or_default();
-                                p.render(
-                                    f,
-                                    area,
-                                    i == 0,
-                                    &orca_tui::config::ThemeConfig::default(),
-                                );
+                                p.render(f, area, i == 0, &orcatui::config::ThemeConfig::default());
                             }
                         })
                         .expect("draw");

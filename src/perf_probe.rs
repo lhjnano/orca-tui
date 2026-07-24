@@ -1,4 +1,4 @@
-//! Throwaway-friendly performance probes for orca-tui's own hot paths.
+//! Throwaway-friendly performance probes for orcatui's own hot paths.
 //!
 //! These are `#[ignore]`d so they never run in the normal suite — run them
 //! explicitly with:
@@ -9,7 +9,7 @@
 //!
 //! They print concrete numbers for the three custom paths the 60 fps goal
 //! depends on: terminal-emulation ingest throughput, the FrameScheduler
-//! decision cost, and the full N-pane render cost (the orca-tui analogue of
+//! decision cost, and the full N-pane render cost (the orcatui analogue of
 //! ratatui-ppalla's `layout_paint_20panes` benchmark).
 
 #![allow(clippy::cast_precision_loss, clippy::needless_pass_by_value)]
@@ -108,7 +108,7 @@ fn perf_frame_scheduler_decision_cost() {
 #[test]
 #[ignore = "performance probe — run with --ignored --nocapture"]
 fn perf_n_pane_render() {
-    // 16.67ms is the 60fps budget. Measure orca-tui's full render path
+    // 16.67ms is the 60fps budget. Measure orcatui's full render path
     // (Pane.render -> paint_grid -> buffer) for N panes filling a 200x50 area.
     for &n in &[1usize, 5, 10, 20] {
         let mut backend = TestBackend::new(200, 50);

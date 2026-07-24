@@ -1,4 +1,4 @@
-//! Render a representative orca-tui frame to the terminal using the REAL
+//! Render a representative orcatui frame to the terminal using the REAL
 //! rendering pipeline (`Pane::render` + `split_panes` + `sidebar::render_sidebar`),
 //! via an in-memory `TestBackend`. The output is a faithful text "screenshot"
 //! of what the TUI looks like — used for the README and for visual regression.
@@ -11,12 +11,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Terminal;
 
-use orca_tui::agent::{AgentState, AgentStatus};
-use orca_tui::config::Config;
-use orca_tui::layout::split_panes;
-use orca_tui::osc::AgentActivity;
-use orca_tui::pane::Pane;
-use orca_tui::sidebar;
+use orcatui::agent::{AgentState, AgentStatus};
+use orcatui::config::Config;
+use orcatui::layout::split_panes;
+use orcatui::osc::AgentActivity;
+use orcatui::pane::Pane;
+use orcatui::sidebar;
 
 const WIDTH: u16 = 124;
 const HEIGHT: u16 = 30;

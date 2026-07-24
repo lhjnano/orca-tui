@@ -1,6 +1,6 @@
 //! # Integrations — external issue/PR sources (Feature 9)
 //!
-//! Feature 9 wires GitHub (and, later, Linear) into orca-tui so you can browse
+//! Feature 9 wires GitHub (and, later, Linear) into orcatui so you can browse
 //! open PRs/issues from inside the TUI and turn an issue into a dispatched
 //! agent task. This module is the **source layer**: it knows how to fetch
 //! [`PullRequest`] / [`Issue`] lists and how to render an [`Issue`] into a
@@ -423,9 +423,9 @@ mod tests {
     fn reporef_display_format_matches_owner_slash_name() {
         let repo = RepoRef {
             owner: "lhjnano".to_owned(),
-            name: "orca-tui".to_owned(),
+            name: "orcatui".to_owned(),
         };
-        assert_eq!(format!("{repo}"), "lhjnano/orca-tui");
+        assert_eq!(format!("{repo}"), "lhjnano/orcatui");
     }
 
     // ---- GitHubSource (constructor + trait wiring, no network) -------------
@@ -434,14 +434,14 @@ mod tests {
     fn github_source_round_trip_repos_through_trait() {
         // We can't call list_open() without gh+network, but we can confirm the
         // constructor stores the repo and the type satisfies IssueSource.
-        let repo = RepoRef::parse("lhjnano/orca-tui").unwrap();
+        let repo = RepoRef::parse("lhjnano/orcatui").unwrap();
         let src = GitHubSource::new(repo.clone());
         // The trait is implemented (compile-time check via a type annotation).
         let _boxed: &dyn IssueSource = &src;
         // Round-trip the stored repo via the (pub) fields to be sure nothing
         // was mangled during construction.
         assert_eq!(src.repo.owner, "lhjnano");
-        assert_eq!(src.repo.name, "orca-tui");
+        assert_eq!(src.repo.name, "orcatui");
     }
 
     // ---- parsing: edge cases (empty / null / malformed) --------------------
@@ -542,7 +542,7 @@ mod tests {
     #[test]
     fn list_pull_requests_errors_for_nonexistent_repo() {
         let repo =
-            RepoRef::parse("orca-tui-nonexistent-owner/does-not-exist").expect("valid reporef");
+            RepoRef::parse("orcatui-nonexistent-owner/does-not-exist").expect("valid reporef");
         let res = list_pull_requests(&repo);
         assert!(
             res.is_err(),
@@ -553,7 +553,7 @@ mod tests {
     #[test]
     fn list_issues_errors_for_nonexistent_repo() {
         let repo =
-            RepoRef::parse("orca-tui-nonexistent-owner/does-not-exist").expect("valid reporef");
+            RepoRef::parse("orcatui-nonexistent-owner/does-not-exist").expect("valid reporef");
         let res = list_issues(&repo);
         assert!(res.is_err(), "list_issues should fail offline: {res:?}");
     }
@@ -561,7 +561,7 @@ mod tests {
     #[test]
     fn github_source_list_open_errors_for_nonexistent_repo() {
         let repo =
-            RepoRef::parse("orca-tui-nonexistent-owner/does-not-exist").expect("valid reporef");
+            RepoRef::parse("orcatui-nonexistent-owner/does-not-exist").expect("valid reporef");
         let src = GitHubSource::new(repo);
         let res = src.list_open();
         assert!(res.is_err(), "list_open should fail offline: {res:?}");

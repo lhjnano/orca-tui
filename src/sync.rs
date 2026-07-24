@@ -3,7 +3,7 @@
 //! Agents like opencode (OpenTUI) redraw inside a synchronized-output batch:
 //! `ESC[?2026h` … (clear + redraw) … `ESC[?2026l`. A terminal that HONORS mode
 //! 2026 displays only the completed frame; vt100 0.15 does not implement it, so
-//! without this layer orca-tui renders the intermediate CLEARED state whenever
+//! without this layer orcatui renders the intermediate CLEARED state whenever
 //! its frame lands inside a batch — the "agent pane is blank / flickery"
 //! symptom.
 //!
