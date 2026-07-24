@@ -647,4 +647,175 @@ mod tests {
         );
         // TempRepo::drop removes the whole temp repo on disk.
     }
+
+    // ---- additional coverage: accessors, error branches, drop logging ------
+
+    #[cfg(unix)]
+    #[test]
+    fn repo_root_resolves_true_toplevel_from_subdir() {
+        let repo = TempRepo::new().expect("temp git repo");
+        // A nested subdirectory is still inside the work tree.
+        let subdir = repo.path.join("nested/sub");
+        std::fs::create_dir_all(&subdir).unwrap();
+        let mgr = WorktreeManager::open(&subdir).expect("open from subdir");
+        // repo_root() must resolve to the real top-level, not the subdir.
+        assert_eq!(
+            mgr.repo_root().canonicalize().unwrap(),
+            repo.path.canonicalize().unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_for_slugifies_special_characters_in_branch_and_path() {
+        let repo = TempRepo::new().expect("temp git repo");
+        let mgr = WorktreeManager::open(&repo.path).expect("open");
+        // slugify("C++ Agent / v2.0!") == "c-agent-v2-0"
+        let wt = mgr.create_for("C++ Agent / v2.0!").expect("create");
+        assert!(wt.path.is_dir(), "worktree checkout should exist");
+        assert!(
+            wt.branch.starts_with("orca/c-agent-v2-0-"),
+            "unexpected branch: {}",
+            wt.branch
+        );
+        assert!(wt.path.starts_with(repo.path.join(WORKTREE_DIR)));
+        assert!(repo.worktree_listed(&wt.path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_for_fails_when_repo_metadata_is_gone() {
+        let repo = TempRepo::new().expect("temp git repo");
+        let mgr = WorktreeManager::open(&repo.path).expect("open");
+        // Remove .git so `git worktree add` cannot run -> forces the failure
+        // branch of create_for.
+        let _ = std::fs::remove_dir_all(repo.path.join(".git"));
+        let err = mgr.create_for("ghost").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("git worktree add failed"),
+            "expected worktree-add failure, got: {msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_shows_every_created_worktree() {
+        let repo = TempRepo::new().expect("temp git repo");
+        let mgr = WorktreeManager::open(&repo.path).expect("open");
+        let w0 = mgr.create_for("alpha").expect("c0");
+        let w1 = mgr.create_for("beta").expect("c1");
+        let w2 = mgr.create_for("gamma").expect("c2");
+        for wt in [&w0, &w1, &w2] {
+            assert!(
+                repo.worktree_listed(&wt.path),
+                "missing worktree {}",
+                wt.path.display()
+            );
+        }
+        // Main repo + 3 worktrees == 4 lines in `git worktree list`.
+        let list = repo.git_stdout(&["worktree", "list"]);
+        assert_eq!(
+            list.lines().count(),
+            4,
+            "expected 4 worktree lines, got:\n{list}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_plain_directory_that_is_not_a_worktree_errors() {
+        let repo = TempRepo::new().expect("temp git repo");
+        let mgr = WorktreeManager::open(&repo.path).expect("open");
+        let junk = repo.path.join("not-a-worktree");
+        std::fs::create_dir_all(&junk).unwrap();
+        // git refuses to "remove" something it never registered; the directory
+        // still exists, so remove() must surface a real error.
+        let err = mgr.remove(&junk).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("git worktree remove failed"),
+            "expected remove failure, got: {msg}"
+        );
+        assert!(junk.is_dir(), "the plain dir is untouched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delete_branch_nonexistent_errors() {
+        let repo = TempRepo::new().expect("temp git repo");
+        let mgr = WorktreeManager::open(&repo.path).expect("open");
+        let err = mgr.delete_branch("no-such-branch-xyz").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("git branch -D failed"),
+            "expected branch-delete failure, got: {msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prune_succeeds_on_clean_repo() {
+        let repo = TempRepo::new().expect("temp git repo");
+        let mgr = WorktreeManager::open(&repo.path).expect("open");
+        // No stale worktree metadata -> prune is a no-op success.
+        mgr.prune().expect("prune should succeed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prune_fails_when_repo_metadata_is_gone() {
+        let repo = TempRepo::new().expect("temp git repo");
+        let mgr = WorktreeManager::open(&repo.path).expect("open");
+        let _ = std::fs::remove_dir_all(repo.path.join(".git"));
+        let err = mgr.prune().unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("git worktree prune failed"),
+            "expected prune failure, got: {msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_worktrees_manager_and_entries_accessors() {
+        let repo = TempRepo::new().expect("temp git repo");
+        let mgr = WorktreeManager::open(&repo.path).expect("open");
+        let mut owned = OwnedWorktrees::new(mgr);
+        assert!(owned.entries().is_empty(), "starts empty");
+        owned.create_for("one").expect("create");
+        owned.create_for("two").expect("create");
+        assert_eq!(owned.entries().len(), 2);
+        // manager() exposes the inner manager unchanged.
+        assert_eq!(
+            owned.manager().repo_root().canonicalize().unwrap(),
+            repo.path.canonicalize().unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_worktrees_debug_formats_without_panicking() {
+        let repo = TempRepo::new().expect("temp git repo");
+        let mgr = WorktreeManager::open(&repo.path).expect("open");
+        let mut owned = OwnedWorktrees::new(mgr);
+        owned.create_for("dbg").expect("create");
+        let s = format!("{owned:?}");
+        assert!(s.contains("OwnedWorktrees"), "debug output: {s}");
+        assert!(s.contains("entries_len"), "debug output: {s}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_worktrees_drop_logs_and_continues_when_cleanup_fails() {
+        let repo = TempRepo::new().expect("temp git repo");
+        let mgr = WorktreeManager::open(&repo.path).expect("open");
+        let mut owned = OwnedWorktrees::new(mgr);
+        owned.create_for("doomed").expect("create");
+        // Corrupt the repo so Drop's remove + delete_branch both fail. Drop is
+        // best-effort: it must log to stderr and NOT panic. Reaching the end of
+        // this test proves it handled both errors gracefully.
+        let _ = std::fs::remove_dir_all(repo.path.join(".git"));
+        drop(owned);
+    }
 }

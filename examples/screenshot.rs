@@ -5,19 +5,20 @@
 //!
 //! Run: `cargo run --example screenshot`
 
-use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Terminal;
 
-use orca_tui::agent::AgentState;
+use orca_tui::agent::{AgentState, AgentStatus};
 use orca_tui::config::Config;
 use orca_tui::layout::split_panes;
 use orca_tui::osc::AgentActivity;
 use orca_tui::pane::Pane;
 use orca_tui::sidebar;
 
-const WIDTH: u16 = 110;
+const WIDTH: u16 = 124;
 const HEIGHT: u16 = 30;
 
 const FOOTER: &str =
@@ -45,6 +46,7 @@ fn sample_sidebar_entries() -> Vec<sidebar::SidebarEntry> {
                 ..Default::default()
             }),
             focused: true,
+            pinned: true,
         },
         sidebar::SidebarEntry {
             name: "codex".into(),
@@ -57,6 +59,7 @@ fn sample_sidebar_entries() -> Vec<sidebar::SidebarEntry> {
                 ..Default::default()
             }),
             focused: false,
+            pinned: false,
         },
         sidebar::SidebarEntry {
             name: "opencode".into(),
@@ -64,6 +67,7 @@ fn sample_sidebar_entries() -> Vec<sidebar::SidebarEntry> {
             branch: Some("main".into()),
             activity: None,
             focused: false,
+            pinned: false,
         },
         sidebar::SidebarEntry {
             name: "gemini".into(),
@@ -71,11 +75,12 @@ fn sample_sidebar_entries() -> Vec<sidebar::SidebarEntry> {
             branch: Some("orca/gemini-e5f6".into()),
             activity: None,
             focused: false,
+            pinned: false,
         },
     ]
 }
 
-fn draw(panes: &[Pane], focus: usize) {
+fn draw(panes: &mut [Pane], focus: usize) {
     let config = Config::default();
     let entries = sample_sidebar_entries();
 
@@ -102,19 +107,66 @@ fn draw(panes: &[Pane], focus: usize) {
             let footer_area = v[1];
 
             // Orca-style sidebar with status dots + live activity.
-            sidebar::render_sidebar(f, sidebar_area, &entries, &config.theme);
+            sidebar::render_sidebar(f, sidebar_area, &entries, &config.theme, None);
 
             // Agent panes.
             let rects = split_panes(pane_area, panes.len());
-            for (i, p) in panes.iter().enumerate() {
+            for (i, p) in panes.iter_mut().enumerate() {
                 let area = rects.get(i).copied().unwrap_or_default();
-                p.render(f, area, i == focus);
+                p.render(f, area, i == focus, &config.theme);
             }
 
-            // Status bar / footer.
+            // opencode-style status bar: left = agent tally, right = key-hint.
+            let foot =
+                Layout::horizontal([Constraint::Min(1), Constraint::Length(56)]).split(footer_area);
+            let sts: Vec<AgentStatus> = entries
+                .iter()
+                .map(|e| {
+                    AgentStatus::derive(&e.state, e.activity.as_ref().map(|a| a.state.as_str()))
+                })
+                .collect();
+            let nw = sts.iter().filter(|s| s.is_active()).count();
+            let nf = sts
+                .iter()
+                .filter(|s| matches!(s, AgentStatus::Failed))
+                .count();
+            let nd = sts
+                .iter()
+                .filter(|s| matches!(s, AgentStatus::Done))
+                .count();
+            let status_line = Line::from(vec![
+                Span::styled(
+                    format!(" ● {nw} working "),
+                    Style::default()
+                        .fg(config.theme.success())
+                        .bg(config.theme.panel()),
+                ),
+                Span::styled(
+                    format!(" ✗ {nf} failed "),
+                    Style::default()
+                        .fg(config.theme.error())
+                        .bg(config.theme.panel()),
+                ),
+                Span::styled(
+                    format!(" ✓ {nd} done "),
+                    Style::default()
+                        .fg(config.theme.muted())
+                        .bg(config.theme.panel()),
+                ),
+            ]);
             f.render_widget(
-                Paragraph::new(FOOTER).style(Style::default().fg(Color::DarkGray)),
-                footer_area,
+                Paragraph::new(status_line).style(Style::default().bg(config.theme.panel())),
+                foot[0],
+            );
+            f.render_widget(
+                Paragraph::new(FOOTER)
+                    .style(
+                        Style::default()
+                            .fg(config.theme.muted())
+                            .bg(config.theme.panel()),
+                    )
+                    .alignment(Alignment::Right),
+                foot[1],
             );
         })
         .expect("draw");
@@ -134,7 +186,7 @@ fn draw(panes: &[Pane], focus: usize) {
 }
 
 fn main() {
-    let panes = vec![
+    let mut panes = vec![
         agent_pane(
             0,
             "claude",
@@ -164,5 +216,5 @@ fn main() {
             "\x1b[31m\u{2717}\x1b[0m Error: rate limit hit\n  retrying in 32s...",
         ),
     ];
-    draw(&panes, 0);
+    draw(&mut panes, 0);
 }

@@ -32,12 +32,13 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::{Backend, CrosstermBackend};
-use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Terminal;
 
-use crate::agent::{AgentSpec, AgentState};
+use crate::agent::{AgentKind, AgentSpec, AgentState, AgentStatus};
 use crate::bus::{self, AgentUpdate, AgentUpdateReceiver, AgentUpdateSender};
 use crate::config::Config;
 use crate::coordinator::{self, Coordinator};
@@ -53,12 +54,59 @@ use crate::worktree::{OwnedWorktrees, WorktreeManager};
 
 use tokio::sync::mpsc::UnboundedSender;
 
-/// Input mode — zellij-style. Normal = passthrough, Pane = focus nav.
+/// Input mode — zellij-style. Normal = passthrough, Pane = focus nav,
+/// the fuzzy-focus palette (`/` from Pane mode).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum InputMode {
     #[default]
     Normal,
     Pane,
+    /// Fuzzy-focus jump palette: type to filter agents, Enter to focus.
+    Jump,
+}
+
+/// The daemon connection state — drives the sidebar indicator + error handling.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ConnectionState {
+    /// No daemon — orca-tui manages PTYs directly (the default/legacy mode).
+    #[default]
+    Standalone,
+    /// Connected to a daemon — panes are backed by daemon sessions.
+    Connected,
+    /// Was connected, but the daemon disconnected (crash, idle shutdown).
+    /// `reason` is the error message; `next_retry` is when to attempt reconnection.
+    Disconnected {
+        reason: String,
+        next_retry: Option<Instant>,
+    },
+}
+
+impl ConnectionState {
+    /// A short label for the sidebar: `● Standalone` / `● Daemon` / etc.
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Standalone => "● Standalone",
+            Self::Connected => "● Daemon",
+            Self::Disconnected { .. } => "✗ Disconnected",
+        }
+    }
+
+    /// The color for the sidebar label.
+    #[must_use]
+    pub fn color(&self, theme: &crate::config::ThemeConfig) -> ratatui::style::Color {
+        match self {
+            Self::Standalone => theme.muted(),
+            Self::Connected => theme.success(),
+            Self::Disconnected { .. } => theme.error(),
+        }
+    }
+
+    /// Whether we are in standalone mode (PTYs managed locally).
+    #[must_use]
+    pub fn is_standalone(&self) -> bool {
+        matches!(self, Self::Standalone)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -70,9 +118,11 @@ enum FocusDir {
 }
 
 const FOOTER_NORMAL: &str =
-    " NORMAL \u{00B7} Ctrl+P: panes \u{00B7} Ctrl+Q: quit \u{00B7} mouse: scroll ";
+    " Ctrl+P: control \u{00B7} Ctrl+Q: quit \u{00B7} Ctrl+N: new \u{00B7} Ctrl+B: sidebar ";
 const FOOTER_PANE: &str =
-    " PANE \u{00B7} arrows/hjkl: focus \u{00B7} Tab: next \u{00B7} Esc: back ";
+    " arrows/hjkl: focus \u{00B7} Tab: next \u{00B7} p: pin \u{00B7} Ctrl+B: sidebar \u{00B7} Esc: back ";
+const FOOTER_JUMP: &str =
+    " type to filter \u{00B7} \u{2191}\u{2193} select \u{00B7} Enter: focus \u{00B7} Esc: cancel ";
 
 /// The interactive Orca TUI application.
 ///
@@ -120,6 +170,17 @@ pub struct App<B: Backend = CrosstermBackend<Stdout>> {
     /// `pane_task[i]` is the coordinator task id pane `i` is running (`None`
     /// for non-orchestrated panes). Kept parallel to `panes`/`sessions`.
     pane_task: Vec<Option<coordinator::TaskId>>,
+    /// Daemon session IDs parallel to panes — `None` for standalone panes or
+    /// panes that haven't been assigned a daemon session yet.
+    daemon_session_ids: Vec<Option<String>>,
+    /// Shared session-ID → pane-index map for the daemon stream reader thread.
+    /// `None` when not in daemon mode.
+    daemon_session_map:
+        Option<std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>>,
+    /// Reconnect attempt counter (resets to 0 on successful connect).
+    daemon_reconnect_attempts: u32,
+    /// Current backoff delay (doubles each failure, capped by config).
+    daemon_backoff: Duration,
     /// PTY size captured at construction, reused by [`App::spawn_one`].
     cols: u16,
     rows: u16,
@@ -136,10 +197,27 @@ pub struct App<B: Backend = CrosstermBackend<Stdout>> {
     /// Feature 8: when non-`None`, the pane is awaiting a backoff-scheduled
     /// respawn at this `Instant`. Drained by [`App::pump_reconnect`].
     reconnect_due: Vec<Option<Instant>>,
+    /// Action item #6: per-pane pin flag, parallel to `panes` (`pinned[i]`
+    /// ↔ pane `i`). A pinned agent renders in a dedicated "PINNED" sidebar
+    /// section above "IN PROGRESS". Toggled in Pane mode with `p`.
+    pinned: Vec<bool>,
     /// User configuration (theme, layout, default agent).
     config: Config,
     /// Current input mode (Normal = passthrough, Pane = focus navigation).
     mode: InputMode,
+    /// User override for sidebar visibility (Ctrl+B toggles). `false` = let the
+    /// adaptive auto-hide logic decide; `true` = force-hidden regardless of width.
+    sidebar_hidden: bool,
+    /// Jump-palette (mode = Jump) state: the current filter query.
+    jump_query: String,
+    /// Jump-palette: selected index into the filtered agent list.
+    jump_selected: usize,
+    /// Daemon connection state — drives the sidebar indicator + error handling.
+    conn_state: ConnectionState,
+    /// Transient UI messages (daemon errors, connection changes, etc.).
+    toasts: crate::toast::ToastQueue,
+    /// The daemon client when connected to an Orca daemon (None in standalone).
+    daemon: Option<crate::orca_daemon::DaemonClient>,
 }
 
 impl App {
@@ -193,6 +271,10 @@ impl App {
         let mut pane_command: Vec<Vec<String>> = Vec::with_capacity(specs.len());
         let mut reconnect: Vec<Option<ssh::ReconnectSession>> = Vec::with_capacity(specs.len());
         let mut reconnect_due: Vec<Option<Instant>> = Vec::with_capacity(specs.len());
+        let mut daemon_session_ids: Vec<Option<String>> = Vec::with_capacity(specs.len());
+        // Action item #6: one pin flag per spec, default unpinned. Captured
+        // before `specs.into_iter()` moves it.
+        let pinned: Vec<bool> = vec![false; specs.len()];
 
         for (idx, spec) in specs.into_iter().enumerate() {
             let name = spec.name.clone();
@@ -244,6 +326,7 @@ impl App {
             pane_command.push(command);
             reconnect.push(None);
             reconnect_due.push(None);
+            daemon_session_ids.push(None);
         }
 
         // NOTE: we keep `bus_tx` (stored on the App) rather than dropping it,
@@ -266,14 +349,25 @@ impl App {
             coordinator: None,
             orch_agent: None,
             pane_task,
+            daemon_session_ids,
+            daemon_session_map: None,
+            daemon_reconnect_attempts: 0,
+            daemon_backoff: Duration::from_secs(Config::default().daemon.reconnect_initial_secs),
             cols,
             rows,
             bus_tx,
             pane_command,
             reconnect,
             reconnect_due,
+            pinned,
             config: Config::load_or_default(),
             mode: InputMode::Normal,
+            sidebar_hidden: false,
+            jump_query: String::new(),
+            jump_selected: 0,
+            conn_state: ConnectionState::Standalone,
+            toasts: crate::toast::ToastQueue::new(),
+            daemon: None,
         })
     }
 }
@@ -349,9 +443,10 @@ impl<B: Backend> App<B> {
 
     fn restore_terminal(&mut self) -> Result<()> {
         let mut stdout = io::stdout();
-        // LeaveAlternateScreen must run before disable_raw_mode so the alt
-        // screen swap isn't done in cooked mode.
-        let _ = execute!(stdout, LeaveAlternateScreen);
+        // DisableMouseCapture MUST run before LeaveAlternateScreen — otherwise
+        // the terminal stays in mouse-capture mode after exit and mouse events
+        // leak through as garbage characters in the shell.
+        let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
         let disable = disable_raw_mode();
         let show = self.terminal.show_cursor();
         self.raw_mode_active = false;
@@ -382,6 +477,9 @@ impl<B: Backend> App<B> {
                 self.scheduler.record_activity(now);
             }
 
+            // GC expired toasts every frame.
+            self.toasts.gc(now);
+
             // Render only when the frame budget allows; otherwise note a skip
             // (backpressure: render the latest state next frame, never catch up).
             if self.scheduler.should_render(now) {
@@ -404,6 +502,10 @@ impl<B: Backend> App<B> {
             // Feature 8: fire any backoff-scheduled remote-session reconnects
             // whose wait has elapsed (non-blocking).
             self.pump_reconnect();
+
+            // Daemon reconnection: if we were connected and the daemon crashed,
+            // attempt to reconnect on an exponential backoff.
+            self.pump_daemon_reconnect();
 
             // Poll with the scheduler-chosen timeout: ~remaining-to-next-frame
             // when active, the longer idle interval when nothing is happening.
@@ -506,8 +608,43 @@ impl<B: Backend> App<B> {
     fn apply_update(&mut self, update: AgentUpdate) {
         match update {
             AgentUpdate::Output { pane_id, bytes } => {
-                if let Some(pane) = self.panes.get_mut(pane_id) {
-                    pane.feed(&bytes);
+                // Answer the agent's terminal-capability queries (OSC color,
+                // DECRQM, DA, DCS terminfo) so probing agents (opencode/OpenTUI)
+                // render instead of going blank waiting for a reply. The bytes
+                // are still fed to the emulator below (the responder only reads).
+                let responses = match self.panes.get_mut(pane_id) {
+                    Some(pane) => {
+                        let r = pane.scan_queries(&bytes, &self.config.theme);
+                        pane.feed(&bytes);
+                        // Optional live debug log (ORCA_DEBUG_LOG=1): did the
+                        // bytes reach the emulator, and does vt100 have content?
+                        if std::env::var("ORCA_DEBUG_LOG").is_ok() {
+                            let cells = pane
+                                .emulator()
+                                .grid()
+                                .iter()
+                                .map(|row| row.iter().filter(|c| c.has_contents()).count())
+                                .sum::<usize>();
+                            let mut f = std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open("/tmp/orca-live.log")
+                                .unwrap();
+                            use std::io::Write;
+                            let _ = writeln!(
+                                f,
+                                "pane {pane_id}: +{} bytes → emulator now has {cells} non-empty cells",
+                                bytes.len()
+                            );
+                        }
+                        r
+                    }
+                    None => Vec::new(),
+                };
+                if !responses.is_empty() && std::env::var("ORCA_NO_RESPOND").is_err() {
+                    if let Some(Some(session)) = self.sessions.get_mut(pane_id) {
+                        let _ = session.write_bytes(&responses);
+                    }
                 }
             }
             AgentUpdate::State { pane_id, state } => {
@@ -601,9 +738,92 @@ impl<B: Backend> App<B> {
         }
     }
 
-    /// Append a new agent pane mid-run (Feature 7 orchestration). Spawns the
-    /// PTY, wires it onto the bus, and returns the new pane index.
+    /// Append a new agent pane mid-run (Feature 7 orchestration). In daemon
+    /// mode, sends a `createOrAttach` RPC instead of spawning a local PTY.
+    /// Returns the new pane index.
     fn spawn_one(&mut self, spec: AgentSpec) -> usize {
+        if self.daemon.is_some() {
+            return self.spawn_one_daemon(spec);
+        }
+        self.spawn_one_local(spec)
+    }
+
+    /// Daemon-mode spawn: sends `createOrAttach` RPC, feeds the snapshot to the
+    /// pane emulator, and registers the session ID in the stream reader map.
+    fn spawn_one_daemon(&mut self, spec: AgentSpec) -> usize {
+        use crate::orca_daemon::DaemonError;
+        let idx = self.panes.len();
+        let name = spec.name.clone();
+        let command = spec.command.clone();
+        let cols = self.cols;
+        let rows = self.rows;
+        let session_id = format!(
+            "orca-tui-{}-{}",
+            idx,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        );
+
+        let daemon = self.daemon.as_mut().unwrap();
+        match daemon.rpc(
+            "createOrAttach",
+            serde_json::json!({
+                "sessionId": session_id,
+                "cols": cols,
+                "rows": rows,
+                "command": command.first().cloned().unwrap_or_default(),
+            }),
+        ) {
+            Ok(resp) => {
+                let mut pane = Pane::new(idx, &name, cols, rows);
+                pane.set_state(AgentState::Running);
+                // Feed the snapshot (if any) to restore the terminal state.
+                if let Some(snap) = resp.get("snapshot").and_then(|v| v.as_str()) {
+                    pane.feed(snap.as_bytes());
+                }
+                self.panes.push(pane);
+                self.sessions.push(None); // no local PTY in daemon mode
+                self.daemon_session_ids.push(Some(session_id.clone()));
+                // Register in the stream reader's session map.
+                if let Some(map) = &self.daemon_session_map {
+                    map.lock().unwrap().insert(session_id, idx);
+                }
+            }
+            Err(e) => {
+                let reason = match &e {
+                    DaemonError::Disconnected { reason } => {
+                        self.conn_state = ConnectionState::Disconnected {
+                            reason: reason.clone(),
+                            next_retry: Some(Instant::now() + Duration::from_secs(3)),
+                        };
+                        self.daemon = None;
+                        reason.clone()
+                    }
+                    _ => e.to_string(),
+                };
+                self.toasts.push(crate::toast::Toast::error(format!(
+                    "Failed to create daemon session: {reason}"
+                )));
+                let mut pane = Pane::new(idx, &name, cols, rows);
+                pane.set_state(AgentState::Failed(reason));
+                self.panes.push(pane);
+                self.sessions.push(None);
+                self.daemon_session_ids.push(None);
+            }
+        }
+        self.pane_task.push(None);
+        self.pane_command.push(command);
+        self.reconnect.push(None);
+        self.reconnect_due.push(None);
+        self.pinned.push(false);
+        // Note: daemon_session_ids is already pushed inside the match above.
+        idx
+    }
+
+    /// Standalone-mode spawn: creates a local PTY via portable-pty.
+    fn spawn_one_local(&mut self, spec: AgentSpec) -> usize {
         let idx = self.panes.len();
         let name = spec.name.clone();
         let command = spec.command.clone();
@@ -621,7 +841,9 @@ impl<B: Backend> App<B> {
                 self.sessions.push(Some(session));
             }
             Err(err) => {
-                eprintln!("orca-tui: failed to spawn {name:?}: {err:#}");
+                // Do NOT eprintln here — we are inside the raw-mode TUI, so a
+                // stderr write would corrupt the display. The Failed pane state
+                // below carries the error into the header + sidebar instead.
                 let mut pane = Pane::new(idx, &name, cols, rows);
                 pane.set_state(AgentState::Failed(format!("{err:#}")));
                 self.panes.push(pane);
@@ -632,12 +854,119 @@ impl<B: Backend> App<B> {
         self.pane_command.push(command);
         self.reconnect.push(None);
         self.reconnect_due.push(None);
+        self.pinned.push(false);
+        self.daemon_session_ids.push(None);
         idx
     }
 
     /// Feature 8: mark every current pane eligible for auto-reconnect (used
     /// with `--remote --reconnect`). A dropped remote session is then re-spawned
     /// on its own pane after an exponential backoff, up to the policy's max.
+    /// Try to connect to an Orca GUI daemon (--daemon flag). On success,
+    /// switches to daemon mode (agent input is forwarded via RPC). On failure,
+    /// falls back to standalone silently (no daemon found) or with a toast
+    /// (daemon found but connection rejected).
+    pub fn try_connect_daemon(&mut self) {
+        use crate::orca_daemon::{DaemonClient, DaemonConnectOptions, DaemonError};
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+        let opts = DaemonConnectOptions {
+            rpc_timeout: Duration::from_secs(self.config.daemon.rpc_timeout_secs),
+            hello_timeout: Duration::from_secs(self.config.daemon.hello_timeout_secs),
+        };
+        match DaemonClient::try_connect_with(opts) {
+            None => {
+                // No daemon socket found — silent standalone fallback.
+            }
+            Some(Ok(mut client)) => {
+                let pid = client.identity().pid;
+
+                // Build the session-ID → pane-index map for the stream reader.
+                let session_map: Arc<Mutex<HashMap<String, usize>>> =
+                    Arc::new(Mutex::new(HashMap::new()));
+                for (i, sid) in self.daemon_session_ids.iter().enumerate() {
+                    if let Some(sid) = sid {
+                        session_map.lock().unwrap().insert(sid.clone(), i);
+                    }
+                }
+
+                // Take the stream socket and start a reader thread.
+                if let Some(mut stream) = client.take_stream() {
+                    // Store the map so spawn_one_daemon can register new sessions.
+                    self.daemon_session_map = Some(Arc::clone(&session_map));
+                    let map = Arc::clone(&session_map);
+                    let tx = self.bus_tx.clone();
+                    let _ = thread::Builder::new()
+                        .name("orca-daemon-stream".to_string())
+                        .spawn(move || {
+                            use crate::orca_daemon::{DaemonClient, FrameType};
+                            loop {
+                                match DaemonClient::read_stream_frame(&mut stream) {
+                                    Ok(frame) => {
+                                        match frame.ftype {
+                                            FrameType::Data => {
+                                                // Parse NDJSON {sessionId, data} or treat as raw for pane 0.
+                                                let (pane_id, bytes) =
+                                                    parse_stream_data(&frame.payload, &map);
+                                                let _ =
+                                                    tx.send(AgentUpdate::Output { pane_id, bytes });
+                                            }
+                                            FrameType::Event => {
+                                                // Parse NDJSON event (exit, etc.).
+                                                if let Some((pane_id, code)) =
+                                                    parse_stream_event(&frame.payload, &map)
+                                                {
+                                                    let _ = tx.send(AgentUpdate::Exit {
+                                                        pane_id,
+                                                        code: Some(code),
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(DaemonError::Disconnected { reason }) => {
+                                        // Signal all panes as exited.
+                                        let ids: Vec<usize> = {
+                                            let m = map.lock().unwrap();
+                                            m.values().copied().collect()
+                                        };
+                                        for id in ids {
+                                            let _ = tx.send(AgentUpdate::Exit {
+                                                pane_id: id,
+                                                code: None,
+                                            });
+                                        }
+                                        break;
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                        });
+                }
+
+                self.daemon = Some(client);
+                self.conn_state = ConnectionState::Connected;
+                self.daemon_reconnect_attempts = 0;
+                self.daemon_backoff =
+                    Duration::from_secs(self.config.daemon.reconnect_initial_secs);
+                self.toasts.push(crate::toast::Toast::success(format!(
+                    "Connected to Orca daemon (pid {pid})"
+                )));
+            }
+            Some(Err(e)) => {
+                let reason = match &e {
+                    DaemonError::Connect(_) => "daemon socket unreachable".to_string(),
+                    DaemonError::HelloRejected { message } => format!("rejected: {message}"),
+                    DaemonError::Disconnected { reason } => reason.clone(),
+                    _ => e.to_string(),
+                };
+                self.toasts.push(crate::toast::Toast::warning(format!(
+                    "Daemon connect failed ({reason}). Running standalone."
+                )));
+            }
+        }
+    }
+
     pub fn enable_reconnect(&mut self) {
         let policy = ssh::ReconnectPolicy::default();
         for slot in &mut self.reconnect {
@@ -667,7 +996,7 @@ impl<B: Backend> App<B> {
                     .spawn(move || bus::forward_session(i, rx, tx));
             }
             Err(err) => {
-                eprintln!("orca-tui: reconnect spawn failed: {err:#}");
+                // No eprintln (would corrupt the TUI); the Failed state carries it.
                 if let Some(pane) = self.panes.get_mut(i) {
                     pane.set_state(AgentState::Failed(format!("reconnect failed: {err:#}")));
                 }
@@ -714,6 +1043,137 @@ impl<B: Backend> App<B> {
         }
     }
 
+    /// Daemon reconnection pump. Called once per loop tick. When in
+    /// `Disconnected` state and the retry deadline has elapsed, attempts to
+    /// reconnect. On success: rebuilds the session map and pushes a success
+    /// toast. On failure: doubles the backoff (capped at 30s) and tries again.
+    fn pump_daemon_reconnect(&mut self) {
+        use crate::orca_daemon::{DaemonClient, DaemonError};
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+
+        // Only act when in Disconnected state with a retry deadline.
+        let next_retry = match &self.conn_state {
+            ConnectionState::Disconnected { next_retry, .. } => *next_retry,
+            _ => return,
+        };
+        let Some(deadline) = next_retry else {
+            return; // no retry scheduled (max attempts exhausted)
+        };
+        if Instant::now() < deadline {
+            return; // not yet time
+        }
+
+        // Attempt reconnection.
+        match DaemonClient::try_connect() {
+            None => {
+                // Daemon disappeared entirely — give up, go standalone.
+                self.conn_state = ConnectionState::Standalone;
+                self.toasts.push(crate::toast::Toast::warning(
+                    "Daemon gone. Switched to standalone.",
+                ));
+            }
+            Some(Ok(mut client)) => {
+                let pid = client.identity().pid;
+
+                // Rebuild the session-ID → pane-index map.
+                let session_map: Arc<Mutex<HashMap<String, usize>>> =
+                    Arc::new(Mutex::new(HashMap::new()));
+                for (i, sid) in self.daemon_session_ids.iter().enumerate() {
+                    if let Some(sid) = sid {
+                        session_map.lock().unwrap().insert(sid.clone(), i);
+                    }
+                }
+
+                // Start a fresh stream reader thread.
+                if let Some(mut stream) = client.take_stream() {
+                    self.daemon_session_map = Some(Arc::clone(&session_map));
+                    let map = Arc::clone(&session_map);
+                    let tx = self.bus_tx.clone();
+                    let _ = thread::Builder::new()
+                        .name("orca-daemon-stream".to_string())
+                        .spawn(move || {
+                            use crate::orca_daemon::{DaemonClient, FrameType};
+                            loop {
+                                match DaemonClient::read_stream_frame(&mut stream) {
+                                    Ok(frame) => match frame.ftype {
+                                        FrameType::Data => {
+                                            let (pane_id, bytes) =
+                                                parse_stream_data(&frame.payload, &map);
+                                            let _ = tx.send(AgentUpdate::Output { pane_id, bytes });
+                                        }
+                                        FrameType::Event => {
+                                            if let Some((pane_id, code)) =
+                                                parse_stream_event(&frame.payload, &map)
+                                            {
+                                                let _ = tx.send(AgentUpdate::Exit {
+                                                    pane_id,
+                                                    code: Some(code),
+                                                });
+                                            }
+                                        }
+                                    },
+                                    Err(DaemonError::Disconnected { .. }) => {
+                                        let ids: Vec<usize> = {
+                                            let m = map.lock().unwrap();
+                                            m.values().copied().collect()
+                                        };
+                                        for id in ids {
+                                            let _ = tx.send(AgentUpdate::Exit {
+                                                pane_id: id,
+                                                code: None,
+                                            });
+                                        }
+                                        break;
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                        });
+                }
+
+                self.daemon = Some(client);
+                self.conn_state = ConnectionState::Connected;
+                self.daemon_reconnect_attempts = 0;
+                self.daemon_backoff =
+                    Duration::from_secs(self.config.daemon.reconnect_initial_secs);
+                self.toasts.push(crate::toast::Toast::success(format!(
+                    "Reconnected to Orca daemon (pid {pid})"
+                )));
+            }
+            Some(Err(e)) => {
+                // Still down — increase backoff (configurable cap).
+                self.daemon_reconnect_attempts += 1;
+                let max = self.config.daemon.reconnect_max_attempts;
+                if max > 0 && self.daemon_reconnect_attempts >= max {
+                    // Exhausted — give up, go standalone.
+                    self.conn_state = ConnectionState::Standalone;
+                    self.daemon = None;
+                    self.toasts.push(crate::toast::Toast::warning(
+                        "Daemon reconnect attempts exhausted. Switched to standalone.",
+                    ));
+                    return;
+                }
+                let prev_reason = match &self.conn_state {
+                    ConnectionState::Disconnected { reason, .. } => reason.clone(),
+                    _ => String::new(),
+                };
+                // Exponential backoff using config-driven initial/max.
+                let cap = Duration::from_secs(self.config.daemon.reconnect_max_secs);
+                let next_delay = (self.daemon_backoff * 2).min(cap);
+                self.daemon_backoff = next_delay;
+                self.conn_state = ConnectionState::Disconnected {
+                    reason: prev_reason,
+                    next_retry: Some(Instant::now() + next_delay),
+                };
+                self.toasts.push(crate::toast::Toast::warning(format!(
+                    "Reconnect failed ({e}). Retrying in {}s.",
+                    next_delay.as_secs()
+                )));
+            }
+        }
+    }
+
     /// Feature 7: release every dependency-gated task the coordinator can
     /// dispatch right now, each to its own new pane. Called once per loop tick
     /// so a task whose dependencies just completed spawns on the next frame.
@@ -757,7 +1217,7 @@ impl<B: Backend> App<B> {
         // live activity from OSC 9999). Hidden when sidebar_width is 0 or the
         // terminal is too narrow for panes to be usable.
         let sidebar_w = self.config.layout.sidebar_width;
-        let show_sidebar = sidebar_w > 0 && total.width > sidebar_w + 22;
+        let show_sidebar = sidebar_w > 0 && !self.sidebar_hidden && total.width > sidebar_w + 22;
         let (sidebar_area, content_area) = if show_sidebar {
             // spacing(1) adds a 1-cell gap between the sidebar and the pane
             // area — the panes' own Double borders provide the visual boundary,
@@ -787,9 +1247,34 @@ impl<B: Backend> App<B> {
             let inner_h = rect.height.saturating_sub(2).max(MIN_ROWS);
             let (cur_w, cur_h) = pane.size();
             if (cur_w, cur_h) != (inner_w, inner_h) {
+                if std::env::var("ORCA_DEBUG_LOG").is_ok() {
+                    use std::io::Write;
+                    let has_session = self.sessions.get(i).and_then(|o| o.as_ref()).is_some();
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("/tmp/orca-live.log")
+                    {
+                        let _ = writeln!(f, "RESIZE pane {i}: emulator {cur_w}x{cur_h} → {inner_w}x{inner_h}; session_present={has_session}");
+                    }
+                }
                 pane.resize_viewport(inner_w, inner_h);
                 if let Some(Some(session)) = self.sessions.get_mut(i) {
-                    let _ = session.resize(inner_w, inner_h);
+                    let r = session.resize(inner_w, inner_h);
+                    if std::env::var("ORCA_DEBUG_LOG").is_ok() {
+                        use std::io::Write;
+                        if let Ok(mut f) = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open("/tmp/orca-live.log")
+                        {
+                            let _ = writeln!(
+                                f,
+                                "  session.resize({inner_w}x{inner_h}) = {}",
+                                if r.is_ok() { "OK" } else { "ERR" }
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -805,36 +1290,162 @@ impl<B: Backend> App<B> {
                 branch: p.branch().map(String::from),
                 activity: p.activity().cloned(),
                 focused: i == self.focus,
+                pinned: self.pinned.get(i).copied().unwrap_or(false),
             })
             .collect();
 
         let focus = self.focus;
-        let panes = &self.panes;
+        let mode = self.mode;
+        // Snapshot the jump-palette state (computed before the mutable `panes`
+        // borrow so the draw closure can render the overlay without touching self).
+        let jump_open = mode == InputMode::Jump;
+        let jump_filtered_idx: Vec<usize> = if jump_open {
+            self.jump_filtered()
+        } else {
+            Vec::new()
+        };
+        let jump_query = self.jump_query.clone();
+        let jump_selected = self.jump_selected;
+        let panes = &mut self.panes;
         let theme = &self.config.theme;
+        // Agent status tallies for the footer status bar (opencode-style).
+        let statuses: Vec<AgentStatus> = sidebar_entries
+            .iter()
+            .map(|e| AgentStatus::derive(&e.state, e.activity.as_ref().map(|a| a.state.as_str())))
+            .collect();
+        let n_working = statuses.iter().filter(|s| s.is_active()).count();
+        let n_failed = statuses
+            .iter()
+            .filter(|s| matches!(s, AgentStatus::Failed))
+            .count();
+        let n_done = statuses
+            .iter()
+            .filter(|s| matches!(s, AgentStatus::Done))
+            .count();
         self.terminal.draw(|f| {
             if let Some(sb) = sidebar_area {
-                sidebar::render_sidebar(f, sb, &sidebar_entries, theme);
+                let conn_status = match self.conn_state {
+                    ConnectionState::Standalone => Some(("● Standalone", theme.muted())),
+                    ConnectionState::Connected => Some(("● Daemon", theme.success())),
+                    ConnectionState::Disconnected { .. } => Some(("✗ Disconnected", theme.error())),
+                };
+                sidebar::render_sidebar(f, sb, &sidebar_entries, theme, conn_status);
+                // Fill the gap between sidebar and panes with the theme bg so it
+                // isn't a terminal-default strip (background everywhere).
+                let gw = content_area.x.saturating_sub(sb.right());
+                if gw > 0 {
+                    let gap = Rect::new(sb.right(), total.y, gw, total.height);
+                    f.buffer_mut()
+                        .set_style(gap, Style::default().bg(theme.bg()));
+                }
             }
-            for (i, pane) in panes.iter().enumerate() {
+            for (i, pane) in panes.iter_mut().enumerate() {
                 let area = rects.get(i).copied().unwrap_or_default();
-                pane.render(f, area, i == focus);
+                pane.render(f, area, i == focus, theme);
             }
             if reserve_footer {
+                // opencode-style status bar: left = agent tally, right = key-hint.
+                let foot = Layout::horizontal([Constraint::Min(1), Constraint::Length(66)])
+                    .split(footer_area);
+                let status_line = Line::from(vec![
+                    Span::styled(
+                        format!(" ● {n_working} working "),
+                        Style::default().fg(theme.success()).bg(theme.panel()),
+                    ),
+                    Span::styled(
+                        format!(" ✗ {n_failed} failed "),
+                        Style::default().fg(theme.error()).bg(theme.panel()),
+                    ),
+                    Span::styled(
+                        format!(" ✓ {n_done} done "),
+                        Style::default().fg(theme.muted()).bg(theme.panel()),
+                    ),
+                ]);
                 f.render_widget(
-                    Paragraph::new(if self.mode == InputMode::Pane {
-                        FOOTER_PANE
-                    } else {
-                        FOOTER_NORMAL
-                    })
-                    .style(Style::default().fg(
-                        if self.mode == InputMode::Pane {
-                            self.config.theme.accent()
-                        } else {
-                            Color::DarkGray
-                        },
-                    )),
-                    footer_area,
+                    Paragraph::new(status_line).style(Style::default().bg(theme.panel())),
+                    foot[0],
                 );
+                let hint = match mode {
+                    InputMode::Pane => FOOTER_PANE,
+                    InputMode::Jump => FOOTER_JUMP,
+                    InputMode::Normal => FOOTER_NORMAL,
+                };
+                f.render_widget(
+                    Paragraph::new(hint)
+                        .style(Style::default().bg(theme.panel()).fg(theme.accent()))
+                        .alignment(Alignment::Right),
+                    foot[1],
+                );
+            }
+            // Jump palette overlay (drawn last, on top of everything).
+            if jump_open {
+                use ratatui::style::Modifier;
+                use ratatui::text::Span;
+                use ratatui::widgets::{Block, BorderType, Borders, Clear};
+                let n = jump_filtered_idx.len();
+                let pop_h = (n as u16 + 3).min(total.height.saturating_sub(4)).max(5);
+                let pop_w = total.width.min(64).max(40);
+                let pop_x = total.x + (total.width.saturating_sub(pop_w)) / 2;
+                let pop_y = total.y + (total.height.saturating_sub(pop_h)) / 2;
+                let pop = Rect::new(pop_x, pop_y, pop_w, pop_h);
+                f.render_widget(Clear, pop);
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(theme.accent()))
+                    .title(
+                        Line::from(" Jump to agent ").style(Style::default().fg(theme.accent())),
+                    );
+                f.render_widget(&block, pop);
+                let inner = block.inner(pop);
+
+                let mut lines: Vec<Line> = Vec::new();
+                // Query line with a block cursor.
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("/{}", jump_query),
+                        Style::default().fg(theme.accent()),
+                    ),
+                    Span::styled(
+                        "_",
+                        Style::default()
+                            .fg(theme.accent())
+                            .add_modifier(Modifier::SLOW_BLINK),
+                    ),
+                ]));
+                lines.push(Line::default());
+                for (i, &pane_idx) in jump_filtered_idx.iter().enumerate() {
+                    if i as u16 + 3 > inner.height {
+                        break;
+                    }
+                    let name = panes
+                        .get(pane_idx)
+                        .map(|p| p.name().to_string())
+                        .unwrap_or_default();
+                    let selected = i == jump_selected;
+                    let style = if selected {
+                        Style::default()
+                            .fg(theme.accent())
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(theme.fg())
+                    };
+                    let prefix = if selected { "▶ " } else { "  " };
+                    lines.push(Line::from(format!("{prefix}{name}")).style(style));
+                }
+                f.render_widget(Paragraph::new(lines), inner);
+            }
+            // Toast overlay: render transient messages at the bottom of the
+            // content area, above the footer. Each toast is one line.
+            if !self.toasts.is_empty() && reserve_footer {
+                let toast_rows = self.toasts.len().min(3) as u16;
+                let toast_area = Rect::new(
+                    content_area.x,
+                    footer_area.y.saturating_sub(toast_rows),
+                    content_area.width,
+                    toast_rows,
+                );
+                self.toasts.render_buf(f.buffer_mut(), toast_area, theme);
             }
         })?;
 
@@ -865,6 +1476,18 @@ impl<B: Backend> App<B> {
             self.quit = true;
             return;
         }
+        // Ctrl+N → spawn a fresh agent pane (the configured default agent) so
+        // agents can be added at runtime, not just at `run` startup.
+        if ctrl && key.code == KeyCode::Char('n') {
+            self.spawn_default_agent();
+            return;
+        }
+        // Ctrl+B → toggle the sidebar (adaptive layout: auto-hides on narrow
+        // terminals; the user can force-show/-hide at any width).
+        if ctrl && key.code == KeyCode::Char('b') {
+            self.sidebar_hidden = !self.sidebar_hidden;
+            return;
+        }
         match self.mode {
             InputMode::Normal => self.forward_key_to_agent(key),
             InputMode::Pane => match key.code {
@@ -875,9 +1498,69 @@ impl<B: Backend> App<B> {
                 KeyCode::Down | KeyCode::Char('j') => self.focus_directional(FocusDir::Down),
                 KeyCode::Left | KeyCode::Char('h') => self.focus_directional(FocusDir::Left),
                 KeyCode::Right | KeyCode::Char('l') => self.focus_directional(FocusDir::Right),
+                // Action item #6: toggle the pin flag on the focused pane so it
+                // renders in the dedicated "PINNED" sidebar section. A bare `p`
+                // (no modifiers) — Ctrl+P is intercepted above as the mode-enter
+                // hotkey, so it never reaches this arm.
+                KeyCode::Char('p') => self.toggle_pin_focused(),
+                // `/` opens the fuzzy-focus jump palette.
+                KeyCode::Char('/') => {
+                    self.jump_query.clear();
+                    self.jump_selected = 0;
+                    self.mode = InputMode::Jump;
+                }
                 _ => {}
             },
+            InputMode::Jump => self.handle_jump_key(key),
         }
+    }
+
+    /// Jump-palette key handling: build the filter query, move the selection
+    /// within the filtered list, focus on Enter, cancel on Esc.
+    fn handle_jump_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => self.mode = InputMode::Normal,
+            KeyCode::Enter => {
+                // Focus the selected filtered agent (if any) and close.
+                if let Some(&idx) = self.jump_filtered().get(self.jump_selected) {
+                    self.focus = idx;
+                }
+                self.mode = InputMode::Normal;
+            }
+            KeyCode::Backspace => {
+                self.jump_query.pop();
+                self.jump_selected = 0;
+            }
+            KeyCode::Up => {
+                if self.jump_selected > 0 {
+                    self.jump_selected -= 1;
+                }
+            }
+            KeyCode::Down => {
+                let n = self.jump_filtered().len();
+                if self.jump_selected + 1 < n {
+                    self.jump_selected += 1;
+                }
+            }
+            KeyCode::Char(c) if !ctrl => {
+                self.jump_query.push(c);
+                self.jump_selected = 0;
+            }
+            _ => {}
+        }
+    }
+
+    /// The pane indices whose name matches the jump query (case-insensitive
+    /// substring). Empty query ⇒ all panes, in order.
+    fn jump_filtered(&self) -> Vec<usize> {
+        let q = self.jump_query.to_ascii_lowercase();
+        self.panes
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| q.is_empty() || p.name().to_ascii_lowercase().contains(&q))
+            .map(|(i, _)| i)
+            .collect()
     }
 
     /// Normal-mode passthrough: forward the key to the focused agent's PTY as
@@ -891,7 +1574,13 @@ impl<B: Backend> App<B> {
                 let byte = (c as u8).to_ascii_lowercase().wrapping_sub(b'a' - 1);
                 self.send_to_focused(&[byte]);
             }
-            KeyCode::Char(c) if !ctrl && !alt => self.send_to_focused(&[c as u8]),
+            // Send the full UTF-8 encoding — `c as u8` truncates non-ASCII
+            // (Korean/CJK/emoji/accents are 2-4 bytes), which corrupts input.
+            KeyCode::Char(c) if !ctrl && !alt => {
+                let mut buf = [0u8; 4];
+                let s = c.encode_utf8(&mut buf);
+                self.send_to_focused(s.as_bytes());
+            }
             KeyCode::Enter if !ctrl && !alt => self.send_to_focused(b"\r"),
             KeyCode::Backspace if !ctrl && !alt => self.send_to_focused(&[0x7f]),
             KeyCode::Tab if !ctrl && !alt => self.send_to_focused(b"\t"),
@@ -989,6 +1678,31 @@ impl<B: Backend> App<B> {
         };
     }
 
+    /// Action item #6: flip the pin flag on the focused pane so it renders in
+    /// the dedicated "PINNED" sidebar section. No-op when focus is out of range.
+    /// Ctrl+N: spawn a fresh agent pane, so the user can add agents at runtime.
+    /// Prefers an actually-installed agent (so Ctrl+N works out of the box even
+    /// when the configured default isn't on PATH — e.g. default `claude` but
+    /// only `opencode` is installed); falls back to the configured default. The
+    /// new pane becomes focused. A failed spawn shows a Failed pane (no stderr,
+    /// which would corrupt the TUI).
+    fn spawn_default_agent(&mut self) {
+        let bin = AgentKind::detect_installed()
+            .first()
+            .map(AgentKind::binary)
+            .map(str::to_string)
+            .unwrap_or_else(|| self.config.default_agent.clone());
+        let spec = AgentSpec::from_command(vec![bin]);
+        let idx = self.spawn_one(spec);
+        self.focus = idx;
+    }
+
+    fn toggle_pin_focused(&mut self) {
+        if let Some(slot) = self.pinned.get_mut(self.focus) {
+            *slot = !*slot;
+        }
+    }
+
     fn focused_pane_mut(&mut self) -> Option<&mut Pane> {
         if self.focus >= self.panes.len() {
             None
@@ -1000,7 +1714,50 @@ impl<B: Backend> App<B> {
     /// Forward raw bytes to the focused pane's PTY. Best-effort: a dead/exited
     /// agent's PTY write will error and we swallow it rather than tear down the
     /// whole TUI (typing into a finished pane is a no-op).
+    ///
+    /// In daemon mode: sends a `write` RPC to the daemon (the daemon owns the
+    /// PTY). If the RPC fails (daemon crash, session gone), a toast is pushed
+    /// so the user sees what happened — the typed bytes are lost (no local PTY
+    /// to fall back to in daemon mode).
     fn send_to_focused(&mut self, bytes: &[u8]) {
+        if let Some(daemon) = &mut self.daemon {
+            // Daemon mode: forward via RPC using the pane's daemon session ID.
+            let session_id = match self
+                .daemon_session_ids
+                .get(self.focus)
+                .and_then(|s| s.as_ref())
+            {
+                Some(id) => id.clone(),
+                None => return, // no daemon session for this pane yet
+            };
+            match daemon.rpc(
+                "write",
+                serde_json::json!({
+                    "sessionId": session_id,
+                    "data": String::from_utf8_lossy(bytes),
+                }),
+            ) {
+                Ok(_) => {}
+                Err(crate::orca_daemon::DaemonError::Disconnected { reason }) => {
+                    self.conn_state = ConnectionState::Disconnected {
+                        reason: reason.clone(),
+                        next_retry: Some(Instant::now() + Duration::from_secs(3)),
+                    };
+                    self.toasts.push(crate::toast::Toast::error(format!(
+                        "Daemon disconnected: {reason}"
+                    )));
+                    // Drop the daemon client — it's dead.
+                    self.daemon = None;
+                }
+                Err(e) => {
+                    self.toasts.push(crate::toast::Toast::warning(format!(
+                        "RPC write failed: {e}"
+                    )));
+                }
+            }
+            return;
+        }
+        // Standalone mode: write directly to the local PTY.
         let Some(Some(session)) = self.sessions.get_mut(self.focus) else {
             return;
         };
@@ -1012,6 +1769,53 @@ impl<B: Backend> App<B> {
     fn all_sessions_gone(&self) -> bool {
         self.sessions.iter().all(|s| s.is_none())
     }
+}
+
+// ── Daemon stream helpers ───────────────────────────────────────────────────
+
+/// Parse a Data-frame payload and route it to the correct pane.
+///
+/// The daemon sends NDJSON `{"sessionId":"...","data":"..."}`. If the payload
+/// doesn't parse as NDJSON (e.g. raw bytes), fall back to pane 0.
+fn parse_stream_data(
+    payload: &[u8],
+    session_map: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
+) -> (usize, Vec<u8>) {
+    // Try NDJSON first.
+    if let Ok(json) = serde_json::from_slice::<serde_json::Value>(payload) {
+        if let Some(sid) = json.get("sessionId").and_then(|v| v.as_str()) {
+            let pane_id = session_map.lock().unwrap().get(sid).copied().unwrap_or(0);
+            if let Some(data) = json.get("data").and_then(|v| v.as_str()) {
+                return (pane_id, data.as_bytes().to_vec());
+            }
+            return (pane_id, Vec::new());
+        }
+    }
+    // Fallback: raw bytes → pane 0.
+    (0, payload.to_vec())
+}
+
+/// Parse an Event-frame payload for an exit event.
+///
+/// Returns `Some((pane_id, exit_code))` for exit events, `None` otherwise.
+fn parse_stream_event(
+    payload: &[u8],
+    session_map: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
+) -> Option<(usize, i32)> {
+    let json: serde_json::Value = serde_json::from_slice(payload).ok()?;
+    let event = json.get("event").and_then(|v| v.as_str())?;
+    if event != "exit" {
+        return None;
+    }
+    let sid = json.get("sessionId").and_then(|v| v.as_str())?;
+    let pane_id = session_map.lock().unwrap().get(sid).copied().unwrap_or(0);
+    let code = json
+        .get("payload")
+        .and_then(|p| p.get("code"))
+        .and_then(|c| c.as_i64())
+        .map(|c| c as i32)
+        .unwrap_or(0);
+    Some((pane_id, code))
 }
 
 impl<B: Backend> Drop for App<B> {
@@ -1069,14 +1873,25 @@ mod tests {
                 coordinator: None,
                 orch_agent: None,
                 pane_task: (0..n).map(|_| None).collect(),
+                daemon_session_ids: (0..n).map(|_| None).collect(),
+                daemon_session_map: None,
+                daemon_reconnect_attempts: 0,
+                daemon_backoff: Duration::from_secs(3),
                 cols: 80,
                 rows: 24,
                 bus_tx,
                 pane_command: (0..n).map(|_| Vec::new()).collect(),
                 reconnect: (0..n).map(|_| None).collect(),
                 reconnect_due: (0..n).map(|_| None).collect(),
+                pinned: vec![false; n],
                 config: Config::default(),
                 mode: InputMode::Normal,
+                sidebar_hidden: false,
+                jump_query: String::new(),
+                jump_selected: 0,
+                conn_state: ConnectionState::Standalone,
+                toasts: crate::toast::ToastQueue::new(),
+                daemon: None,
             }
         }
     }
@@ -1193,6 +2008,74 @@ mod tests {
         app.focus = 0;
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.focus, 0, "Tab in normal mode does NOT switch focus");
+    }
+
+    #[test]
+    fn toggle_pin_flips_the_focused_pane_pinned_flag() {
+        let mut app = App::for_test(vec![pane(0, "a"), pane(1, "b")]);
+        app.focus = 1;
+        app.mode = InputMode::Pane;
+        assert!(!app.pinned[0], "pane 0 starts unpinned");
+        assert!(!app.pinned[1], "pane 1 starts unpinned");
+
+        // First press of bare `p` pins the focused pane (1).
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        assert!(app.pinned[1], "first press pins the focused pane");
+        assert!(!app.pinned[0], "the non-focused pane is untouched");
+
+        // Second press flips it back to unpinned.
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        assert!(!app.pinned[1], "second press unpins");
+    }
+
+    #[test]
+    fn ctrl_b_toggles_sidebar_visibility() {
+        let mut app = App::for_test(vec![pane(0, "a")]);
+        assert!(!app.sidebar_hidden, "sidebar visible by default");
+        // Ctrl+B is a global hotkey — works from any mode.
+        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        assert!(app.sidebar_hidden, "Ctrl+B hides the sidebar");
+        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        assert!(!app.sidebar_hidden, "Ctrl+B again re-shows it");
+    }
+
+    #[test]
+    fn jump_palette_filters_and_focuses_on_enter() {
+        let mut app = App::for_test(vec![
+            pane(0, "claude"),
+            pane(1, "codex"),
+            pane(2, "opencode"),
+        ]);
+        app.mode = InputMode::Pane;
+        app.focus = 0;
+        // `/` opens the palette; empty query shows all agents.
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert_eq!(app.mode, InputMode::Jump);
+        assert_eq!(app.jump_filtered(), vec![0, 1, 2], "empty query shows all");
+
+        // type "co" → matches codex + opencode (substring, case-insensitive).
+        for c in ['c', 'o'] {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(
+            app.jump_filtered(),
+            vec![1, 2],
+            "query 'co' filters to codex+opencode"
+        );
+
+        // Down → select the 2nd filtered (opencode = pane 2); Enter focuses it.
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.jump_selected, 1);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.mode, InputMode::Normal, "Enter closes the palette");
+        assert_eq!(app.focus, 2, "Enter focused the selected agent (opencode)");
+
+        // Esc cancels without changing focus.
+        app.mode = InputMode::Jump;
+        app.focus = 0;
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.mode, InputMode::Normal);
+        assert_eq!(app.focus, 0, "Esc cancels without focusing");
     }
 
     #[test]
@@ -1351,5 +2234,629 @@ mod tests {
         if let Some(s) = app.sessions[0].as_mut() {
             let _ = s.kill();
         }
+    }
+
+    #[test]
+    fn spawn_one_failed_command_adds_failed_pane_and_keeps_vecs_aligned() {
+        // Ctrl+N path: spawning an agent whose binary isn't on PATH must NOT
+        // panic, must add exactly one Failed pane, and must keep every parallel
+        // per-pane vector (sessions/pane_task/pane_command/reconnect/reconnect_due/
+        // pinned) the same length as `panes`. A length mismatch here is exactly
+        // the class of bug that broke Ctrl+N at runtime.
+        let mut app = App::for_test(vec![pane(0, "a"), pane(1, "b")]);
+        let before = app.panes.len();
+        let idx = app.spawn_one(AgentSpec::from_command(vec![
+            "definitely-not-a-real-agent-binary-xyz".to_string(),
+        ]));
+        assert_eq!(idx, before, "new pane index == old panes.len()");
+        assert_eq!(app.panes.len(), before + 1, "exactly one pane added");
+        assert!(
+            matches!(app.panes[idx].state(), AgentState::Failed(_)),
+            "unspawnable agent should be a Failed pane (not Running/Idle)"
+        );
+        assert!(
+            app.sessions[idx].is_none(),
+            "a failed spawn leaves the session slot empty"
+        );
+        // Every parallel per-pane vector must stay aligned with `panes`.
+        let n = app.panes.len();
+        assert_eq!(app.sessions.len(), n, "sessions aligned");
+        assert_eq!(app.pane_task.len(), n, "pane_task aligned");
+        assert_eq!(app.pane_command.len(), n, "pane_command aligned");
+        assert_eq!(app.reconnect.len(), n, "reconnect aligned");
+        assert_eq!(app.reconnect_due.len(), n, "reconnect_due aligned");
+        assert_eq!(app.pinned.len(), n, "pinned aligned");
+
+        // Focusing the new pane + rendering the whole grid must not panic.
+        app.focus = idx;
+        app.render().expect("render after a failed spawn_one");
+    }
+
+    #[test]
+    fn render_shows_new_content_and_retains_old() {
+        // Validates the pane render path against ratatui's double-buffering:
+        // feeding new content and re-rendering must paint the new content, the
+        // old content must persist, and an idle re-render (no new feed) must
+        // neither panic nor erase what was drawn. (A dirty/partial repaint would
+        // fail this — unrepainted cells carry 2-frame-old content under swap.)
+        let mut app = App::for_test(vec![pane(0, "solo")]);
+        app.panes[0].feed(b"first-frame");
+        app.render().expect("first render");
+        assert!(
+            buffer_text(&app).contains("first-frame"),
+            "first content rendered"
+        );
+
+        app.panes[0].feed(b"\nsecond-line");
+        app.render().expect("second render (dirty rows)");
+        let text = buffer_text(&app);
+        assert!(text.contains("first-frame"), "first content persists");
+        assert!(text.contains("second-line"), "new content rendered");
+
+        // Idle frame: no new feed → no dirty rows → content must be retained.
+        app.render().expect("idle re-render");
+        let text = buffer_text(&app);
+        assert!(
+            text.contains("first-frame"),
+            "content retained on idle frame"
+        );
+        assert!(
+            text.contains("second-line"),
+            "new content retained on idle frame"
+        );
+    }
+
+    #[test]
+    fn handle_mouse_scroll_moves_focused_pane_scrollback() {
+        use crossterm::event::MouseEvent;
+        let mut app = App::for_test(vec![pane(0, "a"), pane(1, "b")]);
+        app.focus = 1;
+        assert_eq!(app.panes[1].scroll(), 0);
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(
+            app.panes[1].scroll(),
+            3,
+            "ScrollUp moves the focused pane 3 lines toward older output"
+        );
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(
+            app.panes[1].scroll(),
+            0,
+            "ScrollDown moves it back to the latest line (clamped at 0)"
+        );
+        assert_eq!(
+            app.panes[0].scroll(),
+            0,
+            "the non-focused pane is untouched"
+        );
+    }
+
+    #[test]
+    fn handle_mouse_does_not_panic_when_focus_is_out_of_range() {
+        use crossterm::event::MouseEvent;
+        let mut app = App::for_test(vec![pane(0, "a")]);
+        app.focus = 99;
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        // Non-scroll mouse kinds (click) are ignored entirely.
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.panes[0].scroll(), 0, "nothing changed");
+    }
+
+    #[test]
+    fn focus_directional_moves_focus_on_a_grid() {
+        // 4 panes ⇒ cols = ceil(sqrt(4)) = 2 ⇒ a 2×2 grid:
+        //   0 1
+        //   2 3
+        let mut app = App::for_test(vec![pane(0, "a"), pane(1, "b"), pane(2, "c"), pane(3, "d")]);
+        app.mode = InputMode::Pane;
+        app.focus = 0;
+
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.focus, 1, "Right moves within the row");
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.focus, 3, "Down drops a row");
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(app.focus, 2, "Left moves back within the row");
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.focus, 0, "Up moves up a row");
+
+        // hjkl mirrors the arrow keys.
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert_eq!(app.focus, 1, "'l' == Right");
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.focus, 3, "'j' == Down");
+        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        assert_eq!(app.focus, 2, "'h' == Left");
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(app.focus, 0, "'k' == Up");
+    }
+
+    #[test]
+    fn focus_directional_clamps_at_grid_boundaries() {
+        // 5 panes ⇒ cols = ceil(sqrt(5)) = 3 ⇒ a 3×2 grid:
+        //   0 1 2
+        //   3 4
+        let mut app = App::for_test(vec![
+            pane(0, "a"),
+            pane(1, "b"),
+            pane(2, "c"),
+            pane(3, "d"),
+            pane(4, "e"),
+        ]);
+        app.mode = InputMode::Pane;
+
+        app.focus = 0;
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.focus, 0, "no Up from the top row");
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(app.focus, 0, "no Left from column 0");
+
+        app.focus = 4;
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.focus, 4, "no Right past the last pane in the row");
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.focus, 4, "no Down past the last row");
+    }
+
+    #[test]
+    fn forward_key_to_agent_is_a_noop_with_no_live_session() {
+        // for_test seeds every session slot as None, so every forwarded key is a
+        // best-effort write to a dead PTY — swallowed, never panicking. Exercises
+        // every arm of the forwarding match (char, enter, backspace, tab, esc,
+        // arrows, ctrl+c, and a multi-byte UTF-8 char).
+        let mut app = App::for_test(vec![pane(0, "a")]);
+        app.mode = InputMode::Normal;
+        let keys = [
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+            // Ctrl+C maps to the raw byte 0x03 — still swallowed with no session.
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            // A non-ASCII char exercises the multi-byte UTF-8 encoding path.
+            KeyEvent::new(KeyCode::Char('\u{D55C}'), KeyModifiers::NONE),
+        ];
+        for key in keys {
+            app.handle_key(key); // must not panic
+        }
+        assert_eq!(app.focus, 0, "forwarding never moves focus");
+        assert_eq!(app.mode, InputMode::Normal, "forwarding never changes mode");
+    }
+
+    #[test]
+    fn apply_update_output_feeds_content_and_ignores_out_of_range_pane_id() {
+        let mut app = App::for_test(vec![pane(0, "a"), pane(1, "b")]);
+        app.apply_update(AgentUpdate::Output {
+            pane_id: 0,
+            bytes: b"hello".to_vec(),
+        });
+        let cell = app.panes[0].emulator().cell(0, 0).expect("cell exists");
+        assert_eq!(cell.chars, "h", "fed content reaches pane 0");
+        assert!(
+            !app.panes[1].emulator().cell(0, 0).unwrap().has_contents(),
+            "pane 1 untouched"
+        );
+        // An out-of-range pane_id must be a no-op (the .get_mut guard), not a panic.
+        app.apply_update(AgentUpdate::Output {
+            pane_id: 99,
+            bytes: b"nope".to_vec(),
+        });
+        assert_eq!(app.panes.len(), 2, "no pane added for an OOB pane_id");
+    }
+
+    #[test]
+    fn parse_stream_data_routes_ndjson_and_falls_back_to_pane_zero() {
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+        let mut m = HashMap::new();
+        m.insert("sess-1".to_string(), 2usize);
+        let map = Arc::new(Mutex::new(m));
+
+        let (pane, bytes) =
+            super::parse_stream_data(br#"{"sessionId":"sess-1","data":"hello"}"#, &map);
+        assert_eq!(pane, 2, "known session routes to its pane");
+        assert_eq!(bytes, b"hello", "data field extracted as bytes");
+
+        let (pane, bytes) = super::parse_stream_data(br#"{"sessionId":"sess-9","data":"x"}"#, &map);
+        assert_eq!(pane, 0, "unknown session falls back to pane 0");
+        assert_eq!(bytes, b"x");
+
+        // JSON without a sessionId → pane 0 with the raw payload.
+        let (pane, bytes) = super::parse_stream_data(br#"{"data":"y"}"#, &map);
+        assert_eq!(pane, 0);
+        assert_eq!(bytes, br#"{"data":"y"}"#, "raw payload returned verbatim");
+
+        // Non-JSON bytes → pane 0 with the payload verbatim.
+        let (pane, bytes) = super::parse_stream_data(b"raw-bytes", &map);
+        assert_eq!(pane, 0);
+        assert_eq!(bytes, b"raw-bytes");
+    }
+
+    #[test]
+    fn parse_stream_event_extracts_exit_code_and_ignores_non_exit() {
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+        let mut m = HashMap::new();
+        m.insert("sess-1".to_string(), 2usize);
+        let map = Arc::new(Mutex::new(m));
+
+        assert_eq!(
+            super::parse_stream_event(
+                br#"{"event":"exit","sessionId":"sess-1","payload":{"code":42}}"#,
+                &map,
+            ),
+            Some((2, 42)),
+            "exit event routed to the mapped pane with its code"
+        );
+        assert_eq!(
+            super::parse_stream_event(
+                br#"{"event":"exit","sessionId":"ghost","payload":{"code":7}}"#,
+                &map,
+            ),
+            Some((0, 7)),
+            "unknown session → pane 0"
+        );
+        assert_eq!(
+            super::parse_stream_event(br#"{"event":"data","sessionId":"sess-1"}"#, &map),
+            None,
+            "non-exit events are ignored"
+        );
+        assert_eq!(
+            super::parse_stream_event(b"not json", &map),
+            None,
+            "non-JSON → None"
+        );
+        assert_eq!(
+            super::parse_stream_event(br#"{"sessionId":"sess-1"}"#, &map),
+            None,
+            "missing event field → None"
+        );
+        assert_eq!(
+            super::parse_stream_event(br#"{"event":"exit","payload":{"code":0}}"#, &map),
+            None,
+            "missing sessionId → None"
+        );
+    }
+
+    #[test]
+    fn orchestration_drained_reflects_coordinator_state() {
+        let mut app = App::for_test(vec![pane(0, "a")]);
+        assert!(
+            app.orchestration_drained(),
+            "no coordinator (plain run) ⇒ vacuously drained"
+        );
+
+        // A coordinator with a still-Pending task ⇒ not drained.
+        let mut coord = Coordinator::new();
+        let tid = coord.add_task("work", Vec::new());
+        app.coordinator = Some(coord);
+        assert!(!app.orchestration_drained(), "a Pending task ⇒ not drained");
+
+        // Drive it terminal (Done) ⇒ drained.
+        if let Some(c) = app.coordinator.as_mut() {
+            c.report_done(tid, "finished");
+        }
+        assert!(app.orchestration_drained(), "Done is terminal");
+
+        // A Failed task is also terminal.
+        let mut coord = Coordinator::new();
+        let f = coord.add_task("boom", Vec::new());
+        coord.report_failed(f, "oops");
+        app.coordinator = Some(coord);
+        assert!(app.orchestration_drained(), "Failed is terminal too");
+    }
+
+    #[test]
+    fn ctrl_n_spawns_a_new_pane_and_keeps_parallel_vecs_aligned() {
+        let mut app = App::for_test(vec![pane(0, "a"), pane(1, "b")]);
+        let before = app.panes.len();
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        assert_eq!(app.panes.len(), before + 1, "Ctrl+N adds exactly one pane");
+        // Every parallel per-pane vector must stay aligned with `panes`.
+        let n = app.panes.len();
+        assert_eq!(app.sessions.len(), n, "sessions aligned");
+        assert_eq!(app.pane_task.len(), n, "pane_task aligned");
+        assert_eq!(app.pane_command.len(), n, "pane_command aligned");
+        assert_eq!(app.reconnect.len(), n, "reconnect aligned");
+        assert_eq!(app.reconnect_due.len(), n, "reconnect_due aligned");
+        assert_eq!(app.pinned.len(), n, "pinned aligned");
+        assert_eq!(
+            app.daemon_session_ids.len(),
+            n,
+            "daemon_session_ids aligned"
+        );
+        assert_eq!(app.focus, before, "Ctrl+N focuses the new pane");
+        // Rendering the expanded grid must not panic whether the spawn produced a
+        // live session or a Failed pane.
+        app.render().expect("render after Ctrl+N");
+    }
+
+    #[test]
+    fn jump_palette_backspace_and_navigation_clamp() {
+        let mut app = App::for_test(vec![
+            pane(0, "claude"),
+            pane(1, "codex"),
+            pane(2, "opencode"),
+        ]);
+        app.mode = InputMode::Jump;
+        for c in ['o', 'd', 'e', 'x'] {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(app.jump_query, "odex");
+        assert_eq!(app.jump_filtered(), vec![1], "only codex matches 'odex'");
+
+        // Backspace trims the last char and resets the selection to the top.
+        app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(app.jump_query, "ode");
+        assert_eq!(
+            app.jump_filtered(),
+            vec![1, 2],
+            "'ode' widens back to codex + opencode"
+        );
+        assert_eq!(app.jump_selected, 0);
+
+        // Down / Up move the selection; both ends clamp (no under/overflow).
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.jump_selected, 1);
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.jump_selected, 1, "Down at the bottom clamps");
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.jump_selected, 0);
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.jump_selected, 0, "Up at the top clamps");
+    }
+
+    #[test]
+    fn jump_palette_enter_with_no_matches_keeps_focus() {
+        let mut app = App::for_test(vec![pane(0, "claude"), pane(1, "codex")]);
+        app.mode = InputMode::Jump;
+        app.focus = 1;
+        for c in ['z', 'z'] {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert!(app.jump_filtered().is_empty(), "no agent matches 'zz'");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.mode, InputMode::Normal, "Enter closes the palette");
+        assert_eq!(app.focus, 1, "Enter with no matches keeps the prior focus");
+    }
+
+    #[test]
+    fn drain_bus_applies_queued_updates() {
+        let mut app = App::for_test(vec![pane(0, "a"), pane(1, "b")]);
+        // Push two updates into the bus channel.
+        let _ = app.bus_tx.send(AgentUpdate::Output {
+            pane_id: 0,
+            bytes: b"bus-fed".to_vec(),
+        });
+        let _ = app.bus_tx.send(AgentUpdate::State {
+            pane_id: 1,
+            state: AgentState::Done(Some(0)),
+        });
+        // drain_bus should apply both and return true (activity detected).
+        assert!(app.drain_bus(), "drain_bus returns true when updates exist");
+        // A second drain with nothing queued returns false.
+        assert!(!app.drain_bus(), "drain_bus returns false when empty");
+        // Pane 0 got the bytes, pane 1 got the state.
+        assert!(
+            app.panes[0].emulator().cell(0, 0).unwrap().has_contents(),
+            "bus-fed bytes reached pane 0"
+        );
+        assert!(
+            matches!(app.panes[1].state(), AgentState::Done(_)),
+            "bus-fed state reached pane 1"
+        );
+    }
+
+    #[test]
+    fn apply_update_state_sets_pane_state() {
+        let mut app = App::for_test(vec![pane(0, "a")]);
+        assert!(
+            matches!(app.panes[0].state(), AgentState::Running),
+            "starts Running"
+        );
+        app.apply_update(AgentUpdate::State {
+            pane_id: 0,
+            state: AgentState::Done(Some(0)),
+        });
+        assert!(
+            matches!(app.panes[0].state(), AgentState::Done(_)),
+            "State update transitioned to Done"
+        );
+        // Out-of-range pane_id is a no-op (no panic).
+        app.apply_update(AgentUpdate::State {
+            pane_id: 99,
+            state: AgentState::Failed("nope".into()),
+        });
+    }
+
+    #[test]
+    fn handle_event_mouse_routes_to_handle_mouse() {
+        let mut app = App::for_test(vec![pane(0, "a")]);
+        // Feeding some content so the pane has scrollback.
+        app.panes[0].feed(b"line1\nline2\nline3");
+        // A scroll-up mouse event should not panic.
+        app.handle_event(Event::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }));
+        // A scroll-down should also not panic.
+        app.handle_event(Event::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }));
+        // Other mouse kinds are no-ops (no panic).
+        app.handle_event(Event::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }));
+    }
+
+    #[test]
+    fn handle_event_resize_is_a_noop() {
+        let mut app = App::for_test(vec![pane(0, "a")]);
+        let mode_before = app.mode;
+        app.handle_event(Event::Resize(120, 40));
+        assert_eq!(app.mode, mode_before, "Resize does not change mode");
+    }
+
+    #[test]
+    fn handle_event_key_release_does_not_trigger_handle_key() {
+        let mut app = App::for_test(vec![pane(0, "a")]);
+        assert_eq!(app.mode, InputMode::Normal);
+        // A key RELEASE event should NOT enter pane mode (only Press does).
+        app.handle_event(Event::Key(KeyEvent {
+            code: KeyCode::Char('p'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Release,
+            state: crossterm::event::KeyEventState::NONE,
+        }));
+        assert_eq!(
+            app.mode,
+            InputMode::Normal,
+            "Release does not trigger mode switch"
+        );
+    }
+
+    #[test]
+    fn handle_event_other_event_is_noop() {
+        let mut app = App::for_test(vec![pane(0, "a")]);
+        // FocusGained is an "other" event variant → no-op.
+        app.handle_event(Event::FocusGained);
+        app.handle_event(Event::FocusLost);
+        app.handle_event(Event::Paste("hello".to_string()));
+        assert!(!app.quit, "unrecognized events don't quit");
+    }
+
+    #[test]
+    fn forward_key_to_agent_ctrl_chars_are_noop_with_no_session() {
+        let mut app = App::for_test(vec![pane(0, "a")]);
+        // In Normal mode, Ctrl+C should forward byte 0x03 (but with no
+        // session it's a silent no-op — no panic).
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        // Ctrl+A → byte 0x01, Ctrl+Z → 0x1a.
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+        assert!(!app.quit, "Ctrl+C in standalone (no Ctrl+Q) does not quit");
+    }
+
+    #[test]
+    fn forward_key_to_agent_alt_char_is_noop_with_no_session() {
+        let mut app = App::for_test(vec![pane(0, "a")]);
+        // Alt+x should be a no-op (falls through to the _ => {} arm because
+        // the Char(!ctrl && !alt) arm doesn't match, and there's no
+        // Char + alt arm).
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT));
+        // No panic = pass.
+    }
+
+    #[test]
+    fn forward_key_to_agent_special_keys_are_noop_with_no_session() {
+        let mut app = App::for_test(vec![pane(0, "a")]);
+        // Various special keys that have explicit arms — all no-ops with
+        // no session.
+        for code in [
+            KeyCode::Enter,
+            KeyCode::Backspace,
+            KeyCode::Tab,
+            KeyCode::Esc,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Home,
+            KeyCode::End,
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+            KeyCode::Delete,
+            KeyCode::BackTab,
+        ] {
+            app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+        }
+        // No panic = pass.
+    }
+
+    #[test]
+    fn send_to_focused_is_silent_noop_with_no_session() {
+        let mut app = App::for_test(vec![pane(0, "a")]);
+        // No live session → send_to_focused is a silent no-op.
+        app.send_to_focused(b"test");
+        // No panic, pane unchanged.
+        assert!(
+            !app.panes[0].emulator().cell(0, 0).unwrap().has_contents(),
+            "no bytes written with no session"
+        );
+    }
+
+    #[test]
+    fn render_with_sidebar_shows_connection_state() {
+        let mut app = App::for_test(vec![pane(0, "claude"), pane(1, "codex")]);
+        // Default connection state is Standalone — render with sidebar on.
+        app.render().expect("render");
+        let text = buffer_text(&app);
+        assert!(
+            text.contains("Standalone"),
+            "sidebar shows Standalone connection state"
+        );
+    }
+
+    #[test]
+    fn render_with_sidebar_hidden_still_works() {
+        let mut app = App::for_test(vec![pane(0, "solo")]);
+        app.sidebar_hidden = true;
+        app.render().expect("render with sidebar hidden");
+        let text = buffer_text(&app);
+        assert!(text.contains("solo"), "pane name still rendered");
+    }
+
+    #[test]
+    fn render_with_toasts_overlay_does_not_panic() {
+        let mut app = App::for_test(vec![pane(0, "solo")]);
+        app.toasts.push(crate::toast::Toast::error("daemon error"));
+        app.toasts.push(crate::toast::Toast::warning("slow"));
+        app.render().expect("render with toasts");
+        let text = buffer_text(&app);
+        assert!(text.contains("daemon error"), "toast message rendered");
     }
 }

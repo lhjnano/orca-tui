@@ -13,24 +13,28 @@ categories = ["command-line-utilities", "development-tools"]
 name = "orca-tui"
 path = "src/main.rs"
 
+[[bin]]
+name = "orca-inject"
+path = "src/bin/inject.rs"
+
 [[bench]]
 name = "orca"
 harness = false
 
 [dependencies]
-# TUI rendering primitives — pinned to match ratatui-ppalla 0.0.2's requirements
-# (ppalla 0.0.2 requires ratatui ^0.29 and crossterm ^0.28; pinning the exact
+# TUI rendering primitives — pinned to match ratatui-ppalla 0.0.3's requirements
+# (ppalla 0.0.3 requires ratatui ^0.29 and crossterm ^0.28; pinning the exact
 # majors avoids two-ratatui type conflicts if a future dep pulls a newer major).
 ratatui = "0.29"
 crossterm = "0.28"
-ratatui-ppalla = "0.0.2"
+ratatui-ppalla = "0.0.3"
 
 # PTY management for spawning agent processes (wezterm's PTY layer)
 portable-pty = "0.9"
 
 # Terminal emulation: ANSI escape parsing + virtual terminal state -> Cell grid.
 # NOTE: pinned to 0.15, NOT 0.16, due to a hard resolution conflict:
-#   ratatui 0.29.0 (forced by ratatui-ppalla 0.0.2 -> ratatui ^0.29) exact-pins
+#   ratatui 0.29.0 (forced by ratatui-ppalla 0.0.3 -> ratatui ^0.29) exact-pins
 #   unicode-width =0.2.0, while every vt100 0.16.x requires unicode-width ^0.2.1.
 #   Those cannot coexist. vt100 0.15.x uses unicode-width ^0.1.x (a separate
 #   major) which coexists cleanly. The vt100 API we depend on (Screen::process,
@@ -46,9 +50,13 @@ clap = { version = "4", features = ["derive"] }
 
 # Error handling + config (de)serialization
 anyhow = "1"
+thiserror = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+
+# Orca daemon client discovery (standard config/data dir locations)
+dirs = "5"
 
 # WebSocket server for the mobile companion (Feature 10). Uses tokio (already
 # present); no ratatui/crossterm overlap, so it coexists with the pinned stack.
@@ -71,3 +79,11 @@ futures-util = "0.3"
 # alongside the pinned ratatui 0.29 / crossterm 0.28 / tokio 1 stack — criterion
 # 0.5 shares no overlapping deps at incompatible versions.
 criterion = { version = "0.5", default-features = false, features = ["plotters", "cargo_bench_support"] }
+
+# Optimize the release binary for the 60 fps budget: full LTO + single
+# codegen unit squeezes every cycle out of the render/parse hot paths,
+# and `strip` shrinks the binary (~40% smaller).
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

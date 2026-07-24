@@ -43,6 +43,8 @@ pub struct Config {
     pub layout: LayoutConfig,
     /// Color theme (hex strings, parsed to ratatui [`Color::Rgb`]).
     pub theme: ThemeConfig,
+    /// Orca daemon client settings (reconnection, timeouts).
+    pub daemon: DaemonConfig,
 }
 
 impl Default for Config {
@@ -53,6 +55,7 @@ impl Default for Config {
             default_agent: "claude".to_string(),
             layout: LayoutConfig::default(),
             theme: ThemeConfig::default(),
+            daemon: DaemonConfig::default(),
         }
     }
 }
@@ -110,6 +113,39 @@ impl Default for LayoutConfig {
     }
 }
 
+/// Orca daemon client settings — reconnection backoff, timeouts, retry limits.
+///
+/// All durations are in **seconds** (TOML-friendly integers). The exponential
+/// backoff multiplies `reconnect_initial` by 2 each failure, capped at
+/// `reconnect_max`. After `reconnect_max_attempts` failures the client gives
+/// up and falls back to standalone mode.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DaemonConfig {
+    /// Initial reconnect delay in seconds (first retry waits this long).
+    pub reconnect_initial_secs: u64,
+    /// Maximum reconnect delay in seconds (backoff caps here).
+    pub reconnect_max_secs: u64,
+    /// Maximum reconnect attempts before giving up (0 = unlimited).
+    pub reconnect_max_attempts: u32,
+    /// RPC timeout in seconds (how long to wait for a single request/response).
+    pub rpc_timeout_secs: u64,
+    /// Hello (handshake) timeout in seconds.
+    pub hello_timeout_secs: u64,
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            reconnect_initial_secs: 3,
+            reconnect_max_secs: 30,
+            reconnect_max_attempts: 0, // unlimited
+            rpc_timeout_secs: 10,
+            hello_timeout_secs: 5,
+        }
+    }
+}
+
 /// Hex-string color theme, mirroring Orca's dark UI + status accents.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -120,6 +156,16 @@ pub struct ThemeConfig {
     pub success: String,
     pub warning: String,
     pub error: String,
+    /// Slightly raised panel/box background (sidebars, bordered regions).
+    pub background_panel: String,
+    /// Further-raised element background (hover, nested boxes).
+    pub background_element: String,
+    /// Default border color for box panels.
+    pub border: String,
+    /// Border color for the focused/active box.
+    pub border_active: String,
+    /// Dimmed foreground text (labels, secondary info).
+    pub text_muted: String,
 }
 
 impl Default for ThemeConfig {
@@ -131,6 +177,11 @@ impl Default for ThemeConfig {
             success: "#3fb950".to_string(),
             warning: "#d29922".to_string(),
             error: "#f85149".to_string(),
+            background_panel: "#161b22".to_string(), // canvas-subtle
+            background_element: "#21262d".to_string(), // elevated
+            border: "#30363d".to_string(),           // border-default
+            border_active: "#58a6ff".to_string(),    // accent blue (focused)
+            text_muted: "#8b949e".to_string(),       // fg-muted
         }
     }
 }
@@ -165,6 +216,26 @@ impl ThemeConfig {
     #[must_use]
     pub fn error(&self) -> Color {
         self.color(&self.error, Color::Rgb(0xf8, 0x51, 0x49))
+    }
+    #[must_use]
+    pub fn panel(&self) -> Color {
+        self.color(&self.background_panel, Color::Rgb(0x16, 0x1b, 0x22))
+    }
+    #[must_use]
+    pub fn element(&self) -> Color {
+        self.color(&self.background_element, Color::Rgb(0x21, 0x26, 0x2d))
+    }
+    #[must_use]
+    pub fn border(&self) -> Color {
+        self.color(&self.border, Color::Rgb(0x30, 0x36, 0x3d))
+    }
+    #[must_use]
+    pub fn border_active(&self) -> Color {
+        self.color(&self.border_active, Color::Rgb(0x58, 0xa6, 0xff))
+    }
+    #[must_use]
+    pub fn muted(&self) -> Color {
+        self.color(&self.text_muted, Color::Rgb(0x8b, 0x94, 0x9e))
     }
 }
 
@@ -214,6 +285,12 @@ mod tests {
         assert_eq!(c.theme.bg(), Color::Rgb(0x0d, 0x11, 0x17));
         assert_eq!(c.theme.accent(), Color::Rgb(0x58, 0xa6, 0xff));
         assert_eq!(c.theme.success(), Color::Rgb(0x3f, 0xb9, 0x50));
+        // New panel/border/muted tokens parse to their GitHub-dark defaults.
+        assert_eq!(c.theme.panel(), Color::Rgb(0x16, 0x1b, 0x22));
+        assert_eq!(c.theme.element(), Color::Rgb(0x21, 0x26, 0x2d));
+        assert_eq!(c.theme.border(), Color::Rgb(0x30, 0x36, 0x3d));
+        assert_eq!(c.theme.border_active(), Color::Rgb(0x58, 0xa6, 0xff));
+        assert_eq!(c.theme.muted(), Color::Rgb(0x8b, 0x94, 0x9e));
     }
 
     #[test]
@@ -229,8 +306,12 @@ mod tests {
     fn bad_theme_hex_falls_back_safely() {
         let mut t = ThemeConfig::default();
         t.success = "not-a-color".into();
+        t.border = "garbage".into();
         // malformed hex → fallback (the documented default), never a panic.
         assert_eq!(t.color(&t.success, Color::Green), Color::Green);
+        // The new accessors also fall back to their hardcoded RGB when the
+        // stored hex is unparseable.
+        assert_eq!(t.border(), Color::Rgb(0x30, 0x36, 0x3d));
     }
 
     #[test]
@@ -260,6 +341,50 @@ accent = "#ff00ff"
     }
 
     #[test]
+    fn new_theme_tokens_round_trip_through_toml() {
+        // All 11 theme fields specified; each new accessor must return the
+        // over-ridden RGB, not the default.
+        let toml = r##"
+[theme]
+background = "#0a0a0a"
+foreground = "#f0f0f0"
+accent = "#112233"
+success = "#223344"
+warning = "#334455"
+error = "#445566"
+background_panel = "#556677"
+background_element = "#667788"
+border = "#778899"
+border_active = "#8899aa"
+text_muted = "#99aabb"
+"##;
+        let tmp = std::env::temp_dir().join(format!("orca-cfg-new-{}.toml", std::process::id()));
+        std::fs::write(&tmp, toml).unwrap();
+        let cfg = Config::load(&tmp).expect("parse");
+        assert_eq!(cfg.theme.panel(), Color::Rgb(0x55, 0x66, 0x77));
+        assert_eq!(cfg.theme.element(), Color::Rgb(0x66, 0x77, 0x88));
+        assert_eq!(cfg.theme.border(), Color::Rgb(0x77, 0x88, 0x99));
+        assert_eq!(cfg.theme.border_active(), Color::Rgb(0x88, 0x99, 0xaa));
+        assert_eq!(cfg.theme.muted(), Color::Rgb(0x99, 0xaa, 0xbb));
+        let _ = std::fs::remove_file(&tmp);
+
+        // Partial TOML: unspecified new fields fall back to the serde defaults.
+        let partial = r##"
+[theme]
+border = "#abcdef"
+"##;
+        let tmp2 =
+            std::env::temp_dir().join(format!("orca-cfg-partial-{}.toml", std::process::id()));
+        std::fs::write(&tmp2, partial).unwrap();
+        let cfg2 = Config::load(&tmp2).expect("parse");
+        assert_eq!(cfg2.theme.border(), Color::Rgb(0xab, 0xcd, 0xef));
+        assert_eq!(cfg2.theme.panel(), Color::Rgb(0x16, 0x1b, 0x22));
+        assert_eq!(cfg2.theme.border_active(), Color::Rgb(0x58, 0xa6, 0xff));
+        assert_eq!(cfg2.theme.muted(), Color::Rgb(0x8b, 0x94, 0x9e));
+        let _ = std::fs::remove_file(&tmp2);
+    }
+
+    #[test]
     fn missing_file_uses_default() {
         // load_or_default never panics even with no config file / env.
         let cfg = Config::load_or_default();
@@ -271,5 +396,125 @@ accent = "#ff00ff"
         // An empty TOML document must still deserialize to defaults.
         let cfg: Config = toml::from_str("").unwrap();
         assert_eq!(cfg.layout.sidebar_width, 26);
+    }
+
+    #[test]
+    fn all_theme_accessors_match_defaults() {
+        // Every accessor (including fg/warning/error, which no earlier test
+        // exercised directly) must return the documented GitHub-dark RGB for a
+        // freshly-defaulted ThemeConfig.
+        let t = ThemeConfig::default();
+        assert_eq!(t.bg(), Color::Rgb(0x0d, 0x11, 0x17));
+        assert_eq!(t.fg(), Color::Rgb(0xe6, 0xed, 0xf3));
+        assert_eq!(t.accent(), Color::Rgb(0x58, 0xa6, 0xff));
+        assert_eq!(t.success(), Color::Rgb(0x3f, 0xb9, 0x50));
+        assert_eq!(t.warning(), Color::Rgb(0xd2, 0x99, 0x22));
+        assert_eq!(t.error(), Color::Rgb(0xf8, 0x51, 0x49));
+        assert_eq!(t.panel(), Color::Rgb(0x16, 0x1b, 0x22));
+        assert_eq!(t.element(), Color::Rgb(0x21, 0x26, 0x2d));
+        assert_eq!(t.border(), Color::Rgb(0x30, 0x36, 0x3d));
+        assert_eq!(t.border_active(), Color::Rgb(0x58, 0xa6, 0xff));
+        assert_eq!(t.muted(), Color::Rgb(0x8b, 0x94, 0x9e));
+    }
+
+    #[test]
+    fn daemon_config_defaults() {
+        // DaemonConfig had no dedicated coverage; pin the documented defaults.
+        let d = DaemonConfig::default();
+        assert_eq!(d.reconnect_initial_secs, 3);
+        assert_eq!(d.reconnect_max_secs, 30);
+        assert_eq!(d.reconnect_max_attempts, 0, "0 = unlimited");
+        assert_eq!(d.rpc_timeout_secs, 10);
+        assert_eq!(d.hello_timeout_secs, 5);
+        // And it is wired into Config::default.
+        assert_eq!(Config::default().daemon.reconnect_initial_secs, 3);
+    }
+
+    #[test]
+    fn load_or_default_and_config_path_branches() {
+        // This test manipulates process-global env vars. To stay safe under
+        // the parallel test runner (and panic-safe on a failed assertion) it
+        // (a) performs all env reads FIRST, (b) restores env BEFORE asserting,
+        // and (b) keeps any config it writes defaulting to default_agent =
+        // "claude" so a concurrent `missing_file_uses_default` can't observe a
+        // surprising value (load_or_default always falls back to a valid
+        // default anyway).
+
+        // --- config_path XDG branch (line 247) + the three load_or_default
+        //     outcomes (lines 75-76 parse-Ok, 77-79 bad-toml, 82 read-Err) ---
+        let xdg_prev = std::env::var_os("XDG_CONFIG_HOME");
+        let temp = std::env::temp_dir().join(format!("orca-cfg-xdg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(temp.join("orca-tui")).unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &temp);
+
+        // line 247: XDG set → path resolves under it.
+        let path_xdg = config_path();
+
+        // line 82: file absent → read_to_string Err → default.
+        let cfg_missing = Config::load_or_default();
+
+        // lines 75-76: valid file present → parsed config returned.
+        std::fs::write(
+            temp.join("orca-tui").join("config.toml"),
+            "default_agent = \"claude\"\n[theme]\naccent = \"#aabbcc\"\n",
+        )
+        .unwrap();
+        let cfg_valid = Config::load_or_default();
+
+        // lines 77-79: unparseable file → logged + replaced with default.
+        std::fs::write(
+            temp.join("orca-tui").join("config.toml"),
+            "this is = = not valid toml [[[",
+        )
+        .unwrap();
+        let cfg_bad = Config::load_or_default();
+
+        // Restore XDG (and clean up) BEFORE asserting so a panic can't leak.
+        match &xdg_prev {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&temp);
+
+        assert_eq!(
+            path_xdg,
+            Some(temp.join("orca-tui").join("config.toml")),
+            "line 247: XDG_CONFIG_HOME drives the path"
+        );
+        assert_eq!(
+            cfg_missing.default_agent, "claude",
+            "line 82: missing file → default"
+        );
+        assert_eq!(cfg_valid.default_agent, "claude", "lines 75-76: parsed");
+        assert_eq!(
+            cfg_valid.theme.accent(),
+            Color::Rgb(0xaa, 0xbb, 0xcc),
+            "lines 75-76: the custom accent from disk was parsed"
+        );
+        assert_eq!(
+            cfg_bad.default_agent, "claude",
+            "lines 77-79: bad toml → default"
+        );
+
+        // --- config_path None branch (line 72): neither HOME nor XDG set ---
+        let home_prev = std::env::var_os("HOME");
+        let xdg_prev2 = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::remove_var("XDG_CONFIG_HOME");
+        std::env::remove_var("HOME");
+        let cfg_no_env = Config::load_or_default();
+        // Restore FIRST, then assert.
+        match &home_prev {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        match &xdg_prev2 {
+            Some(x) => std::env::set_var("XDG_CONFIG_HOME", x),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        assert_eq!(
+            cfg_no_env.default_agent, "claude",
+            "line 72: no HOME/XDG → config_path None → default"
+        );
     }
 }

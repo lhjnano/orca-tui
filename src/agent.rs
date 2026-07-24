@@ -160,6 +160,101 @@ impl AgentState {
     }
 }
 
+/// Unified display status — the Orca-GUI vocabulary derived from lifecycle
+/// state plus the OSC 9999 activity payload. This is the single source of
+/// truth for "what state is this agent in?" used by the sidebar, snapshots,
+/// auto-scroll targeting and the jump palette.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentStatus {
+    Working,
+    Blocked,
+    Waiting,
+    Done,
+    Failed,
+    Idle,
+}
+
+impl AgentStatus {
+    /// Derive the display status from the lifecycle state and the (optional)
+    /// OSC 9999 activity state string. Priority:
+    ///   1. a `Failed` lifecycle always wins (a crash overrides everything);
+    ///   2. a recognized OSC state ("working"|"blocked"|"waiting"|"done") wins
+    ///      next (it is more granular than the lifecycle);
+    ///   3. otherwise fall back to the lifecycle (Running→Working, Done→Done,
+    ///      Idle→Idle).
+    #[must_use]
+    pub fn derive(state: &AgentState, osc_state: Option<&str>) -> Self {
+        if matches!(state, AgentState::Failed(_)) {
+            return Self::Failed;
+        }
+        if let Some(s) = osc_state {
+            return match s {
+                "working" => Self::Working,
+                "blocked" => Self::Blocked,
+                "waiting" => Self::Waiting,
+                "done" => Self::Done,
+                _ => Self::from_lifecycle(state),
+            };
+        }
+        Self::from_lifecycle(state)
+    }
+
+    fn from_lifecycle(state: &AgentState) -> Self {
+        match state {
+            AgentState::Running => Self::Working,
+            AgentState::Done(_) => Self::Done,
+            AgentState::Idle => Self::Idle,
+            AgentState::Failed(_) => Self::Failed,
+        }
+    }
+
+    /// Status dot glyph (matches the current sidebar glyphs exactly).
+    #[must_use]
+    pub fn icon(&self) -> &'static str {
+        match self {
+            Self::Working | Self::Blocked | Self::Waiting => "\u{25CF}", // ●
+            Self::Done => "\u{2713}",                                    // ✓
+            Self::Failed => "\u{2717}",                                  // ✗
+            Self::Idle => "\u{25CB}",                                    // ○
+        }
+    }
+
+    /// Short lowercase label (Orca vocabulary).
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Working => "working",
+            Self::Blocked => "blocked",
+            Self::Waiting => "waiting",
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::Idle => "idle",
+        }
+    }
+
+    /// Whether this status counts as "in progress" (the sidebar section header
+    /// and auto-scroll targeting). Working/blocked/waiting are all active.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        matches!(self, Self::Working | Self::Blocked | Self::Waiting)
+    }
+
+    /// Relative activity ranking for "most active agent" selection (higher =
+    /// more active / needs-attention). Used by future auto-scroll + jump
+    /// palette default selection.
+    #[must_use]
+    pub fn priority(&self) -> u8 {
+        match self {
+            Self::Working => 5,
+            Self::Blocked => 4,
+            Self::Waiting => 3,
+            Self::Idle => 2,
+            Self::Done => 1,
+            Self::Failed => 0,
+        }
+    }
+}
+
 /// Launch specification for one agent.
 ///
 /// `command[0]` is the binary (classified into [`AgentKind`]); the rest are its
@@ -357,5 +452,133 @@ mod tests {
         assert_eq!(AgentState::Running.label(), "Running");
         assert_eq!(AgentState::Done(Some(2)).label(), "Done");
         assert_eq!(AgentState::Failed("e".to_owned()).label(), "Failed");
+    }
+
+    // ---- AgentStatus -------------------------------------------------------
+
+    #[test]
+    fn status_failed_overrides_everything() {
+        // A crash wins regardless of the OSC payload.
+        let failed = AgentState::Failed("boom".to_owned());
+        assert_eq!(
+            AgentStatus::derive(&failed, Some("working")),
+            AgentStatus::Failed
+        );
+        assert_eq!(
+            AgentStatus::derive(&failed, Some("done")),
+            AgentStatus::Failed
+        );
+        assert_eq!(AgentStatus::derive(&failed, None), AgentStatus::Failed);
+    }
+
+    #[test]
+    fn status_each_osc_state_maps_correctly() {
+        let running = AgentState::Running;
+        assert_eq!(
+            AgentStatus::derive(&running, Some("working")),
+            AgentStatus::Working
+        );
+        assert_eq!(
+            AgentStatus::derive(&running, Some("blocked")),
+            AgentStatus::Blocked
+        );
+        assert_eq!(
+            AgentStatus::derive(&running, Some("waiting")),
+            AgentStatus::Waiting
+        );
+        assert_eq!(
+            AgentStatus::derive(&running, Some("done")),
+            AgentStatus::Done
+        );
+    }
+
+    #[test]
+    fn status_lifecycle_fallback_running_to_working() {
+        assert_eq!(
+            AgentStatus::derive(&AgentState::Running, None),
+            AgentStatus::Working
+        );
+    }
+
+    #[test]
+    fn status_lifecycle_fallback_done_to_done() {
+        assert_eq!(
+            AgentStatus::derive(&AgentState::Done(Some(0)), None),
+            AgentStatus::Done
+        );
+        assert_eq!(
+            AgentStatus::derive(&AgentState::Done(None), None),
+            AgentStatus::Done
+        );
+    }
+
+    #[test]
+    fn status_lifecycle_fallback_idle_to_idle() {
+        assert_eq!(
+            AgentStatus::derive(&AgentState::Idle, None),
+            AgentStatus::Idle
+        );
+    }
+
+    #[test]
+    fn status_unknown_osc_string_falls_back_to_lifecycle() {
+        // An unrecognized OSC state string must not change the lifecycle
+        // derivation. Running stays Working, not something arbitrary.
+        assert_eq!(
+            AgentStatus::derive(&AgentState::Running, Some("thinking")),
+            AgentStatus::Working
+        );
+        // Empty string also falls back (treated as unknown).
+        assert_eq!(
+            AgentStatus::derive(&AgentState::Running, Some("")),
+            AgentStatus::Working
+        );
+        // Done lifecycle + unknown OSC stays Done.
+        assert_eq!(
+            AgentStatus::derive(&AgentState::Done(None), Some("zzz")),
+            AgentStatus::Done
+        );
+    }
+
+    #[test]
+    fn status_is_active_expectations() {
+        assert!(AgentStatus::Working.is_active());
+        assert!(AgentStatus::Blocked.is_active());
+        assert!(AgentStatus::Waiting.is_active());
+        assert!(!AgentStatus::Done.is_active());
+        assert!(!AgentStatus::Failed.is_active());
+        assert!(!AgentStatus::Idle.is_active());
+    }
+
+    #[test]
+    fn status_priority_ordering() {
+        // Higher = more active / needs-attention.
+        assert!(AgentStatus::Working.priority() > AgentStatus::Blocked.priority());
+        assert!(AgentStatus::Blocked.priority() > AgentStatus::Waiting.priority());
+        assert!(AgentStatus::Waiting.priority() > AgentStatus::Idle.priority());
+        assert!(AgentStatus::Idle.priority() > AgentStatus::Done.priority());
+        assert!(AgentStatus::Done.priority() > AgentStatus::Failed.priority());
+        // A blocked-but-alive agent outranks a finished one.
+        assert!(AgentStatus::Blocked.priority() > AgentStatus::Done.priority());
+    }
+
+    #[test]
+    fn status_icons_match_sidebar_glyphs() {
+        assert_eq!(AgentStatus::Working.icon(), "\u{25CF}");
+        assert_eq!(AgentStatus::Blocked.icon(), "\u{25CF}");
+        assert_eq!(AgentStatus::Waiting.icon(), "\u{25CF}");
+        assert_eq!(AgentStatus::Done.icon(), "\u{2713}");
+        assert_eq!(AgentStatus::Failed.icon(), "\u{2717}");
+        assert_eq!(AgentStatus::Idle.icon(), "\u{25CB}");
+    }
+
+    #[test]
+    fn status_labels_are_orca_vocabulary() {
+        assert_eq!(AgentStatus::Working.label(), "working");
+        assert_eq!(AgentStatus::Blocked.label(), "blocked");
+        assert_eq!(AgentStatus::Waiting.label(), "waiting");
+        assert_eq!(AgentStatus::Done.label(), "done");
+        assert_eq!(AgentStatus::Failed.label(), "failed");
+        assert_eq!(AgentStatus::Idle.label(), "idle");
     }
 }

@@ -443,4 +443,127 @@ mod tests {
         assert_eq!(src.repo.owner, "lhjnano");
         assert_eq!(src.repo.name, "orca-tui");
     }
+
+    // ---- parsing: edge cases (empty / null / malformed) --------------------
+
+    #[test]
+    fn parse_pull_request_json_empty_array_yields_empty_vec() {
+        let prs: Vec<PullRequest> = serde_json::from_str("[]").expect("empty array");
+        assert!(prs.is_empty());
+    }
+
+    #[test]
+    fn parse_pull_request_json_malformed_is_error() {
+        let res: Result<Vec<PullRequest>, _> = serde_json::from_str("[not json");
+        assert!(res.is_err(), "malformed JSON must not parse");
+    }
+
+    #[test]
+    fn parse_issue_json_empty_array_yields_empty_vec() {
+        let issues: Vec<Issue> = serde_json::from_str("[]").expect("empty array");
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn parse_issue_json_null_body_is_none() {
+        // gh may emit an explicit JSON null for a missing body.
+        let json = r#"[{"number": 3, "title": "t", "body": null}]"#;
+        let issues: Vec<Issue> = serde_json::from_str(json).expect("parse");
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].number, 3);
+        assert!(issues[0].body.is_none(), "explicit null body -> None");
+    }
+
+    #[test]
+    fn parse_issue_json_malformed_is_error() {
+        let res: Result<Vec<Issue>, _> = serde_json::from_str("{broken");
+        assert!(res.is_err(), "malformed JSON must not parse");
+    }
+
+    #[test]
+    fn issue_to_prompt_preserves_multiline_body_structure() {
+        // Internal newlines in the body are kept verbatim (only leading/trailing
+        // whitespace is trimmed).
+        let issue = Issue {
+            number: 9,
+            title: "Multi".to_owned(),
+            body: Some("line one\nline two".to_owned()),
+        };
+        let prompt = issue_to_prompt(&issue);
+        assert!(
+            prompt.contains("line one\nline two"),
+            "internal newlines should be kept: {prompt:?}"
+        );
+    }
+
+    // ---- LinearSource (offline-deterministic via the env var) --------------
+    //
+    // Combined into one test so the two phases run sequentially: env::set_var /
+    // env::remove_var are process-wide, and parallel sibling tests racing on
+    // LINEAR_API_KEY would be flaky.
+
+    #[test]
+    fn linear_source_offline_behaviour_without_and_with_token() {
+        // Phase 1: no token -> Linear is inert and contributes no issues.
+        std::env::remove_var("LINEAR_API_KEY");
+        let src = LinearSource::new();
+        let issues = src.list_open().expect("no token -> empty list");
+        assert!(issues.is_empty(), "Linear without a token yields no issues");
+
+        // Phase 2: token present -> the HTTP client is deliberately absent, so
+        // the source reports a clear "not yet wired" error instead of silently
+        // doing nothing.
+        std::env::set_var("LINEAR_API_KEY", "test-token-only");
+        let err = src.list_open().unwrap_err();
+        std::env::remove_var("LINEAR_API_KEY");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not yet wired"),
+            "expected the not-yet-wired error, got: {msg}"
+        );
+    }
+
+    // ---- gh-backed functions (offline: always Err for a bad invocation) ----
+    //
+    // These exercise the run_gh spawn + error paths and the list_* /
+    // GitHubSource wrappers. A bogus gh invocation / nonexistent repo makes `gh`
+    // fail everywhere — whether gh is absent (spawn error) or present but
+    // unauthenticated/not-found (non-zero exit) — so asserting Err is
+    // environment-independent and needs no network success.
+
+    #[test]
+    fn run_gh_errors_for_bogus_invocation() {
+        // gh is either missing (spawn error) or rejects the unknown flag
+        // (non-zero exit). Either way run_gh surfaces an Err.
+        let res = run_gh(&["--definitely-not-a-gh-flag"]);
+        assert!(res.is_err(), "run_gh should surface an error: {res:?}");
+    }
+
+    #[test]
+    fn list_pull_requests_errors_for_nonexistent_repo() {
+        let repo =
+            RepoRef::parse("orca-tui-nonexistent-owner/does-not-exist").expect("valid reporef");
+        let res = list_pull_requests(&repo);
+        assert!(
+            res.is_err(),
+            "list_pull_requests should fail offline: {res:?}"
+        );
+    }
+
+    #[test]
+    fn list_issues_errors_for_nonexistent_repo() {
+        let repo =
+            RepoRef::parse("orca-tui-nonexistent-owner/does-not-exist").expect("valid reporef");
+        let res = list_issues(&repo);
+        assert!(res.is_err(), "list_issues should fail offline: {res:?}");
+    }
+
+    #[test]
+    fn github_source_list_open_errors_for_nonexistent_repo() {
+        let repo =
+            RepoRef::parse("orca-tui-nonexistent-owner/does-not-exist").expect("valid reporef");
+        let src = GitHubSource::new(repo);
+        let res = src.list_open();
+        assert!(res.is_err(), "list_open should fail offline: {res:?}");
+    }
 }

@@ -82,6 +82,15 @@ impl PtySession {
         if let Some(dir) = cwd {
             cmd.cwd(dir);
         }
+        // Present the PTY as a capable xterm so agent TUIs (opencode, claude,
+        // codex, …) render with the 256-color + truecolor escape sequences our
+        // vt100 emulator understands. A multiplexer must tell children which
+        // terminal it emulates (like tmux setting TERM=tmux-256color) — without
+        // this, sophisticated renderers (e.g. opencode's OpenTUI) can't probe
+        // capabilities and may not render at all.
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
+        cmd.env("TERM_PROGRAM", "orca-tui");
 
         let child = pair
             .slave
@@ -366,5 +375,132 @@ mod tests {
     #[allow(dead_code)]
     fn _color_compile_check() -> EmuColor {
         EmuColor::Default
+    }
+
+    /// `--cwd` (the `cwd: Some(dir)` branch in `spawn`, line 83) must actually
+    /// change the child's working directory.
+    #[test]
+    fn spawn_with_cwd_runs_child_in_that_directory() {
+        let dir = std::env::temp_dir();
+        let (mut session, rx) = PtySession::spawn(
+            vec![sh().to_string(), "-c".to_string(), "pwd".to_string()],
+            Some(&dir),
+            80,
+            3,
+        )
+        .expect("spawn");
+        let mut emu = TerminalEmulator::new(80, 3, 0);
+        drain(&mut emu, rx);
+        // `pwd` prints the directory we passed via --cwd.
+        let row0: String = (0..80)
+            .filter_map(|x| emu.cell(x, 0).map(|c| c.chars.clone()))
+            .collect();
+        assert!(
+            row0.contains(&dir.display().to_string()),
+            "pwd should print cwd {dir:?}; got {row0:?}"
+        );
+        let _ = poll_exit_code(&mut session);
+    }
+
+    /// A nonexistent program must produce a spawn error, not a panic.
+    #[test]
+    fn spawning_nonexistent_binary_returns_error() {
+        let res = PtySession::spawn(
+            vec!["definitely-not-a-real-binary-zzz".to_string()],
+            None,
+            10,
+            3,
+        );
+        // PtySession is not Debug, so use a match instead of expect_err (which
+        // would require the Ok variant to implement Debug).
+        let err = match res {
+            Ok(_) => panic!("nonexistent binary must error, not panic"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.to_lowercase().contains("pty") || msg.to_lowercase().contains("spawn"),
+            "spawn error should mention pty/spawn: {msg}"
+        );
+    }
+
+    /// `kill` (line 183-188) must deliver a signal so a long-running child is
+    /// reaped within a bounded wait.
+    #[test]
+    fn kill_terminates_a_running_child() {
+        let (mut session, _rx) = PtySession::spawn(
+            vec![sh().to_string(), "-c".to_string(), "sleep 30".to_string()],
+            None,
+            10,
+            3,
+        )
+        .expect("spawn");
+        session.kill().expect("kill succeeds on a live child");
+        let mut code = None;
+        for _ in 0..80 {
+            match session.try_wait() {
+                Ok(Some(c)) => {
+                    code = Some(c);
+                    break;
+                }
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(25)),
+                Err(_) => break,
+            }
+        }
+        assert!(code.is_some(), "killed child must be reaped");
+    }
+
+    /// `try_wait` (lines 169-175) returns `None` while running and `Some(code)`
+    /// after exit.
+    #[test]
+    fn try_wait_none_while_running_then_some_after_exit() {
+        let (mut session, _rx) = PtySession::spawn(
+            vec![sh().to_string(), "-c".to_string(), "sleep 1".to_string()],
+            None,
+            10,
+            3,
+        )
+        .expect("spawn");
+        // Immediately after spawn the child is still sleeping.
+        assert_eq!(session.try_wait().unwrap(), None, "running child → None");
+        // After it exits on its own the code is reported.
+        let code = poll_exit_code(&mut session);
+        assert_eq!(code, Some(0), "sleep 1 exits 0");
+    }
+
+    /// `process_id` (lines 192-193) + `is_child_gone` (lines 198-199) + the
+    /// `child.is_none()` short-circuit in `try_wait` (line 171).
+    #[test]
+    fn process_id_and_is_child_gone_reflect_state() {
+        let (mut session, _rx) = PtySession::spawn(
+            vec![sh().to_string(), "-c".to_string(), "sleep 2".to_string()],
+            None,
+            10,
+            3,
+        )
+        .expect("spawn");
+        // Live child: pid known, handle present → not gone.
+        let pid = session.process_id().expect("live child has a pid");
+        assert!(pid > 0);
+        assert!(!session.is_child_gone(), "handle present → not gone");
+
+        // Kill + reap so the process is cleaned up (no leak / no reader hang).
+        session.kill().expect("kill");
+        let _ = poll_exit_code(&mut session);
+
+        // The handle is still Some after reaping (try_wait does not null it),
+        // so from the accessor's view the child is not yet "gone".
+        assert!(!session.is_child_gone(), "handle still Some after reap");
+
+        // Simulate the post-kill state `Drop` reaches once it takes the handle:
+        // accessors now report gone / no pid, and try_wait short-circuits.
+        session.child = None;
+        assert!(session.is_child_gone(), "handle taken → gone");
+        assert_eq!(session.process_id(), None, "no handle → no pid");
+        assert_eq!(
+            session.try_wait().unwrap(),
+            None,
+            "no handle → try_wait Ok(None) [line 171]"
+        );
     }
 }

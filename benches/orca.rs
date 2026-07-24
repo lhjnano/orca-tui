@@ -141,9 +141,14 @@ fn n_pane_render(c: &mut Criterion) {
                     terminal
                         .draw(|f| {
                             let rects = split_panes(f.area(), n);
-                            for (i, p) in panes.iter().enumerate() {
+                            for (i, p) in panes.iter_mut().enumerate() {
                                 let area = rects.get(i).copied().unwrap_or_default();
-                                p.render(f, area, i == 0);
+                                p.render(
+                                    f,
+                                    area,
+                                    i == 0,
+                                    &orca_tui::config::ThemeConfig::default(),
+                                );
                             }
                         })
                         .expect("draw");

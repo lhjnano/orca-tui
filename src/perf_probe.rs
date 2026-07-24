@@ -45,6 +45,27 @@ fn synth_ansi(mb: usize) -> Vec<u8> {
     out
 }
 
+/// `synth_ansi` is a pure helper (no timing); test it directly so the size /
+/// SGR / CRLF contract the perf probes rely on can't silently regress. This is
+/// a normal (non-ignored) test.
+#[test]
+fn synth_ansi_builds_realistic_payload() {
+    let payload = synth_ansi(1);
+    // ~1 MiB or larger: the append loop runs until `out.len() >= target`.
+    assert!(
+        payload.len() >= 1024 * 1024,
+        "synth_ansi(1) too small: {} bytes",
+        payload.len()
+    );
+    let s = std::str::from_utf8(&payload).expect("synth_ansi output is valid UTF-8");
+    // A palette-color SGR escape is emitted on every line.
+    assert!(s.contains("\x1b[3"), "missing SGR palette escape sequence");
+    // The recognizable text payload line.
+    assert!(s.contains("The quick brown fox"), "missing the text line");
+    // CRLF line endings are emitted every 8th line.
+    assert!(s.contains("\r\n"), "missing CRLF line endings");
+}
+
 #[test]
 #[ignore = "performance probe — run with --ignored --nocapture"]
 fn perf_terminal_emu_ingest_throughput() {
@@ -92,7 +113,7 @@ fn perf_n_pane_render() {
     for &n in &[1usize, 5, 10, 20] {
         let mut backend = TestBackend::new(200, 50);
         let mut terminal = Terminal::new(backend).unwrap();
-        let panes: Vec<Pane> = (0..n)
+        let mut panes: Vec<Pane> = (0..n)
             .map(|i| {
                 let mut p = Pane::new(i, format!("agent{i}"), 80, 24);
                 p.feed(b"\x1b[32mhello orca\n\x1b[0mworking...");
@@ -105,9 +126,9 @@ fn perf_n_pane_render() {
             terminal
                 .draw(|f| {
                     let rects = split_panes(f.area(), n);
-                    for (i, p) in panes.iter().enumerate() {
+                    for (i, p) in panes.iter_mut().enumerate() {
                         let area = rects.get(i).copied().unwrap_or_default();
-                        p.render(f, area, i == 0);
+                        p.render(f, area, i == 0, &crate::config::ThemeConfig::default());
                     }
                 })
                 .unwrap();

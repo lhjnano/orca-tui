@@ -514,4 +514,129 @@ mod tests {
         assert_eq!(acts.len(), 1);
         assert_eq!(acts[0].state, "done");
     }
+
+    #[test]
+    fn consecutive_esc_emits_first_then_starts_new() {
+        // A lone ESC immediately followed by another ESC: the first is emitted
+        // to the output (as a stray ESC), and the second begins a fresh escape
+        // — here an OSC 9999 that is then stripped. Covers the EscSeen ESC arm.
+        let mut s = OscScanner::new();
+        let (clean, acts) = s.process(b"a\x1b\x1b]9999;{\"state\":\"done\"}\x07b");
+        assert_eq!(clean, b"a\x1bb");
+        assert_eq!(acts.len(), 1);
+        assert_eq!(acts[0].state, "done");
+    }
+
+    #[test]
+    fn osc_9999_empty_bel_terminator_no_activity() {
+        // A 9999 OSC closed by BEL before any payload separator: nothing to
+        // parse, no activity, and the introducer is dropped (no bytes emitted).
+        // Covers the OscParam BEL arm for param == 9999.
+        let mut s = OscScanner::new();
+        let (clean, acts) = s.process(b"\x1b]9999\x07");
+        assert!(clean.is_empty());
+        assert!(acts.is_empty());
+    }
+
+    #[test]
+    fn osc_non_9999_empty_bel_passes_through() {
+        // A non-9999 OSC closed by BEL with no payload passes through verbatim.
+        // Covers the OscParam BEL arm for param != 9999.
+        let mut s = OscScanner::new();
+        let (clean, acts) = s.process(b"\x1b]0\x07");
+        assert_eq!(clean, b"\x1b]0\x07");
+        assert!(acts.is_empty());
+    }
+
+    #[test]
+    fn osc_9999_empty_st_terminator_no_activity() {
+        // A 9999 OSC closed by ST (`ESC \`) before any payload separator: no
+        // activity, introducer stripped. Covers OscParam -> EscInOsc(Param) and
+        // the EscInOsc(Param) ST arm for param == 9999.
+        let mut s = OscScanner::new();
+        let (clean, acts) = s.process(b"\x1b]9999\x1b\\");
+        assert!(clean.is_empty());
+        assert!(acts.is_empty());
+    }
+
+    #[test]
+    fn osc_non_9999_param_st_passes_through() {
+        // A non-9999 OSC param (no `;` yet) closed by ST passes through
+        // verbatim. Covers the EscInOsc(Param) ST arm for param != 9999.
+        let mut s = OscScanner::new();
+        let (clean, acts) = s.process(b"\x1b]0\x1b\\");
+        assert_eq!(clean, b"\x1b]0\x1b\\");
+        assert!(acts.is_empty());
+    }
+
+    #[test]
+    fn stray_esc_in_9999_payload_drops_partial() {
+        // An ESC inside a 9999 payload that is NOT followed by '\' is not an ST;
+        // the partial payload is dropped and the re-fed byte plus following
+        // bytes pass through as normal terminal content. Covers the
+        // EscInOsc non-ST arm (Payload context) + the re-feed `continue`.
+        let mut s = OscScanner::new();
+        let (clean, acts) = s.process(b"\x1b]9999;{\"state\":\"working\"}\x1bX\x07z");
+        assert_eq!(clean, b"X\x07z");
+        assert!(acts.is_empty());
+    }
+
+    #[test]
+    fn stray_esc_in_osc_param_preserves_bytes() {
+        // An ESC inside a non-9999 OSC param (no `;` yet) not followed by '\' is
+        // literal content; everything seen so far plus the stray byte flush
+        // verbatim, and the trailing BEL is preserved. Covers the EscInOsc
+        // non-ST arm (Param context).
+        let mut s = OscScanner::new();
+        let (clean, acts) = s.process(b"\x1b]0\x1bX\x07");
+        assert_eq!(clean, b"\x1b]0\x1bX\x07");
+        assert!(acts.is_empty());
+    }
+
+    #[test]
+    fn stray_esc_in_passthrough_osc_preserves_bytes() {
+        // A non-9999 OSC past its separator, with a stray ESC (not ST) inside
+        // the payload, still flushes all bytes verbatim at the final BEL.
+        // Covers the EscInOsc non-ST arm (Passthrough context).
+        let mut s = OscScanner::new();
+        let (clean, acts) = s.process(b"\x1b]0;title\x1bX\x07");
+        assert_eq!(clean, b"\x1b]0;title\x1bX\x07");
+        assert!(acts.is_empty());
+    }
+
+    #[test]
+    fn payload_with_unknown_fields_still_parses() {
+        // Unknown JSON fields are ignored by serde; the known `state` still
+        // parses into an activity.
+        let mut s = OscScanner::new();
+        let (clean, acts) = s.process(b"\x1b]9999;{\"state\":\"waiting\",\"bogus\":42}\x07");
+        assert!(clean.is_empty());
+        assert_eq!(acts.len(), 1);
+        assert_eq!(acts[0].state, "waiting");
+    }
+
+    #[test]
+    fn near_miss_osc_param_passes_through() {
+        // "99999" (one digit too many) is not "9999" → treated as a normal OSC
+        // and passed through verbatim; no activity is extracted.
+        let mut s = OscScanner::new();
+        let (clean, acts) = s.process(b"\x1b]99999;x\x07");
+        assert_eq!(clean, b"\x1b]99999;x\x07");
+        assert!(acts.is_empty());
+    }
+
+    #[test]
+    fn st_terminator_split_across_chunks() {
+        // The ST terminator itself straddles a chunk boundary: the ESC lands at
+        // the end of one process() call and the '\' at the start of the next.
+        let mut s = OscScanner::new();
+        let (c1, a1) = s.process(b"\x1b]9999;{\"state\":\"done\"}\x1b");
+        let (c2, a2) = s.process(b"\\tail");
+        assert!(a1.is_empty(), "no activity until ST completes");
+        let clean: Vec<u8> = [c1, c2].concat();
+        let acts: Vec<AgentActivity> = [a1, a2].concat();
+        assert_eq!(clean, b"tail");
+        assert_eq!(acts.len(), 1);
+        assert_eq!(acts[0].state, "done");
+    }
 }

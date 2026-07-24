@@ -186,6 +186,18 @@ impl TerminalEmulator {
         }
         out
     }
+
+    /// The cursor position as `(col, row)`, or `None` if the agent has hidden
+    /// the cursor (ESC[?25l). Used by the pane to render a visible cursor.
+    #[must_use]
+    pub fn cursor_position(&self) -> Option<(u16, u16)> {
+        let screen = self.parser.screen();
+        if screen.hide_cursor() {
+            return None;
+        }
+        let (row, col) = screen.cursor_position();
+        Some((col, row))
+    }
 }
 
 /// Convert a borrowed vt100 cell into an owned [`EmuCell`] value-copy.
@@ -370,5 +382,69 @@ mod tests {
         emu.resize(MIN_COLS, MIN_ROWS);
         emu.feed(b"xy");
         assert_eq!(emu.size(), (MIN_COLS, MIN_ROWS));
+    }
+
+    /// DIAGNOSTIC (ignored): feed opencode's real captured PTY output into the
+    /// emulator and report whether vt100 turns it into cells. Run with:
+    ///   cargo test diag_opencode -- --nocapture --ignored
+    /// High non-empty cell count + logo glyphs ⇒ the emulator CAN render
+    /// opencode (so the blank pane is a plumbing/timing bug). Near-zero ⇒ vt100
+    /// 0.15 can't emulate opencode's drawing sequences (an emulation gap).
+    #[test]
+    #[ignore]
+    fn diag_opencode_renders_in_emulator() {
+        let bytes = std::fs::read("/tmp/oc_solo.txt").unwrap_or_default();
+        let mut emu = TerminalEmulator::new(120, 30, 1000);
+        emu.feed(&bytes);
+        let grid = emu.grid();
+        let nonempty: usize = grid
+            .iter()
+            .map(|r| r.iter().filter(|c| c.has_contents()).count())
+            .sum();
+        let has_logo = grid.iter().any(|r| {
+            r.iter()
+                .any(|c| c.chars.contains('█') || c.chars.contains('▀') || c.chars.contains('▄'))
+        });
+        let has_ask = grid.iter().any(|r| {
+            r.iter()
+                .any(|c| c.chars.contains("Ask") || c.chars.contains("anythin"))
+        });
+        eprintln!(
+            "DIAG opencode: {} bytes fed, {} non-empty cells, logo_glyphs={}, ask_prompt={}",
+            bytes.len(),
+            nonempty,
+            has_logo,
+            has_ask
+        );
+    }
+
+    /// DIAGNOSTIC (ignored): does `grid()` return the ALTERNATE screen after
+    /// `ESC[?1049h`? If row0 shows the alt marker, alt screen is visible; if it
+    /// shows the main-screen text or is blank, vt100 0.15's `screen()` returns
+    /// the main screen while the agent drew on alt — the blank-pane cause.
+    ///   cargo test diag_alt_screen -- --nocapture --ignored
+    #[test]
+    #[ignore]
+    fn diag_alt_screen_visible() {
+        let mut emu = TerminalEmulator::new(40, 5, 0);
+        emu.feed(b"MAIN-TEXT");
+        emu.feed(b"\x1b[?1049h"); // enter alternate screen
+        emu.feed(b"\x1b[2J\x1b[H"); // clear + cursor home
+        emu.feed(b"ALT-MARKER-XYZ");
+        let grid = emu.grid();
+        let row0: String = grid[0]
+            .iter()
+            .map(|c| c.chars.chars().next().unwrap_or(' '))
+            .collect();
+        let joined: String = grid
+            .iter()
+            .flat_map(|r| r.iter().map(|c| c.chars.chars().next().unwrap_or(' ')))
+            .collect();
+        eprintln!(
+            "DIAG alt: row0={:?} has_marker={} has_main={}",
+            row0,
+            joined.contains("ALT-MARKER-XYZ"),
+            joined.contains("MAIN-TEXT")
+        );
     }
 }

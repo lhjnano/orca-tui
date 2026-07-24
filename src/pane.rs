@@ -15,11 +15,15 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, BorderType, Borders};
+use ratatui::widgets::{BorderType, Borders};
 use ratatui::Frame;
 
 use crate::agent::AgentState;
+use crate::config::ThemeConfig;
 use crate::terminal_emu::{EmuCell, EmuColor, EmuStyle, TerminalEmulator, MIN_COLS, MIN_ROWS};
+use ratatui_ppalla::prepared::{
+    BlockSpec, LayoutCtx, Preparable, PreparedBlock, PreparedBlockState,
+};
 
 /// Scrollback lines retained above the viewport inside the emulator.
 const SCROLLBACK: usize = 1000;
@@ -27,9 +31,6 @@ const SCROLLBACK: usize = 1000;
 /// Default foreground for an emulator `Default` color (light gray on a dark
 /// terminal).
 const DEFAULT_FG: Color = Color::Gray;
-/// Default background for an emulator `Default` color (`Reset` lets the real
-/// terminal background show through).
-const DEFAULT_BG: Color = Color::Reset;
 
 /// One agent pane: emulator + metadata + scroll cursor.
 ///
@@ -44,8 +45,25 @@ pub struct Pane {
     scroll: usize,
     /// OSC 9999 scanner — intercepts agent status from the PTY byte stream.
     osc_scanner: crate::osc::OscScanner,
+    /// Synchronized-output (mode 2026) batcher — buffers `ESC[?2026h…2026l`
+    /// redraw batches and flushes them atomically so the emulator only ever
+    /// holds complete frames (prevents the mid-batch "cleared" frame from
+    /// rendering as a blank pane, e.g. for opencode/OpenTUI).
+    sync_scanner: crate::sync::SyncScanner,
     /// Last captured agent activity (from OSC 9999), if any.
     activity: Option<crate::osc::AgentActivity>,
+    /// Terminal-capability query responder — detects OSC color / DECRQM / DA /
+    /// DCS queries in the PTY stream and produces the replies a probing agent
+    /// (opencode/​OpenTUI) waits for so it renders instead of going blank.
+    query_responder: crate::query::QueryResponder,
+    /// ppalla cached border spec (PreparedBlock). The border/title glyph
+    /// placement is cached keyed on (w, h, border_type, borders, title); the
+    /// border/title *style* (focus color) is applied at paint time and is
+    /// excluded from the cache key, so toggling focus never invalidates it.
+    block: PreparedBlockState,
+    /// Last block title rendered, to detect header changes (the only thing that
+    /// can invalidate the block layout cache besides a resize).
+    last_title: String,
 }
 
 impl fmt::Debug for Pane {
@@ -76,7 +94,11 @@ impl Pane {
             branch: None,
             scroll: 0,
             osc_scanner: crate::osc::OscScanner::new(),
+            sync_scanner: crate::sync::SyncScanner::new(),
             activity: None,
+            query_responder: crate::query::QueryResponder::new(),
+            block: PreparedBlockState::default(),
+            last_title: String::new(),
         }
     }
 
@@ -101,7 +123,11 @@ impl Pane {
         if let Some(act) = activities.into_iter().last() {
             self.activity = Some(act);
         }
-        self.emu.feed(&clean);
+        // Buffer synchronized-output (mode 2026) batches and flush them
+        // atomically so the emulator only ever holds complete frames — a render
+        // that fires mid-batch sees the previous frame, not the half-cleared one.
+        let batched = self.sync_scanner.process(&clean);
+        self.emu.feed(&batched);
     }
 
     /// Resize the emulator viewport (PTY-side resize is Task 4's job).
@@ -149,6 +175,17 @@ impl Pane {
         self.activity.as_ref()
     }
 
+    /// Scan a chunk of PTY bytes for terminal-capability queries (OSC 10/11/12
+    /// color, DECRQM private modes, DA1/DA2, DCS terminfo) and return the
+    /// synthesized responses to write back to the agent. Probing agents
+    /// (opencode/OpenTUI) block until these are answered; without replies they
+    /// render blank. Does not consume the bytes — feed them to [`Pane::feed`]
+    /// as usual.
+    #[must_use]
+    pub fn scan_queries(&mut self, bytes: &[u8], theme: &crate::config::ThemeConfig) -> Vec<u8> {
+        self.query_responder.process(bytes, theme)
+    }
+
     /// Scroll back `n` lines (towards older output). Saturates; never panics.
     pub fn scroll_up(&mut self, n: usize) {
         self.scroll = self.scroll.saturating_add(n);
@@ -181,23 +218,71 @@ impl Pane {
     /// Draws a bordered block whose title shows `name · branch · icon state`,
     /// then paints the emulator's cell grid into the inner area. `focused`
     /// brightens the border.
-    pub fn render(&self, frame: &mut Frame<'_>, area: Rect, focused: bool) {
+    pub fn render(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        focused: bool,
+        theme: &ThemeConfig,
+    ) {
         let border_color = if focused {
-            Color::LightBlue
+            theme.border_active()
         } else {
-            Color::DarkGray
+            theme.border()
         };
-        let title = Line::from(self.header()).style(Style::default().fg(self.state.color()));
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Double)
-            .border_style(Style::default().fg(border_color))
-            .title(title);
+        let title = self.header();
 
-        // `block.inner` does not mutate; compute before consuming the block.
-        let inner = block.inner(area);
-        frame.render_widget(&block, area);
-        self.paint_grid(frame.buffer_mut(), inner);
+        // Update the cached block spec only when the title changes (a resize is
+        // detected at layout time via the LayoutCtx dimensions). The border/title
+        // *style* (focus color) is applied at paint time and is deliberately
+        // excluded from the cache key, so toggling focus never invalidates the
+        // cached glyph placement.
+        if title != self.last_title {
+            PreparedBlock::append(
+                &mut self.block,
+                BlockSpec {
+                    borders: Borders::ALL,
+                    border_type: BorderType::Rounded,
+                    title: Some(Line::from(title.clone())),
+                    border_style: Style::default(),
+                    title_style: Style::default(),
+                },
+            );
+            self.last_title = title;
+        }
+
+        let layout = PreparedBlock::layout(&self.block, LayoutCtx::new(area.width, area.height));
+        // Inner content rect in absolute buffer coordinates (PreparedBlock's
+        // `inner` is relative to the block origin; ratatui Block gave the same
+        // inset for an ALL-bordered Double block).
+        let inner = Rect::new(
+            area.x.saturating_add(layout.inner.x),
+            area.y.saturating_add(layout.inner.y),
+            layout.inner.width,
+            layout.inner.height,
+        );
+        self.paint_grid(frame.buffer_mut(), inner, theme.bg());
+        // Paint the cached border + title glyphs (styles applied here).
+        layout.paint(
+            frame.buffer_mut(),
+            area,
+            Style::default().fg(border_color).bg(theme.bg()),
+            Style::default().fg(self.state.color()).bg(theme.bg()),
+        );
+        // Render the cursor: reverse-video the cell at the emulator's cursor
+        // position so the user sees where their typing will land. Skipped when
+        // the agent has hidden the cursor (ESC[?25l) or it's off-screen.
+        if let Some((cur_col, cur_row)) = self.emu.cursor_position() {
+            let x = inner.x.saturating_add(cur_col);
+            let y = inner.y.saturating_add(cur_row);
+            if x < inner.right() && y < inner.bottom() {
+                let cell = &mut frame.buffer_mut()[(x, y)];
+                let fg = cell.fg;
+                let bg = cell.bg;
+                cell.set_fg(bg);
+                cell.set_bg(fg);
+            }
+        }
     }
 
     /// Build the `" name · branch · icon state "` header string.
@@ -212,18 +297,52 @@ impl Pane {
         )
     }
 
-    /// Paint the emulator grid into `area` of the buffer.
+    /// Paint the emulator grid into `area` of the buffer — **every cell, every
+    /// frame**.
     ///
-    /// Clamps to the smaller of the grid and the area so differing sizes never
-    /// index out of bounds. Wide (CJK/emoji) cells consume two columns: the
-    /// following column is left as the block's default blank.
-    fn paint_grid(&self, buf: &mut Buffer, area: Rect) {
+    /// ratatui double-buffers its `Terminal` (the back buffer is swapped with
+    /// the front on each `flush`), so a per-frame partial/dirty repaint is
+    /// unsound here: unrepainted cells would carry 2-frame-old content from the
+    /// other buffer and the diff would smear the screen. We therefore repaint
+    /// the full visible window each frame (ratatui's own diff still skips
+    /// unchanged cells on the stdout side, so this is not wasteful on output).
+    /// `bg_fill` (the theme background) backs `Default`-bg cells so the pane
+    /// interior is consistently themed. Wide (CJK/emoji) cells consume two
+    /// columns; the following column is left as the block's default blank.
+    fn paint_grid(&mut self, buf: &mut Buffer, area: Rect, bg_fill: Color) {
         if area.width == 0 || area.height == 0 {
             return;
         }
         let grid = self.emu.grid();
         let max_rows = usize::from(area.height);
         let max_cols = usize::from(area.width);
+        // Optional live debug: does the painted window overlap the content?
+        if std::env::var("ORCA_DEBUG_LOG").is_ok() {
+            let gh = grid.len();
+            let gw = grid.first().map_or(0, Vec::len);
+            let painted_with_content: usize = grid
+                .iter()
+                .take(max_rows)
+                .map(|r| {
+                    r.iter()
+                        .take(max_cols)
+                        .filter(|c| c.has_contents() && c.chars != " ")
+                        .count()
+                })
+                .sum();
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/orca-live.log")
+            {
+                let _ = writeln!(
+                    f,
+                    "paint_grid: area x={} y={} {}x{}, grid={}x{}, window={}x{}, content_in_window={}",
+                    area.x, area.y, area.width, area.height, gw, gh, max_cols, max_rows, painted_with_content
+                );
+            }
+        }
 
         for (row_idx, row) in grid.iter().enumerate() {
             if row_idx >= max_rows {
@@ -234,9 +353,7 @@ impl Pane {
             while col_idx < row.len() && col_idx < max_cols {
                 let cell = &row[col_idx];
                 let x = area.x.saturating_add(col_idx as u16);
-                paint_cell(buf, x, y, cell);
-                // Wide glyph occupies two columns; the next column is a
-                // continuation placeholder we leave blank.
+                paint_cell(buf, x, y, cell, bg_fill);
                 col_idx += if cell.wide { 2 } else { 1 };
             }
         }
@@ -244,7 +361,7 @@ impl Pane {
 }
 
 /// Paint one emulator cell into the buffer at `(x, y)`.
-fn paint_cell(buf: &mut Buffer, x: u16, y: u16, cell: &EmuCell) {
+fn paint_cell(buf: &mut Buffer, x: u16, y: u16, cell: &EmuCell, bg_fill: Color) {
     let buf_cell = &mut buf[(x, y)];
 
     // Symbol: the cell's glyph(s), or a space for blank cells so the block's
@@ -263,7 +380,7 @@ fn paint_cell(buf: &mut Buffer, x: u16, y: u16, cell: &EmuCell) {
         (cell.fg, cell.bg)
     };
     buf_cell.set_fg(map_fg(fg));
-    buf_cell.set_bg(map_bg(bg));
+    buf_cell.set_bg(map_bg(bg, bg_fill));
 
     let modifier = map_style(&cell.style);
     if modifier != Modifier::empty() {
@@ -275,8 +392,8 @@ fn paint_cell(buf: &mut Buffer, x: u16, y: u16, cell: &EmuCell) {
 ///
 /// `Default` becomes the theme default foreground ([`DEFAULT_FG`]);
 /// `Indexed` and `Rgb` map 1:1. Splitting fg/bg (rather than one shared
-/// `map_color`) ensures the default *background* paints as [`DEFAULT_BG`]
-/// (terminal-transparent) instead of being forced to the foreground default.
+/// `map_color`) lets the default *background* paint as the theme background
+/// (passed in via `bg_fill`) instead of being forced to the foreground default.
 #[must_use]
 fn map_fg(color: EmuColor) -> Color {
     match color {
@@ -288,12 +405,13 @@ fn map_fg(color: EmuColor) -> Color {
 
 /// Map a background [`EmuColor`] onto a ratatui [`Color`].
 ///
-/// `Default` becomes the theme default background ([`DEFAULT_BG`]); `Indexed`
-/// and `Rgb` map 1:1. See [`map_fg`] for why fg and bg use separate defaults.
+/// `Default` becomes the supplied `bg_fill` (the theme background threaded
+/// down from `render`, so the pane interior is consistently themed instead of
+/// terminal-transparent); `Indexed` and `Rgb` map 1:1.
 #[must_use]
-fn map_bg(color: EmuColor) -> Color {
+fn map_bg(color: EmuColor, bg_fill: Color) -> Color {
     match color {
-        EmuColor::Default => DEFAULT_BG,
+        EmuColor::Default => bg_fill,
         EmuColor::Indexed(i) => Color::Indexed(i),
         EmuColor::Rgb(r, g, b) => Color::Rgb(r, g, b),
     }
@@ -320,6 +438,7 @@ fn map_style(style: &EmuStyle) -> Modifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ThemeConfig;
     use crate::terminal_emu::{EmuColor, EmuStyle};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -327,20 +446,22 @@ mod tests {
     #[test]
     fn map_fg_map_bg_default_indexed_rgb() {
         // The whole point of the fg/bg split: a `Default` fg paints as the
-        // foreground default, a `Default` bg paints as the (different!)
-        // background default. Locking in the inequality guards against a
-        // regression to a single shared `map_color`.
+        // foreground default, a `Default` bg paints as the supplied theme fill.
+        let fill = Color::Rgb(0x0d, 0x11, 0x17);
         assert_eq!(map_fg(EmuColor::Default), DEFAULT_FG);
-        assert_eq!(map_bg(EmuColor::Default), DEFAULT_BG);
-        assert_ne!(DEFAULT_FG, DEFAULT_BG, "fg/bg defaults must differ");
+        assert_eq!(map_bg(EmuColor::Default, fill), fill);
+        assert_ne!(DEFAULT_FG, fill, "fg default and bg fill must differ");
 
         // Indexed / Rgb map 1:1 for both slots.
         assert_eq!(map_fg(EmuColor::Indexed(1)), Color::Indexed(1));
-        assert_eq!(map_bg(EmuColor::Indexed(1)), Color::Indexed(1));
+        assert_eq!(map_bg(EmuColor::Indexed(1), fill), Color::Indexed(1));
         assert_eq!(map_fg(EmuColor::Indexed(255)), Color::Indexed(255));
-        assert_eq!(map_bg(EmuColor::Indexed(255)), Color::Indexed(255));
+        assert_eq!(map_bg(EmuColor::Indexed(255), fill), Color::Indexed(255));
         assert_eq!(map_fg(EmuColor::Rgb(10, 20, 30)), Color::Rgb(10, 20, 30));
-        assert_eq!(map_bg(EmuColor::Rgb(10, 20, 30)), Color::Rgb(10, 20, 30));
+        assert_eq!(
+            map_bg(EmuColor::Rgb(10, 20, 30), fill),
+            Color::Rgb(10, 20, 30)
+        );
     }
 
     #[test]
@@ -405,7 +526,7 @@ mod tests {
         pane.feed(b"AB");
 
         terminal
-            .draw(|f| pane.render(f, f.area(), true))
+            .draw(|f| pane.render(f, f.area(), true, &ThemeConfig::default()))
             .expect("draw");
 
         let buf = terminal.backend().buffer();
@@ -431,9 +552,9 @@ mod tests {
         let backend = TestBackend::new(6, 4);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        let pane = Pane::new(2, "big", 80, 24);
+        let mut pane = Pane::new(2, "big", 80, 24);
         terminal
-            .draw(|f| pane.render(f, f.area(), false))
+            .draw(|f| pane.render(f, f.area(), false, &ThemeConfig::default()))
             .expect("draw");
     }
 
@@ -444,14 +565,37 @@ mod tests {
         // this guards against regressions in the block construction.
         let backend = TestBackend::new(10, 3);
         let mut terminal = Terminal::new(backend).unwrap();
-        let pane = Pane::new(0, "x", 10, 3);
+        let mut pane = Pane::new(0, "x", 10, 3);
         terminal
-            .draw(|f| pane.render(f, f.area(), true))
+            .draw(|f| pane.render(f, f.area(), true, &ThemeConfig::default()))
             .expect("focused draw");
         let backend = TestBackend::new(10, 3);
         terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| pane.render(f, f.area(), false))
+            .draw(|f| pane.render(f, f.area(), false, &ThemeConfig::default()))
             .expect("unfocused draw");
+    }
+
+    #[test]
+    fn debug_impl_shows_key_fields() {
+        let mut pane = Pane::new(7, "gemini", 80, 24);
+        pane.set_state(AgentState::Done(Some(0)));
+        pane.set_branch(Some("feat/x".to_string()));
+        let s = format!("{pane:?}");
+        assert!(s.contains("id: 7"), "Debug shows id");
+        assert!(s.contains("gemini"), "Debug shows name");
+        assert!(s.contains("Done"), "Debug shows state");
+        assert!(s.contains("feat/x"), "Debug shows branch");
+    }
+
+    #[test]
+    fn feed_with_osc9999_activity_sets_activity_field() {
+        let mut pane = Pane::new(0, "agent", 40, 6);
+        // OSC 9999 with an activity JSON payload.
+        let payload = b"\x1b]9999;{\"state\":\"thinking\",\"detail\":\"planning\"}\x07";
+        pane.feed(payload);
+        let act = pane.activity();
+        assert!(act.is_some(), "OSC 9999 activity was captured");
+        assert_eq!(act.unwrap().state, "thinking");
     }
 }

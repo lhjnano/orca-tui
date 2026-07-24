@@ -64,6 +64,12 @@ enum Command {
         #[arg(long)]
         worktree: bool,
 
+        /// Try to connect to a running Orca GUI daemon for session
+        /// persistence + multi-client (GUI + TUI). Falls back to standalone
+        /// (direct PTY) if no daemon is found or the connection fails.
+        #[arg(long)]
+        daemon: bool,
+
         /// Run each agent on a REMOTE host over SSH (Feature 8). The host spec
         /// is `user@host`, `host`, or `user@host:port`; each agent command is
         /// wrapped as `ssh <opts> <host> <command...>`.
@@ -145,6 +151,7 @@ fn try_main(cli: Cli) -> Result<()> {
         Command::Run {
             cwd,
             worktree,
+            daemon,
             remote,
             reconnect,
             mobile,
@@ -189,6 +196,13 @@ fn try_main(cli: Cli) -> Result<()> {
             }
 
             let mut app = App::spawn_agents(specs, cwd.as_deref(), worktree)?;
+
+            // Try to connect to an Orca GUI daemon (--daemon). Falls back to
+            // standalone silently if no daemon is found; shows a toast if a
+            // daemon was found but the connection failed.
+            if daemon {
+                app.try_connect_daemon();
+            }
 
             // Feature 8: mark every pane reconnect-eligible so a dropped remote
             // session is re-spawned after a backoff (harmless without --remote).
@@ -456,5 +470,220 @@ mod tests {
         for s in &specs {
             assert_eq!(s.kind, crate::agent::AgentKind::Generic);
         }
+    }
+
+    // ---- clap argument-parsing coverage (struct fields + dispatch inputs) ----
+
+    #[test]
+    fn parse_run_with_all_flags() {
+        let cli = Cli::try_parse_from([
+            "orca-tui",
+            "run",
+            "--cwd",
+            "/tmp",
+            "--worktree",
+            "--daemon",
+            "--remote",
+            "user@host",
+            "--reconnect",
+            "--mobile",
+            "8080",
+            "--",
+            "claude",
+        ])
+        .expect("valid run invocation parses");
+        match cli.command {
+            Command::Run {
+                cwd,
+                worktree,
+                daemon,
+                remote,
+                reconnect,
+                mobile,
+                command,
+            } => {
+                assert_eq!(cwd.as_deref(), Some(std::path::Path::new("/tmp")));
+                assert!(worktree, "--worktree parsed");
+                assert!(daemon, "--daemon parsed");
+                assert!(reconnect, "--reconnect parsed");
+                assert_eq!(remote.as_deref(), Some("user@host"));
+                assert_eq!(mobile, Some(8080));
+                assert_eq!(command, vec!["claude".to_string()]);
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_run_defaults_when_flags_absent() {
+        // Only the required trailing command is given; every flag defaults.
+        let cli = Cli::try_parse_from(["orca-tui", "run", "claude"]).expect("minimal run parses");
+        match cli.command {
+            Command::Run {
+                cwd,
+                worktree,
+                daemon,
+                remote,
+                reconnect,
+                mobile,
+                command,
+            } => {
+                assert!(cwd.is_none());
+                assert!(!worktree);
+                assert!(!daemon);
+                assert!(remote.is_none());
+                assert!(!reconnect);
+                assert!(mobile.is_none());
+                assert_eq!(command, vec!["claude".to_string()]);
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_orchestrate_spec_and_parallel() {
+        let cli = Cli::try_parse_from([
+            "orca-tui",
+            "orchestrate",
+            "--spec",
+            "task one\ntask two",
+            "--parallel",
+        ])
+        .expect("orchestrate --spec --parallel parses");
+        match cli.command {
+            Command::Orchestrate {
+                spec,
+                parallel,
+                issues,
+            } => {
+                assert_eq!(spec.as_deref(), Some("task one\ntask two"));
+                assert!(parallel);
+                assert!(issues.is_none());
+            }
+            other => panic!("expected Orchestrate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_orchestrate_issues_overrides_spec() {
+        let cli = Cli::try_parse_from(["orca-tui", "orchestrate", "--issues", "owner/name"])
+            .expect("orchestrate --issues parses");
+        match cli.command {
+            Command::Orchestrate {
+                spec,
+                parallel,
+                issues,
+            } => {
+                assert_eq!(issues.as_deref(), Some("owner/name"));
+                assert!(spec.is_none());
+                assert!(!parallel, "--parallel defaults to false");
+            }
+            other => panic!("expected Orchestrate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_prs_and_issues_repo() {
+        let prs =
+            Cli::try_parse_from(["orca-tui", "prs", "octocat/hello-world"]).expect("prs parses");
+        match prs.command {
+            Command::Prs { repo } => assert_eq!(repo, "octocat/hello-world"),
+            other => panic!("expected Prs, got {other:?}"),
+        }
+
+        let issues = Cli::try_parse_from(["orca-tui", "issues", "octocat/hello-world"])
+            .expect("issues parses");
+        match issues.command {
+            Command::Issues { repo } => assert_eq!(repo, "octocat/hello-world"),
+            other => panic!("expected Issues, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_mobile_default_and_custom_port() {
+        let default = Cli::try_parse_from(["orca-tui", "mobile"]).expect("mobile parses");
+        match default.command {
+            Command::Mobile { port } => assert_eq!(port, 0, "port defaults to 0"),
+            other => panic!("expected Mobile, got {other:?}"),
+        }
+
+        let custom =
+            Cli::try_parse_from(["orca-tui", "mobile", "--port", "9090"]).expect("mobile --port");
+        match custom.command {
+            Command::Mobile { port } => assert_eq!(port, 9090),
+            other => panic!("expected Mobile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn version_flag_is_recognized() {
+        // clap handles `--version` by yielding a DisplayVersion error (in the
+        // real binary it would print + exit). Assert the flag is wired up.
+        let err = Cli::try_parse_from(["orca-tui", "--version"])
+            .expect_err("--version is a display action, not a normal parse");
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+    }
+
+    #[test]
+    fn run_captures_separator_tokens_verbatim() {
+        // Everything after `--` is captured verbatim, including `::`.
+        let cli = Cli::try_parse_from([
+            "orca-tui", "run", "--", "claude", "::", "codex", "--model", "x", "::", "opencode",
+        ])
+        .expect("trailing capture parses");
+        let command = match cli.command {
+            Command::Run { command, .. } => command,
+            other => panic!("expected Run, got {other:?}"),
+        };
+        assert_eq!(
+            command,
+            vec!["claude", "::", "codex", "--model", "x", "::", "opencode",]
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>(),
+            "clap must hand `::` and agent flags through untouched"
+        );
+        // And the dispatch-time step regroups them into per-agent segments.
+        let agents = split_agents(command);
+        assert_eq!(
+            agents,
+            vec![
+                vec!["claude"],
+                vec!["codex", "--model", "x"],
+                vec!["opencode"],
+            ]
+        );
+    }
+
+    #[test]
+    fn run_without_command_parses_empty_then_guarded_at_dispatch() {
+        // clap's `trailing_var_arg` does NOT enforce a non-empty minimum, so
+        // `run` with no trailing command parses successfully to an EMPTY
+        // command vec. The "no agent command given" guard lives in `try_main`
+        // (split_agents + bail), NOT in the parser — this test pins that
+        // contract so the runtime guard is never accidentally removed.
+        let cli = Cli::try_parse_from(["orca-tui", "run"])
+            .expect("clap accepts an empty trailing-var-arg list");
+        let command = match cli.command {
+            Command::Run { command, .. } => command,
+            other => panic!("expected Run, got {other:?}"),
+        };
+        assert!(command.is_empty(), "no trailing args → empty command vec");
+        // The dispatch-time guard fires on exactly this empty input.
+        assert!(split_agents(command).is_empty());
+    }
+
+    #[test]
+    fn prs_without_repo_is_a_required_arg_error() {
+        let err =
+            Cli::try_parse_from(["orca-tui", "prs"]).expect_err("prs requires the repo positional");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn unknown_subcommand_is_an_error() {
+        let err = Cli::try_parse_from(["orca-tui", "frobnicate"])
+            .expect_err("unknown subcommand rejected");
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand);
     }
 }
