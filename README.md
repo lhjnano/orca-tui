@@ -52,8 +52,14 @@ measurements, and the opencode layout study.
 ## Install & run
 
 ```bash
+# from crates.io
+cargo install orcatui
+
 # from source
-cargo run --release -- run -- claude
+cargo install --path .
+
+# run a single agent
+orcatui run -- claude
 
 # run two agents side by side
 orcatui run --cwd ./my-repo -- claude :: codex
@@ -65,6 +71,70 @@ orcatui run --worktree -- claude :: codex :: opencode
 The agent invocation is captured verbatim after `--`, so flags are forwarded to
 the agent: `orcatui run -- claude --dangerously-skip-permissions`.
 Separate multiple agents with ` :: `.
+
+## Orca daemon mode (`--daemon`)
+
+orcatui can run **standalone** (manages its own PTYs — the default) or as a
+**client** of a running [Orca GUI](https://github.com/stablyai/orca) daemon.
+In daemon mode, the GUI acts as the *server* (owns the PTYs + session state)
+and orcatui is one of potentially many *clients* (GUI + terminal + mobile).
+
+### Why use it?
+
+| Capability | Standalone | `--daemon` |
+|------------|:----------:|:----------:|
+| Session persistence (survive orcatui restart) | ✗ | ✅ |
+| Multi-client (GUI + TUI see the same agents) | ✗ | ✅ |
+| Auto-reconnect on disconnect | ✗ | ✅ |
+| Structured status (exit codes, session history) | limited | ✅ |
+
+### Setup
+
+1. **Install & launch Orca GUI** — it automatically starts the background
+   daemon (Unix socket + token file):
+
+   ```bash
+   git clone https://github.com/stablyai/orca && cd orca
+   npm install && npm start
+   ```
+
+   The daemon writes two artifacts that orcatui auto-discovers:
+   - Socket: `~/.config/orca/daemon.sock` (or `~/.local/share/orca/daemon.sock`)
+   - Token: `~/.config/orca/daemon.token`
+
+2. **Connect orcatui as a client:**
+
+   ```bash
+   orcatui run --daemon -- claude :: codex
+   ```
+
+   That's it — orcatui discovers the socket, authenticates with the token, and
+   switches to daemon mode. The sidebar shows `● Daemon` instead of
+   `● Standalone`.
+
+### Fallback
+
+If no daemon socket is found, `--daemon` **silently falls back to standalone**
+(you get a normal local-PTY run). If a socket exists but the handshake fails
+(bad token, version mismatch), orcatui shows a toast warning and still runs
+standalone — you never get a hard failure from a missing daemon.
+
+### Auto-reconnect
+
+If the daemon crashes or restarts mid-session, orcatui retries on an
+exponential backoff (configurable via `[daemon]` in `config.toml`):
+
+```toml
+[daemon]
+reconnect_initial_secs = 3       # first retry delay
+reconnect_max_secs     = 30      # backoff cap
+reconnect_max_attempts = 0       # 0 = unlimited
+rpc_timeout_secs       = 10
+hello_timeout_secs     = 5
+```
+
+On reconnect, orcatui re-attaches to the existing daemon sessions — your agents
+are still alive (the daemon owns the PTYs, not the client).
 
 ## CLI reference
 
