@@ -34,7 +34,7 @@ pub fn run() -> Result<()> {
 )]
 pub(crate) struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -182,7 +182,31 @@ enum Command {
 }
 
 fn try_main(cli: Cli) -> Result<()> {
-    match cli.command {
+    let command = cli.command.unwrap_or_else(|| {
+        // Smart default: if a daemon socket exists → attach; else → run default agent.
+        let socket = crate::daemon_server::default_socket_path();
+        if socket.exists() {
+            Command::Attach { socket: None }
+        } else {
+            // Detect an installed agent, fall back to "claude".
+            let agent = crate::agent::AgentKind::detect_installed()
+                .first()
+                .map(crate::agent::AgentKind::binary)
+                .unwrap_or("claude")
+                .to_string();
+            Command::Run {
+                cwd: None,
+                worktree: false,
+                daemon: false,
+                remote: None,
+                reconnect: false,
+                mobile: None,
+                command: vec![agent],
+            }
+        }
+    });
+
+    match command {
         Command::Run {
             cwd,
             worktree,
@@ -744,7 +768,7 @@ mod tests {
             "claude",
         ])
         .expect("valid run invocation parses");
-        match cli.command {
+        match cli.command.unwrap() {
             Command::Run {
                 cwd,
                 worktree,
@@ -770,7 +794,7 @@ mod tests {
     fn parse_run_defaults_when_flags_absent() {
         // Only the required trailing command is given; every flag defaults.
         let cli = Cli::try_parse_from(["orcatui", "run", "claude"]).expect("minimal run parses");
-        match cli.command {
+        match cli.command.unwrap() {
             Command::Run {
                 cwd,
                 worktree,
@@ -802,7 +826,7 @@ mod tests {
             "--parallel",
         ])
         .expect("orchestrate --spec --parallel parses");
-        match cli.command {
+        match cli.command.unwrap() {
             Command::Orchestrate {
                 spec,
                 parallel,
@@ -820,7 +844,7 @@ mod tests {
     fn parse_orchestrate_issues_overrides_spec() {
         let cli = Cli::try_parse_from(["orcatui", "orchestrate", "--issues", "owner/name"])
             .expect("orchestrate --issues parses");
-        match cli.command {
+        match cli.command.unwrap() {
             Command::Orchestrate {
                 spec,
                 parallel,
@@ -838,14 +862,14 @@ mod tests {
     fn parse_prs_and_issues_repo() {
         let prs =
             Cli::try_parse_from(["orcatui", "prs", "octocat/hello-world"]).expect("prs parses");
-        match prs.command {
+        match prs.command.unwrap() {
             Command::Prs { repo } => assert_eq!(repo, "octocat/hello-world"),
             other => panic!("expected Prs, got {other:?}"),
         }
 
         let issues = Cli::try_parse_from(["orcatui", "issues", "octocat/hello-world"])
             .expect("issues parses");
-        match issues.command {
+        match issues.command.unwrap() {
             Command::Issues { repo } => assert_eq!(repo, "octocat/hello-world"),
             other => panic!("expected Issues, got {other:?}"),
         }
@@ -854,14 +878,14 @@ mod tests {
     #[test]
     fn parse_mobile_default_and_custom_port() {
         let default = Cli::try_parse_from(["orcatui", "mobile"]).expect("mobile parses");
-        match default.command {
+        match default.command.unwrap() {
             Command::Mobile { port } => assert_eq!(port, 0, "port defaults to 0"),
             other => panic!("expected Mobile, got {other:?}"),
         }
 
         let custom =
             Cli::try_parse_from(["orcatui", "mobile", "--port", "9090"]).expect("mobile --port");
-        match custom.command {
+        match custom.command.unwrap() {
             Command::Mobile { port } => assert_eq!(port, 9090),
             other => panic!("expected Mobile, got {other:?}"),
         }
@@ -883,7 +907,7 @@ mod tests {
             "orcatui", "run", "--", "claude", "::", "codex", "--model", "x", "::", "opencode",
         ])
         .expect("trailing capture parses");
-        let command = match cli.command {
+        let command = match cli.command.unwrap() {
             Command::Run { command, .. } => command,
             other => panic!("expected Run, got {other:?}"),
         };
@@ -916,7 +940,7 @@ mod tests {
         // contract so the runtime guard is never accidentally removed.
         let cli = Cli::try_parse_from(["orcatui", "run"])
             .expect("clap accepts an empty trailing-var-arg list");
-        let command = match cli.command {
+        let command = match cli.command.unwrap() {
             Command::Run { command, .. } => command,
             other => panic!("expected Run, got {other:?}"),
         };
