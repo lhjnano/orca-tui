@@ -1,0 +1,15 @@
+[Unit]
+Description=orcatui daemon — multi-agent coding orchestrator
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/orcatui daemon
+Restart=on-failure
+RestartSec=3
+# Keep agents alive when the daemon restarts — they run in their own PTYs
+# and the daemon re-discovers them on restart (dtach integration planned).
+KillMode=mixed
+
+[Install]
+WantedBy=default.target

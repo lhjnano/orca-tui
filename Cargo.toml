@@ -71,6 +71,9 @@ tokio-tungstenite = "0.24"
 # so pinning it adds no new version to the graph and disturbs nothing above.
 futures-util = "0.3"
 
+# Base64 encoding for the daemon protocol (PTY output in NDJSON messages).
+base64 = "0.22"
+
 [dev-dependencies]
 # Benchmarking only — `cargo bench --bench orca`. `default-features = false`
 # drops the unused `rayon` (parallel sample analysis) to keep the dep graph

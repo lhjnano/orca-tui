@@ -5,7 +5,7 @@
 //! binary stays a one-line entry point.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -143,6 +143,41 @@ enum Command {
         /// Port to bind. Defaults to 0 (OS-assigned).
         #[arg(long, default_value_t = 0)]
         port: u16,
+    },
+
+    /// Start the built-in daemon server (run as a systemd/supervisor service).
+    ///
+    /// Owns agent PTYs and serves `orcatui attach` clients over a Unix socket.
+    /// Agents survive client disconnect — the daemon keeps running until all
+    /// agents exit and no clients remain, or until SIGTERM.
+    ///
+    /// Designed for `systemctl --user start orcatui` or equivalent. Logs to
+    /// stdout/stderr (captured by journald/supervisor).
+    Daemon {
+        /// Unix socket path. Defaults to `$XDG_RUNTIME_DIR/orcatui.sock`.
+        #[arg(long, value_name = "PATH")]
+        socket: Option<PathBuf>,
+
+        /// Agent commands (same `::` separator as `run`). If omitted, the
+        /// daemon starts empty and clients create sessions via the protocol.
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "COMMAND"
+        )]
+        command: Vec<String>,
+    },
+
+    /// Attach to a running orcatui daemon as a TUI client.
+    ///
+    /// Connects to the daemon's Unix socket, renders all live agent panes,
+    /// and forwards keyboard input. Multiple clients can attach simultaneously.
+    /// Detaching (Ctrl+Q) does NOT kill the agents — they keep running in the
+    /// daemon.
+    Attach {
+        /// Unix socket path. Defaults to `$XDG_RUNTIME_DIR/orcatui.sock`.
+        #[arg(long, value_name = "PATH")]
+        socket: Option<PathBuf>,
     },
 }
 
@@ -346,7 +381,224 @@ fn try_main(cli: Cli) -> Result<()> {
             runtime.block_on(mobile::serve(addr, token, snapshot_rx))?;
             Ok(())
         }
+
+        Command::Daemon { socket, command } => {
+            use crate::daemon_server::{default_socket_path, DaemonServer};
+
+            let socket_path = socket.unwrap_or_else(default_socket_path);
+
+            let mut server = DaemonServer::new(&socket_path)?;
+
+            // Parse initial agents (same `::` separator as `run`).
+            if !command.is_empty() {
+                let commands = split_agents(command);
+                let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+                server.spawn_initial(commands, cols.max(20), rows.max(3));
+            }
+
+            // Install SIGTERM handler for graceful shutdown.
+            let shutdown_flag = server.shutdown_flag();
+            install_sigterm_handler(shutdown_flag);
+
+            server.run()?;
+            Ok(())
+        }
+
+        Command::Attach { socket } => {
+            use crate::daemon_server::{default_socket_path, AttachClient};
+
+            let socket_path = socket.unwrap_or_else(default_socket_path);
+            run_attach(&socket_path)?;
+            Ok(())
+        }
     }
+}
+
+/// Install a SIGTERM handler that sets the atomic shutdown flag.
+fn install_sigterm_handler(flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    // Use a raw signal handler via libc (avoids adding signal-hook dep).
+    // SAFETY: AtomicBool::store is signal-safe.
+    extern "C" {
+        fn signal(signum: i32, handler: usize) -> usize;
+    }
+    static mut SHUTDOWN_FLAG: Option<std::sync::Arc<std::sync::atomic::AtomicBool>> = None;
+    unsafe {
+        SHUTDOWN_FLAG = Some(flag);
+        let handler = sigterm_handler as usize;
+        signal(15, handler); // SIGTERM = 15
+    }
+    extern "C" fn sigterm_handler(_sig: i32) {
+        unsafe {
+            if let Some(flag) = &SHUTDOWN_FLAG {
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// Connect to a daemon and run a TUI client loop.
+fn run_attach(socket_path: &Path) -> Result<()> {
+    use crate::daemon_server::AttachClient;
+    use crate::layout::split_panes;
+    use crate::pane::Pane;
+    use base64::{engine::general_purpose, Engine as _};
+    use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+    use crossterm::terminal::size as term_size;
+    use crossterm::{
+        execute,
+        terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    };
+    use ratatui::backend::CrosstermBackend;
+    use ratatui::Terminal;
+    use std::io::{BufRead, BufReader};
+    use std::sync::mpsc;
+
+    let (mut client, sessions) = AttachClient::connect(socket_path)?;
+
+    // Set up terminal.
+    enable_raw_mode()?;
+    let mut stdout = std::io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let (cols, rows) = term_size().unwrap_or((80, 24));
+    let mut panes: Vec<Pane> = sessions
+        .iter()
+        .map(|s| {
+            let mut p = Pane::new(s.id, &s.name, cols.max(20), rows.max(3));
+            p.set_state(crate::agent::AgentState::Running);
+            p
+        })
+        .collect();
+
+    let mut focus: usize = 0;
+    let config = crate::config::Config::default();
+    let theme = &config.theme;
+
+    // Reader thread: reads NDJSON from the daemon, feeds output to a channel.
+    let reader_stream = client.try_clone_stream()?;
+    let (data_tx, data_rx) = mpsc::channel::<(usize, Vec<u8>)>(); // (session_id, bytes)
+    let (exit_tx, exit_rx) = mpsc::channel::<(usize, Option<i32>)>(); // (session_id, code)
+    std::thread::Builder::new()
+        .name("orcatui-attach-reader".into())
+        .spawn(move || {
+            let mut reader = BufReader::new(reader_stream);
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) {
+                            let msg_type = msg.get("type").and_then(|v| v.as_str());
+                            match msg_type {
+                                Some("output") => {
+                                    let session = msg["session"].as_u64().unwrap_or(0) as usize;
+                                    if let Some(data) = msg["data"].as_str() {
+                                        if let Ok(bytes) = general_purpose::STANDARD.decode(data) {
+                                            let _ = data_tx.send((session, bytes));
+                                        }
+                                    }
+                                }
+                                Some("exit") => {
+                                    let session = msg["session"].as_u64().unwrap_or(0) as usize;
+                                    let code = msg["code"].as_i64().map(|c| c as i32);
+                                    let _ = exit_tx.send((session, code));
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        })?;
+
+    // Main attach loop.
+    let result = (|| -> Result<()> {
+        loop {
+            // Drain pending output from the daemon.
+            while let Ok((session_id, bytes)) = data_rx.try_recv() {
+                if let Some(p) = panes.iter_mut().find(|p| p.id() == session_id) {
+                    p.feed(&bytes);
+                }
+            }
+            // Drain exit events.
+            while let Ok((session_id, code)) = exit_rx.try_recv() {
+                if let Some(p) = panes.iter_mut().find(|p| p.id() == session_id) {
+                    let state = match code {
+                        Some(0) | None => crate::agent::AgentState::Done(code),
+                        Some(c) => crate::agent::AgentState::Failed(format!("exit code {c}")),
+                    };
+                    p.set_state(state);
+                }
+            }
+
+            // Render.
+            terminal.draw(|f| {
+                let area = f.area();
+                let rects = split_panes(area, panes.len());
+                for (i, pane) in panes.iter_mut().enumerate() {
+                    let pane_area = rects.get(i).copied().unwrap_or_default();
+                    pane.render(f, pane_area, i == focus, theme);
+                }
+            })?;
+
+            // Poll for input (10ms timeout — keeps the UI responsive to daemon output).
+            if event::poll(std::time::Duration::from_millis(10))? {
+                let ev = event::read()?;
+                if let Event::Key(key) = ev {
+                    if key.kind == KeyEventKind::Press {
+                        match (key.code, key.modifiers) {
+                            (KeyCode::Char('q'), KeyModifiers::CONTROL) => break,
+                            (KeyCode::Tab, _) => {
+                                if !panes.is_empty() {
+                                    focus = (focus + 1) % panes.len();
+                                }
+                            }
+                            (KeyCode::Enter, _) => {
+                                if let Some(p) = panes.get(focus) {
+                                    let _ = client.write_session(p.id(), b"\r");
+                                }
+                            }
+                            (KeyCode::Backspace, _) => {
+                                if let Some(p) = panes.get(focus) {
+                                    let _ = client.write_session(p.id(), &[0x7f]);
+                                }
+                            }
+                            (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => {
+                                if let Some(p) = panes.get(focus) {
+                                    let mut buf = [0u8; 4];
+                                    let s = c.encode_utf8(&mut buf);
+                                    let _ = client.write_session(p.id(), s.as_bytes());
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+
+            // Exit if all panes are terminal.
+            if !panes.is_empty()
+                && panes.iter().all(|p| {
+                    matches!(
+                        p.state(),
+                        crate::agent::AgentState::Done(_) | crate::agent::AgentState::Failed(_)
+                    )
+                })
+            {
+                break;
+            }
+        }
+        Ok(())
+    })();
+
+    // Restore terminal.
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+
+    result
 }
 
 /// Split the trailing command list into per-agent command vectors on the
