@@ -22,7 +22,7 @@ drives PTYs directly.
 
 ## Status
 
-**All 10 core features implemented** · 355 tests · 71% coverage · CI green ·
+**All 10 core features implemented** · 362 tests · 71% coverage · CI green ·
 opencode-inspired **box-form** UI (themed panel boxes, 3-level background
 palette, 2-line sidebar entries, Pinned section, jump palette) · **full
 agent-rendering compatibility** (synchronized-output mode 2026 batching +
@@ -136,10 +136,62 @@ hello_timeout_secs     = 5
 On reconnect, orcatui re-attaches to the existing daemon sessions — your agents
 are still alive (the daemon owns the PTYs, not the client).
 
+## Built-in daemon (service mode)
+
+orcatui has its own lightweight daemon — no Orca GUI, no Electron, no Node.js.
+The daemon owns agent PTYs and serves TUI clients over a Unix socket. Agents
+**survive client disconnect**: close your terminal, the agents keep running.
+
+### Quick start
+
+```bash
+# 1. Start the daemon with agents
+orcatui daemon -- claude :: codex
+
+# 2. Attach from any terminal (even simultaneously)
+orcatui attach
+
+# 3. Ctrl+Q to detach — agents keep running
+
+# 4. Re-attach later
+orcatui attach
+```
+
+### As a system service (recommended)
+
+The daemon is designed to run under systemd or supervisor — it stays in the
+foreground, logs to stdout/stderr, and exits on SIGTERM.
+
+```bash
+# systemd (Linux)
+cp contrib/orcatui.service ~/.config/systemd/user/
+systemctl --user enable --now orcatui
+
+# Check status / logs
+systemctl --user status orcatui
+journalctl --user -u orcatui -f
+
+# supervisor (any platform)
+# Copy contrib/orcatui-supervisor.conf to your supervisor config dir
+supervisorctl start orcatui
+```
+
+Once the service is running, just `orcatui attach` from any terminal.
+
+### Standalone vs daemon vs Orca daemon
+
+| Mode | Command | Agents survive | Multi-client | Extra deps |
+|------|---------|:--------------:|:------------:|:----------:|
+| Standalone | `orcatui run -- claude` | client exit ❌ | ❌ | none |
+| Built-in daemon | `orcatui daemon` + `orcatui attach` | client exit ✅ | ✅ | none |
+| Orca GUI daemon | `orcatui run --daemon` | client exit ✅ | ✅ | Orca GUI |
+
 ## CLI reference
 
 ```
 orcatui run [--cwd DIR] [--worktree] [--daemon] [--remote HOST] [--reconnect] [--mobile PORT] -- <agent> [:: <agent> ...]
+orcatui daemon [--socket PATH] [-- <agent> ...]
+orcatui attach [--socket PATH]
 orcatui orchestrate [--spec TEXT | --issues OWNER/NAME] [--parallel]
 orcatui prs <owner/name>
 orcatui issues <owner/name>
