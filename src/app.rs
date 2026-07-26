@@ -123,7 +123,7 @@ enum FocusDir {
 const FOOTER_NORMAL: &str =
     " Ctrl+P: control \u{00B7} Ctrl+Q: quit \u{00B7} Ctrl+N: new \u{00B7} Ctrl+B: sidebar ";
 const FOOTER_PANE: &str =
-    " arrows/hjkl: focus \u{00B7} Tab: next \u{00B7} p: pin \u{00B7} Ctrl+B: sidebar \u{00B7} Esc: back ";
+    " arrows/hjkl: focus \u{00B7} Tab: next \u{00B7} p: pin \u{00B7} x: close \u{00B7} Esc: back ";
 const FOOTER_JUMP: &str =
     " type to filter \u{00B7} \u{2191}\u{2193} select \u{00B7} Enter: focus \u{00B7} Esc: cancel ";
 const FOOTER_SPAWN: &str = " \u{2191}\u{2193} select \u{00B7} Enter: spawn \u{00B7} Esc: cancel ";
@@ -1595,6 +1595,9 @@ impl<B: Backend> App<B> {
                 // (no modifiers) — Ctrl+P is intercepted above as the mode-enter
                 // hotkey, so it never reaches this arm.
                 KeyCode::Char('p') => self.toggle_pin_focused(),
+                // `x` kills the focused pane (closes the agent + removes it
+                // from the grid). Focus moves to the previous pane.
+                KeyCode::Char('x') => self.close_focused_pane(),
                 // `/` opens the fuzzy-focus jump palette.
                 KeyCode::Char('/') => {
                     self.jump_query.clear();
@@ -1861,6 +1864,35 @@ impl<B: Backend> App<B> {
     fn toggle_pin_focused(&mut self) {
         if let Some(slot) = self.pinned.get_mut(self.focus) {
             *slot = !*slot;
+        }
+    }
+
+    /// Close the focused pane: kill the agent, remove it from all parallel
+    /// vectors, and move focus to the previous pane.
+    fn close_focused_pane(&mut self) {
+        if self.focus >= self.panes.len() {
+            return;
+        }
+        let idx = self.focus;
+        // Kill the session if it's still alive.
+        if let Some(Some(session)) = self.sessions.get_mut(idx) {
+            let _ = session.kill();
+        }
+        // Remove from every parallel vector.
+        self.panes.remove(idx);
+        self.sessions.remove(idx);
+        self.pane_task.remove(idx);
+        self.pane_command.remove(idx);
+        self.reconnect.remove(idx);
+        self.reconnect_due.remove(idx);
+        self.pinned.remove(idx);
+        self.daemon_session_ids.remove(idx);
+        // Adjust focus to the previous pane (or wrap to the last).
+        if self.panes.is_empty() {
+            self.mode = InputMode::Normal;
+            self.focus = 0;
+        } else if self.focus >= self.panes.len() {
+            self.focus = self.panes.len() - 1;
         }
     }
 
