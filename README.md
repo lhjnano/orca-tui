@@ -58,10 +58,13 @@ cargo install orcatui
 # from source
 cargo install --path .
 
-# run a single agent
+# just run — auto-detects installed agent, or falls back to bash
+orcatui
+
+# explicit: one agent
 orcatui run -- claude
 
-# run two agents side by side
+# two agents side by side
 orcatui run --cwd ./my-repo -- claude :: codex
 
 # each agent in its own git worktree
@@ -210,9 +213,9 @@ orcatui itself.
 
 | Key | Action |
 |-----|--------|
-| `Ctrl+P` | Enter **Pane mode** (control orcatui: focus, pin, …) |
+| `Ctrl+P` | Enter **Pane mode** (control orcatui: focus, pin, close, …) |
 | `Ctrl+Q` | Quit orcatui |
-| `Ctrl+N` | **Spawn a new agent pane** (auto-picks an installed agent — claude / codex / opencode / …) |
+| `Ctrl+N` | **Spawn picker** — select which agent to add (bash, opencode, claude, …) |
 | `Ctrl+B` | **Toggle the sidebar** (adaptive: auto-hides on narrow terminals; force show/hide at any width) |
 | Mouse scroll | Scroll the focused pane's scrollback (1000 lines, 3 lines/notch) |
 
@@ -229,8 +232,21 @@ to the agent. To control orcatui, enter Pane mode with `Ctrl+P`.
 | `←` `↑` `↓` `→`  or  `h` `j` `k` `l` | Move focus (grid-aware: stays within the row/column) |
 | `Tab` / `Shift+Tab` | Focus next / previous pane (wraps) |
 | `p` | **Pin / unpin** the focused agent → sidebar "PINNED" section |
+| `x` | **Close** the focused pane (kill the agent + remove from grid) |
 | `/` | **Jump palette** — fuzzy-focus any agent (type to filter, Enter to focus) |
 | `Esc` | Return to Normal (passthrough) |
+
+#### Spawn picker (`Ctrl+N`) — add a new agent
+
+| Key | Action |
+|-----|--------|
+| `↑` / `↓` | Select an agent (bash, opencode, claude, codex, …) |
+| `Enter` | **Spawn** the selected agent in a new pane |
+| `Esc` | Cancel |
+
+> The picker shows 2–6 agents depending on terminal height (scrolls if more).
+> Pane count is limited by terminal size — if panes would drop below 24×5
+> inner, a toast warns *"Terminal too small for another pane"*.
 
 #### Jump mode (`/` from Pane mode) — fuzzy-focus
 
@@ -251,7 +267,7 @@ Zero-config by default — everything has a built-in. Override via
 `~/.config/orcatui/config.toml` (or `$XDG_CONFIG_HOME`):
 
 ```toml
-default_agent = "claude"
+default_agent = "bash"        # "bash" (always available), or "opencode", "claude", …
 
 [layout]
 sidebar_width = 26          # 0 hides the sidebar
