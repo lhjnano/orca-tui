@@ -392,11 +392,11 @@ impl DaemonServer {
                     self.handle_command(client_id, msg);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    // Check if we should exit: all agents gone + no clients.
-                    if self.all_sessions_gone() && self.clients.is_empty() {
-                        eprintln!("orcatui-daemon: all agents exited, no clients — shutting down");
-                        break;
-                    }
+                    // Keep running — the daemon only exits on SIGTERM or when
+                    // the acceptor/reader threads all disconnect (channel drop).
+                    // We do NOT auto-exit when sessions die: a service daemon
+                    // should stay up so clients can attach, inspect the exit
+                    // state, or create new sessions.
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     break;
