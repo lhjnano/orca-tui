@@ -123,10 +123,11 @@ enum FocusDir {
 const FOOTER_NORMAL: &str =
     " Ctrl+P: control \u{00B7} Ctrl+Q: quit \u{00B7} Ctrl+N: new \u{00B7} Ctrl+B: sidebar ";
 const FOOTER_PANE: &str =
-    " arrows/hjkl: focus \u{00B7} Tab: next \u{00B7} p: pin \u{00B7} x: close \u{00B7} Esc: back ";
+    " hjkl: focus \u{00B7} Tab: next \u{00B7} p: pin \u{00B7} x: close \u{00B7} z: zoom \u{00B7} ?: help \u{00B7} Esc: back ";
 const FOOTER_JUMP: &str =
     " type to filter \u{00B7} \u{2191}\u{2193} select \u{00B7} Enter: focus \u{00B7} Esc: cancel ";
 const FOOTER_SPAWN: &str = " \u{2191}\u{2193} select \u{00B7} Enter: spawn \u{00B7} Esc: cancel ";
+const FOOTER_ZOOM: &str = " z: unzoom \u{00B7} Ctrl+Q: quit \u{00B7} Ctrl+B: sidebar ";
 
 /// Practical minimum pane inner size for agents to render. Below this, the
 /// pane is too small for most TUI agents and spawning is blocked.
@@ -223,6 +224,12 @@ pub struct App<B: Backend = CrosstermBackend<Stdout>> {
     jump_selected: usize,
     /// Spawn-picker: selected index into the agent options list.
     spawn_selected: usize,
+    /// When true, the focused pane fills the entire content area (other panes
+    /// keep running, just not visible). Toggled with `z` in Pane mode.
+    zoomed: bool,
+    /// When true, a full-screen help overlay is rendered. Toggled with `?` in
+    /// Pane mode (or `F1`). Any key dismisses it.
+    show_help: bool,
     /// Daemon connection state — drives the sidebar indicator + error handling.
     conn_state: ConnectionState,
     /// Transient UI messages (daemon errors, connection changes, etc.).
@@ -377,6 +384,8 @@ impl App {
             jump_query: String::new(),
             jump_selected: 0,
             spawn_selected: 0,
+            zoomed: false,
+            show_help: false,
             conn_state: ConnectionState::Standalone,
             toasts: crate::toast::ToastQueue::new(),
             daemon: None,
@@ -1251,10 +1260,24 @@ impl<B: Backend> App<B> {
             (content_area, Rect::default())
         };
 
-        let rects = split_panes(pane_area, self.panes.len());
+        // In zoom mode, the focused pane fills the entire pane area.
+        let zoomed = self.zoomed && self.focus < self.panes.len();
+        let rects = if zoomed {
+            vec![pane_area]
+        } else {
+            split_panes(pane_area, self.panes.len())
+        };
 
         for (i, pane) in self.panes.iter_mut().enumerate() {
-            let Some(&rect) = rects.get(i) else { continue };
+            // In zoom mode, skip all panes except the focused one.
+            if zoomed && i != self.focus {
+                continue;
+            }
+            let rect = if zoomed {
+                pane_area
+            } else {
+                rects.get(i).copied().unwrap_or_default()
+            };
             let inner_w = rect.width.saturating_sub(2).max(MIN_COLS);
             let inner_h = rect.height.saturating_sub(2).max(MIN_ROWS);
             let (cur_w, cur_h) = pane.size();
@@ -1307,6 +1330,8 @@ impl<B: Backend> App<B> {
             .collect();
 
         let focus = self.focus;
+        let zoomed_render = zoomed;
+        let show_help = self.show_help;
         let mode = self.mode;
         // Snapshot the jump-palette state (computed before the mutable `panes`
         // borrow so the draw closure can render the overlay without touching self).
@@ -1362,7 +1387,14 @@ impl<B: Backend> App<B> {
                 }
             }
             for (i, pane) in panes.iter_mut().enumerate() {
-                let area = rects.get(i).copied().unwrap_or_default();
+                if zoomed_render && i != focus {
+                    continue;
+                }
+                let area = if zoomed_render {
+                    pane_area
+                } else {
+                    rects.get(i).copied().unwrap_or_default()
+                };
                 pane.render(f, area, i == focus, theme);
             }
             if reserve_footer {
@@ -1387,11 +1419,15 @@ impl<B: Backend> App<B> {
                     Paragraph::new(status_line).style(Style::default().bg(theme.panel())),
                     foot[0],
                 );
-                let hint = match mode {
-                    InputMode::Pane => FOOTER_PANE,
-                    InputMode::Jump => FOOTER_JUMP,
-                    InputMode::Spawn => FOOTER_SPAWN,
-                    InputMode::Normal => FOOTER_NORMAL,
+                let hint = if zoomed_render {
+                    FOOTER_ZOOM
+                } else {
+                    match mode {
+                        InputMode::Pane => FOOTER_PANE,
+                        InputMode::Jump => FOOTER_JUMP,
+                        InputMode::Spawn => FOOTER_SPAWN,
+                        InputMode::Normal => FOOTER_NORMAL,
+                    }
                 };
                 f.render_widget(
                     Paragraph::new(hint)
@@ -1524,6 +1560,74 @@ impl<B: Backend> App<B> {
                 }
                 f.render_widget(Paragraph::new(lines), inner);
             }
+            // Help overlay: full-screen keybindings reference.
+            if show_help {
+                use ratatui::widgets::{Block, BorderType, Borders, Clear};
+                let pop = Rect::new(
+                    total.x + 2,
+                    total.y + 1,
+                    total.width.saturating_sub(4).max(40),
+                    total.height.saturating_sub(2).max(10),
+                );
+                f.render_widget(Clear, pop);
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(theme.accent()))
+                    .title(
+                        Line::from(" Keybindings (any key to close) ")
+                            .style(Style::default().fg(theme.accent())),
+                    );
+                f.render_widget(&block, pop);
+                let inner = block.inner(pop);
+
+                let help_lines = vec![
+                    Line::from(vec![Span::styled(
+                        "Global",
+                        Style::default()
+                            .fg(theme.accent())
+                            .add_modifier(ratatui::style::Modifier::BOLD),
+                    )]),
+                    Line::from("  Ctrl+P    Enter Pane mode"),
+                    Line::from("  Ctrl+Q    Quit"),
+                    Line::from("  Ctrl+N    Spawn picker (select agent)"),
+                    Line::from("  Ctrl+B    Toggle sidebar"),
+                    Line::from("  scroll    Scroll focused pane"),
+                    Line::raw(""),
+                    Line::from(vec![Span::styled(
+                        "Pane mode (Ctrl+P)",
+                        Style::default()
+                            .fg(theme.accent())
+                            .add_modifier(ratatui::style::Modifier::BOLD),
+                    )]),
+                    Line::from("  h j k l   Move focus (or arrows)"),
+                    Line::from("  Tab       Next pane (wraps)"),
+                    Line::from("  p         Pin / unpin agent"),
+                    Line::from("  x         Close focused pane"),
+                    Line::from("  z         Zoom / unzoom focused pane"),
+                    Line::from("  /         Jump palette (fuzzy-focus)"),
+                    Line::from("  ?         This help"),
+                    Line::from("  Esc       Back to Normal"),
+                    Line::raw(""),
+                    Line::from(vec![Span::styled(
+                        "Normal mode",
+                        Style::default()
+                            .fg(theme.accent())
+                            .add_modifier(ratatui::style::Modifier::BOLD),
+                    )]),
+                    Line::from("  (all keys forwarded to the agent)"),
+                    Line::raw(""),
+                    Line::from(vec![Span::styled(
+                        "Zoom mode (z in Pane)",
+                        Style::default()
+                            .fg(theme.accent())
+                            .add_modifier(ratatui::style::Modifier::BOLD),
+                    )]),
+                    Line::from("  Ctrl+P → z   Unzoom"),
+                    Line::from("  Esc          Normal (interact with agent while zoomed)"),
+                ];
+                f.render_widget(Paragraph::new(help_lines), inner);
+            }
             // Toast overlay: render transient messages at the bottom of the
             // content area, above the footer. Each toast is one line.
             if !self.toasts.is_empty() && reserve_footer {
@@ -1558,6 +1662,11 @@ impl<B: Backend> App<B> {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        // Help overlay: any key dismisses it.
+        if self.show_help {
+            self.show_help = false;
+            return;
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         // Global hotkeys (any mode): Ctrl+P → pane mode, Ctrl+Q → quit.
         if ctrl && key.code == KeyCode::Char('p') {
@@ -1598,6 +1707,10 @@ impl<B: Backend> App<B> {
                 // `x` kills the focused pane (closes the agent + removes it
                 // from the grid). Focus moves to the previous pane.
                 KeyCode::Char('x') => self.close_focused_pane(),
+                // `z` toggles zoom: the focused pane fills the content area.
+                KeyCode::Char('z') => self.zoomed = !self.zoomed,
+                // `?` toggles the help overlay.
+                KeyCode::Char('?') => self.show_help = !self.show_help,
                 // `/` opens the fuzzy-focus jump palette.
                 KeyCode::Char('/') => {
                     self.jump_query.clear();
@@ -2083,6 +2196,8 @@ mod tests {
                 jump_query: String::new(),
                 jump_selected: 0,
                 spawn_selected: 0,
+                zoomed: false,
+                show_help: false,
                 conn_state: ConnectionState::Standalone,
                 toasts: crate::toast::ToastQueue::new(),
                 daemon: None,

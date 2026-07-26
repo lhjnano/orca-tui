@@ -233,6 +233,8 @@ to the agent. To control orcatui, enter Pane mode with `Ctrl+P`.
 | `Tab` / `Shift+Tab` | Focus next / previous pane (wraps) |
 | `p` | **Pin / unpin** the focused agent → sidebar "PINNED" section |
 | `x` | **Close** the focused pane (kill the agent + remove from grid) |
+| `z` | **Zoom** — toggle the focused pane to fill the screen (press again to unzoom) |
+| `?` | **Help** — full-screen keybindings reference (any key to close) |
 | `/` | **Jump palette** — fuzzy-focus any agent (type to filter, Enter to focus) |
 | `Esc` | Return to Normal (passthrough) |
 
