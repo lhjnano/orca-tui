@@ -192,7 +192,7 @@ fn try_main(cli: Cli) -> Result<()> {
             let agent = crate::agent::AgentKind::detect_installed()
                 .first()
                 .map(crate::agent::AgentKind::binary)
-                .unwrap_or("claude")
+                .unwrap_or("bash")
                 .to_string();
             Command::Run {
                 cwd: None,

@@ -55,7 +55,8 @@ use crate::worktree::{OwnedWorktrees, WorktreeManager};
 use tokio::sync::mpsc::UnboundedSender;
 
 /// Input mode — zellij-style. Normal = passthrough, Pane = focus nav,
-/// the fuzzy-focus palette (`/` from Pane mode).
+/// the fuzzy-focus palette (`/` from Pane mode), or the spawn picker
+/// (`Ctrl+N`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum InputMode {
     #[default]
@@ -63,6 +64,8 @@ enum InputMode {
     Pane,
     /// Fuzzy-focus jump palette: type to filter agents, Enter to focus.
     Jump,
+    /// Agent-spawn picker: Up/Down to select, Enter to spawn, Esc to cancel.
+    Spawn,
 }
 
 /// The daemon connection state — drives the sidebar indicator + error handling.
@@ -123,6 +126,12 @@ const FOOTER_PANE: &str =
     " arrows/hjkl: focus \u{00B7} Tab: next \u{00B7} p: pin \u{00B7} Ctrl+B: sidebar \u{00B7} Esc: back ";
 const FOOTER_JUMP: &str =
     " type to filter \u{00B7} \u{2191}\u{2193} select \u{00B7} Enter: focus \u{00B7} Esc: cancel ";
+const FOOTER_SPAWN: &str = " \u{2191}\u{2193} select \u{00B7} Enter: spawn \u{00B7} Esc: cancel ";
+
+/// Practical minimum pane inner size for agents to render. Below this, the
+/// pane is too small for most TUI agents and spawning is blocked.
+const MIN_PANE_COLS: u16 = 24;
+const MIN_PANE_ROWS: u16 = 5;
 
 /// The interactive Orca TUI application.
 ///
@@ -212,6 +221,8 @@ pub struct App<B: Backend = CrosstermBackend<Stdout>> {
     jump_query: String,
     /// Jump-palette: selected index into the filtered agent list.
     jump_selected: usize,
+    /// Spawn-picker: selected index into the agent options list.
+    spawn_selected: usize,
     /// Daemon connection state — drives the sidebar indicator + error handling.
     conn_state: ConnectionState,
     /// Transient UI messages (daemon errors, connection changes, etc.).
@@ -365,6 +376,7 @@ impl App {
             sidebar_hidden: false,
             jump_query: String::new(),
             jump_selected: 0,
+            spawn_selected: 0,
             conn_state: ConnectionState::Standalone,
             toasts: crate::toast::ToastQueue::new(),
             daemon: None,
@@ -1306,6 +1318,16 @@ impl<B: Backend> App<B> {
         };
         let jump_query = self.jump_query.clone();
         let jump_selected = self.jump_selected;
+        let spawn_open = mode == InputMode::Spawn;
+        let spawn_opts: Vec<(String, String)> = if spawn_open {
+            self.spawn_options()
+                .into_iter()
+                .map(|(name, cmd)| (name, cmd.first().cloned().unwrap_or_default()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let spawn_selected = self.spawn_selected;
         let panes = &mut self.panes;
         let theme = &self.config.theme;
         // Agent status tallies for the footer status bar (opencode-style).
@@ -1368,6 +1390,7 @@ impl<B: Backend> App<B> {
                 let hint = match mode {
                     InputMode::Pane => FOOTER_PANE,
                     InputMode::Jump => FOOTER_JUMP,
+                    InputMode::Spawn => FOOTER_SPAWN,
                     InputMode::Normal => FOOTER_NORMAL,
                 };
                 f.render_widget(
@@ -1435,6 +1458,72 @@ impl<B: Backend> App<B> {
                 }
                 f.render_widget(Paragraph::new(lines), inner);
             }
+            // Spawn picker overlay (drawn on top, like the jump palette).
+            if spawn_open {
+                use ratatui::style::Modifier;
+                use ratatui::widgets::{Block, BorderType, Borders, Clear};
+                // ~3 items per 12 rows of terminal height, clamped to [2, 6]
+                let max_visible = ((total.height / 12) as usize).clamp(2, 6);
+                let n = spawn_opts.len();
+                let visible = n.min(max_visible);
+                let pop_h = (visible as u16 + 3)
+                    .min(total.height.saturating_sub(4))
+                    .max(5);
+                let pop_w = total.width.min(48).max(30);
+                let pop_x = total.x + (total.width.saturating_sub(pop_w)) / 2;
+                let pop_y = total.y + (total.height.saturating_sub(pop_h)) / 2;
+                let pop = Rect::new(pop_x, pop_y, pop_w, pop_h);
+                f.render_widget(Clear, pop);
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(theme.accent()))
+                    .title(Line::from(" New pane ").style(Style::default().fg(theme.accent())));
+                f.render_widget(&block, pop);
+                let inner = block.inner(pop);
+
+                // Scroll offset: keep the selected item visible.
+                let scroll = spawn_selected.saturating_sub(max_visible.saturating_sub(1));
+
+                let mut lines: Vec<Line> = Vec::new();
+                for (i, (name, cmd_first)) in spawn_opts
+                    .iter()
+                    .enumerate()
+                    .skip(scroll)
+                    .take(usize::from(inner.height))
+                {
+                    let selected = i == spawn_selected;
+                    let style = if selected {
+                        Style::default()
+                            .fg(theme.accent())
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(theme.fg())
+                    };
+                    let prefix = if selected { "▶ " } else { "  " };
+                    let line = if cmd_first.is_empty() || cmd_first == name {
+                        format!("{prefix}{name}")
+                    } else {
+                        format!("{prefix}{name:<12} {cmd_first}")
+                    };
+                    lines.push(Line::from(line).style(style));
+                }
+                // Scroll indicator.
+                if n > max_visible {
+                    let more_below = spawn_selected + 1 < n;
+                    let more_above = scroll > 0;
+                    let indicator = match (more_above, more_below) {
+                        (true, true) => " ↑↓ more ",
+                        (true, false) => " ↑ end ",
+                        (false, true) => " ↓ more ",
+                        (false, false) => "",
+                    };
+                    if !indicator.is_empty() {
+                        lines.push(Line::from(indicator).style(Style::default().fg(theme.muted())));
+                    }
+                }
+                f.render_widget(Paragraph::new(lines), inner);
+            }
             // Toast overlay: render transient messages at the bottom of the
             // content area, above the footer. Each toast is one line.
             if !self.toasts.is_empty() && reserve_footer {
@@ -1460,7 +1549,10 @@ impl<B: Backend> App<B> {
                 }
             }
             Event::Mouse(mouse) => self.handle_mouse(mouse),
-            Event::Resize(_, _) => {}
+            Event::Resize(cols, rows) => {
+                self.cols = cols.max(MIN_COLS);
+                self.rows = rows.max(MIN_ROWS);
+            }
             _ => {}
         }
     }
@@ -1476,10 +1568,10 @@ impl<B: Backend> App<B> {
             self.quit = true;
             return;
         }
-        // Ctrl+N → spawn a fresh agent pane (the configured default agent) so
-        // agents can be added at runtime, not just at `run` startup.
+        // Ctrl+N → open the spawn picker (select which agent to add).
         if ctrl && key.code == KeyCode::Char('n') {
-            self.spawn_default_agent();
+            self.spawn_selected = 0;
+            self.mode = InputMode::Spawn;
             return;
         }
         // Ctrl+B → toggle the sidebar (adaptive layout: auto-hides on narrow
@@ -1512,6 +1604,7 @@ impl<B: Backend> App<B> {
                 _ => {}
             },
             InputMode::Jump => self.handle_jump_key(key),
+            InputMode::Spawn => self.handle_spawn_key(key),
         }
     }
 
@@ -1678,23 +1771,91 @@ impl<B: Backend> App<B> {
         };
     }
 
-    /// Action item #6: flip the pin flag on the focused pane so it renders in
-    /// the dedicated "PINNED" sidebar section. No-op when focus is out of range.
-    /// Ctrl+N: spawn a fresh agent pane, so the user can add agents at runtime.
-    /// Prefers an actually-installed agent (so Ctrl+N works out of the box even
-    /// when the configured default isn't on PATH — e.g. default `claude` but
-    /// only `opencode` is installed); falls back to the configured default. The
-    /// new pane becomes focused. A failed spawn shows a Failed pane (no stderr,
-    /// which would corrupt the TUI).
-    fn spawn_default_agent(&mut self) {
-        let bin = AgentKind::detect_installed()
-            .first()
-            .map(AgentKind::binary)
-            .map(str::to_string)
-            .unwrap_or_else(|| self.config.default_agent.clone());
-        let spec = AgentSpec::from_command(vec![bin]);
-        let idx = self.spawn_one(spec);
-        self.focus = idx;
+    /// Build the list of spawnable agents for the Ctrl+N picker.
+    /// Always includes `bash`; then all detected installed agents (deduped);
+    /// then the configured default if not already present.
+    fn spawn_options(&self) -> Vec<(String, Vec<String>)> {
+        let mut opts: Vec<(String, Vec<String>)> = Vec::new();
+        // Always-available: bash.
+        opts.push(("bash".to_string(), vec!["bash".to_string()]));
+        // Detected agents.
+        for kind in AgentKind::detect_installed() {
+            let bin = kind.binary().to_string();
+            let name = kind.display_name().to_string();
+            if !opts.iter().any(|(n, _)| n == &name) {
+                opts.push((name, vec![bin]));
+            }
+        }
+        // Configured default if not already listed.
+        let default = &self.config.default_agent;
+        if !opts
+            .iter()
+            .any(|(_, cmd)| cmd.first().is_some_and(|c| c == default))
+            && !default.is_empty()
+        {
+            opts.push((default.clone(), vec![default.clone()]));
+        }
+        opts
+    }
+
+    /// Maximum panes that fit in the current terminal without dropping below
+    /// [`MIN_PANE_COLS`] × [`MIN_PANE_ROWS`] inner area.
+    fn max_panes(&self) -> usize {
+        let sidebar = if self.config.layout.sidebar_width > 0 && !self.sidebar_hidden {
+            self.config.layout.sidebar_width + 1 // +1 gap
+        } else {
+            0
+        };
+        let footer = if self.config.layout.show_status_bar {
+            1
+        } else {
+            0
+        };
+        let avail_cols = self.cols.saturating_sub(sidebar);
+        let avail_rows = self.rows.saturating_sub(footer);
+        let h = (avail_cols / (MIN_PANE_COLS + 2)) as usize; // +2 border
+        let v = (avail_rows / (MIN_PANE_ROWS + 2)) as usize; // +2 border
+        (h * v).max(1)
+    }
+
+    /// Check if there is room for one more pane.
+    fn can_spawn_pane(&self) -> bool {
+        self.panes.len() < self.max_panes()
+    }
+
+    /// Spawn-picker key handling: Up/Down to navigate, Enter to spawn, Esc cancel.
+    fn handle_spawn_key(&mut self, key: KeyEvent) {
+        let opts = self.spawn_options();
+        let n = opts.len();
+        match key.code {
+            KeyCode::Esc => self.mode = InputMode::Normal,
+            KeyCode::Up => {
+                if self.spawn_selected > 0 {
+                    self.spawn_selected -= 1;
+                }
+            }
+            KeyCode::Down => {
+                if self.spawn_selected + 1 < n {
+                    self.spawn_selected += 1;
+                }
+            }
+            KeyCode::Enter => {
+                if let Some((_, cmd)) = opts.get(self.spawn_selected) {
+                    if !self.can_spawn_pane() {
+                        self.toasts.push(crate::toast::Toast::warning(
+                            "Terminal too small for another pane".to_string(),
+                        ));
+                        self.mode = InputMode::Normal;
+                        return;
+                    }
+                    let spec = AgentSpec::from_command(cmd.clone());
+                    let idx = self.spawn_one(spec);
+                    self.focus = idx;
+                }
+                self.mode = InputMode::Normal;
+            }
+            _ => {}
+        }
     }
 
     fn toggle_pin_focused(&mut self) {
@@ -1889,6 +2050,7 @@ mod tests {
                 sidebar_hidden: false,
                 jump_query: String::new(),
                 jump_selected: 0,
+                spawn_selected: 0,
                 conn_state: ConnectionState::Standalone,
                 toasts: crate::toast::ToastQueue::new(),
                 daemon: None,
@@ -2586,8 +2748,12 @@ mod tests {
     fn ctrl_n_spawns_a_new_pane_and_keeps_parallel_vecs_aligned() {
         let mut app = App::for_test(vec![pane(0, "a"), pane(1, "b")]);
         let before = app.panes.len();
+        // Ctrl+N opens the spawn picker; Enter spawns the selected agent.
         app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
-        assert_eq!(app.panes.len(), before + 1, "Ctrl+N adds exactly one pane");
+        assert_eq!(app.mode, InputMode::Spawn, "Ctrl+N opens spawn picker");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.mode, InputMode::Normal, "Enter closes the picker");
+        assert_eq!(app.panes.len(), before + 1, "Ctrl+N → Enter adds one pane");
         // Every parallel per-pane vector must stay aligned with `panes`.
         let n = app.panes.len();
         assert_eq!(app.sessions.len(), n, "sessions aligned");
@@ -2601,10 +2767,8 @@ mod tests {
             n,
             "daemon_session_ids aligned"
         );
-        assert_eq!(app.focus, before, "Ctrl+N focuses the new pane");
-        // Rendering the expanded grid must not panic whether the spawn produced a
-        // live session or a Failed pane.
-        app.render().expect("render after Ctrl+N");
+        assert_eq!(app.focus, before, "spawned pane is focused");
+        app.render().expect("render after spawn");
     }
 
     #[test]

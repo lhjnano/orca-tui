@@ -7,7 +7,7 @@
 //!
 //! ```toml
 //! # ~/.config/orcatui/config.toml
-//! default_agent = "claude"
+//! default_agent = "bash"
 //!
 //! [layout]
 //! sidebar_width = 26     # 0 hides the sidebar
@@ -52,7 +52,7 @@ impl Default for Config {
     /// accent, and green/amber/red status semantics.
     fn default() -> Self {
         Self {
-            default_agent: "claude".to_string(),
+            default_agent: "bash".to_string(),
             layout: LayoutConfig::default(),
             theme: ThemeConfig::default(),
             daemon: DaemonConfig::default(),
@@ -278,7 +278,7 @@ mod tests {
     #[test]
     fn defaults_are_orca_dark() {
         let c = Config::default();
-        assert_eq!(c.default_agent, "claude");
+        assert_eq!(c.default_agent, "bash");
         assert_eq!(c.layout.sidebar_width, 26);
         assert!(c.layout.show_status_bar);
         // theme parses to the expected RGB values.
@@ -388,7 +388,7 @@ border = "#abcdef"
     fn missing_file_uses_default() {
         // load_or_default never panics even with no config file / env.
         let cfg = Config::load_or_default();
-        assert_eq!(cfg.default_agent, "claude");
+        assert_eq!(cfg.default_agent, "bash");
     }
 
     #[test]
@@ -436,7 +436,7 @@ border = "#abcdef"
         // the parallel test runner (and panic-safe on a failed assertion) it
         // (a) performs all env reads FIRST, (b) restores env BEFORE asserting,
         // and (b) keeps any config it writes defaulting to default_agent =
-        // "claude" so a concurrent `missing_file_uses_default` can't observe a
+        // "bash" so a concurrent `missing_file_uses_default` can't observe a
         // surprising value (load_or_default always falls back to a valid
         // default anyway).
 
@@ -457,7 +457,7 @@ border = "#abcdef"
         // lines 75-76: valid file present → parsed config returned.
         std::fs::write(
             temp.join("orcatui").join("config.toml"),
-            "default_agent = \"claude\"\n[theme]\naccent = \"#aabbcc\"\n",
+            "default_agent = \"bash\"\n[theme]\naccent = \"#aabbcc\"\n",
         )
         .unwrap();
         let cfg_valid = Config::load_or_default();
@@ -483,17 +483,17 @@ border = "#abcdef"
             "line 247: XDG_CONFIG_HOME drives the path"
         );
         assert_eq!(
-            cfg_missing.default_agent, "claude",
+            cfg_missing.default_agent, "bash",
             "line 82: missing file → default"
         );
-        assert_eq!(cfg_valid.default_agent, "claude", "lines 75-76: parsed");
+        assert_eq!(cfg_valid.default_agent, "bash", "lines 75-76: parsed");
         assert_eq!(
             cfg_valid.theme.accent(),
             Color::Rgb(0xaa, 0xbb, 0xcc),
             "lines 75-76: the custom accent from disk was parsed"
         );
         assert_eq!(
-            cfg_bad.default_agent, "claude",
+            cfg_bad.default_agent, "bash",
             "lines 77-79: bad toml → default"
         );
 
@@ -513,7 +513,7 @@ border = "#abcdef"
             None => std::env::remove_var("XDG_CONFIG_HOME"),
         }
         assert_eq!(
-            cfg_no_env.default_agent, "claude",
+            cfg_no_env.default_agent, "bash",
             "line 72: no HOME/XDG → config_path None → default"
         );
     }
