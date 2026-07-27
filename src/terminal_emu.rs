@@ -145,6 +145,22 @@ impl TerminalEmulator {
         self.parser.set_size(rows, cols);
     }
 
+    /// Scroll the viewport `offset` lines back into the scrollback history.
+    ///
+    /// `offset = 0` shows the latest (normal) screen; `offset = N` shifts the
+    /// view up by `N` history lines so [`grid`](Self::grid)/[`cell`](Self::cell)
+    /// return the older content. The value is **clamped internally** by vt100
+    /// to the number of history lines actually stored, so passing a value
+    /// larger than the available history just lands on the oldest line (never
+    /// panics). This does NOT affect [`feed`](Self::feed) — new bytes still
+    /// append to the live screen regardless of the scroll offset.
+    ///
+    /// This is what wires mouse-wheel scrollback to the rendered view: a `Pane`
+    /// calls this with its `scroll` cursor before snapshotting [`grid`](Self::grid).
+    pub fn set_scroll(&mut self, offset: usize) {
+        self.parser.set_scrollback(offset);
+    }
+
     /// Returns `(cols, rows)` — the current viewport size.
     #[must_use]
     pub fn size(&self) -> (u16, u16) {
@@ -445,6 +461,78 @@ mod tests {
             row0,
             joined.contains("ALT-MARKER-XYZ"),
             joined.contains("MAIN-TEXT")
+        );
+    }
+
+    #[test]
+    fn set_scroll_shifts_the_view_into_history() {
+        // 10 cols × 3 rows, 50 lines of scrollback. Write 6 lines so the first
+        // three (AAA, BBB, CCC) scroll off into history and the viewport shows
+        // the latest three (DDD, EEE, FFF). Each line uses "\r\n" so the cursor
+        // returns to column 0 and advances a row (scrolling when at the bottom).
+        let mut emu = TerminalEmulator::new(10, 3, 50);
+        emu.feed(b"AAA\r\nBBB\r\nCCC\r\nDDD\r\nEEE\r\nFFF");
+
+        // Latest view (scroll = 0): DDD / EEE / FFF.
+        assert_eq!(emu.cell(0, 0).unwrap().chars, "D");
+        assert_eq!(emu.cell(0, 1).unwrap().chars, "E");
+        assert_eq!(emu.cell(0, 2).unwrap().chars, "F");
+
+        // Scroll back 3 lines → the oldest history (AAA / BBB / CCC).
+        emu.set_scroll(3);
+        assert_eq!(emu.cell(0, 0).unwrap().chars, "A", "scroll=3 row0");
+        assert_eq!(emu.cell(0, 1).unwrap().chars, "B", "scroll=3 row1");
+        assert_eq!(emu.cell(0, 2).unwrap().chars, "C", "scroll=3 row2");
+
+        // Scroll back 1 line → the boundary (CCC / DDD / EEE).
+        emu.set_scroll(1);
+        assert_eq!(emu.cell(0, 0).unwrap().chars, "C", "scroll=1 row0");
+        assert_eq!(emu.cell(0, 1).unwrap().chars, "D", "scroll=1 row1");
+        assert_eq!(emu.cell(0, 2).unwrap().chars, "E", "scroll=1 row2");
+
+        // Back to latest (scroll = 0) restores the live screen.
+        emu.set_scroll(0);
+        assert_eq!(
+            emu.cell(0, 2).unwrap().chars,
+            "F",
+            "scroll=0 back to latest"
+        );
+    }
+
+    #[test]
+    fn set_scroll_clamps_beyond_available_history() {
+        // 3 rows, 50 scrollback, only 2 lines of history available. Asking for
+        // a huge offset must clamp to the oldest line rather than panicking or
+        // reading out of bounds.
+        let mut emu = TerminalEmulator::new(10, 3, 50);
+        emu.feed(b"AAA\r\nBBB\r\nCCC\r\nDDD");
+        // History = AAA (1 line), live = BBB / CCC / DDD.
+        emu.set_scroll(usize::MAX);
+        assert_eq!(
+            emu.cell(0, 0).unwrap().chars,
+            "A",
+            "clamped to the oldest line"
+        );
+    }
+
+    #[test]
+    fn set_scroll_does_not_affect_subsequent_feed() {
+        // Scrolling back must not corrupt the live screen: feeding new bytes
+        // still lands on the normal screen (vt015 guarantees process() is
+        // independent of the scroll offset).
+        let mut emu = TerminalEmulator::new(10, 3, 50);
+        emu.feed(b"AAA\r\nBBB\r\nCCC\r\nDDD");
+        // Live = BBB / CCC / DDD (AAA in history); cursor sits right after "DDD".
+        emu.set_scroll(1);
+        emu.feed(b"X"); // appended at the live cursor (row 2, col 3) → "DDDX"
+                        // Reset to the latest view and check the live screen kept DDD + the
+                        // just-fed 'X'.
+        emu.set_scroll(0);
+        assert_eq!(emu.cell(0, 2).unwrap().chars, "D", "live row preserved");
+        assert_eq!(
+            emu.cell(3, 2).unwrap().chars,
+            "X",
+            "fed byte landed on the live screen"
         );
     }
 }

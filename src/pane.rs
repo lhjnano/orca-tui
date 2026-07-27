@@ -140,6 +140,13 @@ impl Pane {
         // that fires mid-batch sees the previous frame, not the half-cleared one.
         let batched = self.sync_scanner.process(&clean);
         self.emu.feed(&batched);
+        // New agent output → jump back to the latest line (the conventional
+        // terminal behaviour: scrolling up then receiving output snaps you to
+        // the bottom). Without this, a user scrolled back through history would
+        // be stuck viewing old content while fresh output flows below.
+        if !bytes.is_empty() {
+            self.scroll = 0;
+        }
     }
 
     /// Resize the emulator viewport (PTY-side resize is Task 4's job).
@@ -360,16 +367,20 @@ impl Pane {
         );
         // Render the cursor: reverse-video the cell at the emulator's cursor
         // position so the user sees where their typing will land. Skipped when
-        // the agent has hidden the cursor (ESC[?25l) or it's off-screen.
-        if let Some((cur_col, cur_row)) = self.emu.cursor_position() {
-            let x = inner.x.saturating_add(cur_col);
-            let y = inner.y.saturating_add(cur_row);
-            if x < inner.right() && y < inner.bottom() {
-                let cell = &mut frame.buffer_mut()[(x, y)];
-                let fg = cell.fg;
-                let bg = cell.bg;
-                cell.set_fg(bg);
-                cell.set_bg(fg);
+        // the agent has hidden the cursor (ESC[?25l), when the view is scrolled
+        // back through history (the cursor lives on the live screen, not the
+        // historical view), or when it's off-screen.
+        if self.scroll == 0 {
+            if let Some((cur_col, cur_row)) = self.emu.cursor_position() {
+                let x = inner.x.saturating_add(cur_col);
+                let y = inner.y.saturating_add(cur_row);
+                if x < inner.right() && y < inner.bottom() {
+                    let cell = &mut frame.buffer_mut()[(x, y)];
+                    let fg = cell.fg;
+                    let bg = cell.bg;
+                    cell.set_fg(bg);
+                    cell.set_bg(fg);
+                }
             }
         }
     }
@@ -402,6 +413,11 @@ impl Pane {
         if area.width == 0 || area.height == 0 {
             return;
         }
+        // Apply the user's scroll offset (mouse-wheel / scroll API) BEFORE
+        // snapshotting the grid. vt015 clamps it to the available history, so
+        // `grid()` then returns the scrolled-back view (older lines) instead of
+        // always the live screen. `self.scroll == 0` is the normal latest view.
+        self.emu.set_scroll(self.scroll);
         let grid = self.emu.grid();
         let max_rows = usize::from(area.height);
         let max_cols = usize::from(area.width);
@@ -673,6 +689,43 @@ mod tests {
             cell_b.symbol().contains('B'),
             "expected 'B' at (2,1), got {:?}",
             cell_b.symbol()
+        );
+    }
+
+    #[test]
+    fn scrollback_render_shifts_to_older_content() {
+        // Pane 10×3 (matching the inner of a 12×5 render area after the 1-cell
+        // border). Feed six 3-letter lines so AAA/BBB/CCC scroll into history
+        // and the live viewport is DDD/EEE/FFF. Rendering at scroll=0 shows the
+        // live view; scrolling up must repaint the buffer with the older lines.
+        let backend = TestBackend::new(12, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut pane = Pane::new(0, "p", 10, 3);
+        pane.feed(b"AAA\r\nBBB\r\nCCC\r\nDDD\r\nEEE\r\nFFF");
+
+        // Live view (scroll = 0): inner row 0 (buffer y=1) starts with 'D'.
+        terminal
+            .draw(|f| pane.render(f, f.area(), true, &ThemeConfig::default()))
+            .expect("draw at scroll=0");
+        let buf = terminal.backend().buffer();
+        assert!(
+            buf[(1, 1)].symbol().contains('D'),
+            "scroll=0 should show the latest line (DDD); got {:?}",
+            buf[(1, 1)].symbol()
+        );
+
+        // Scroll up 3 lines into history, re-render, and the SAME buffer cell
+        // must now show the oldest line (AAA) — proving the scroll offset is
+        // applied to the painted grid (the bug this fixes).
+        pane.scroll_up(3);
+        terminal
+            .draw(|f| pane.render(f, f.area(), true, &ThemeConfig::default()))
+            .expect("draw at scroll=3");
+        let buf = terminal.backend().buffer();
+        assert!(
+            buf[(1, 1)].symbol().contains('A'),
+            "scroll=3 should repaint with the oldest history (AAA); got {:?}",
+            buf[(1, 1)].symbol()
         );
     }
 
