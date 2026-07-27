@@ -20,7 +20,7 @@
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use crossterm::event::{
@@ -38,7 +38,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Terminal;
 
-use crate::agent::{AgentKind, AgentSpec, AgentState, AgentStatus};
+use crate::activity::{ActivityEvent, ActivityLog};
+use crate::agent::{status_tally, AgentKind, AgentSpec, AgentState, AgentStatus};
 use crate::bus::{self, AgentUpdate, AgentUpdateReceiver, AgentUpdateSender};
 use crate::config::Config;
 use crate::coordinator::{self, Coordinator};
@@ -66,6 +67,11 @@ enum InputMode {
     Jump,
     /// Agent-spawn picker: Up/Down to select, Enter to spawn, Esc to cancel.
     Spawn,
+    /// Full-screen activity timeline overlay: any key closes it.
+    Activity,
+    /// Sidebar navigation menu: ↑↓ moves between items, Enter dispatches,
+    /// Esc returns to Normal. Ctrl+S enters it from any mode.
+    Sidebar,
 }
 
 /// The daemon connection state — drives the sidebar indicator + error handling.
@@ -127,7 +133,14 @@ const FOOTER_PANE: &str =
 const FOOTER_JUMP: &str =
     " type to filter \u{00B7} \u{2191}\u{2193} select \u{00B7} Enter: focus \u{00B7} Esc: cancel ";
 const FOOTER_SPAWN: &str = " \u{2191}\u{2193} select \u{00B7} Enter: spawn \u{00B7} Esc: cancel ";
+const FOOTER_ACTIVITY: &str = " \u{2191}\u{2193} scroll activity \u{00B7} Esc: close ";
+const FOOTER_SIDEBAR: &str =
+    " \u{2191}\u{2193} navigate \u{00B7} Enter: select \u{00B7} Esc: back ";
 const FOOTER_ZOOM: &str = " z: unzoom \u{00B7} Ctrl+Q: quit \u{00B7} Ctrl+B: sidebar ";
+
+/// Sidebar nav menu items (index == sidebar_nav). Only the first is wired in
+/// Phase 1; the others are "coming soon" placeholders.
+const SIDEBAR_NAV_ITEMS: &[&str] = &["Activity", "Tasks", "Settings"];
 
 /// Practical minimum pane inner size for agents to render. Below this, the
 /// pane is too small for most TUI agents and spawning is blocked.
@@ -236,6 +249,15 @@ pub struct App<B: Backend = CrosstermBackend<Stdout>> {
     toasts: crate::toast::ToastQueue,
     /// The daemon client when connected to an Orca daemon (None in standalone).
     daemon: Option<crate::orca_daemon::DaemonClient>,
+    /// In-memory activity timeline (state transitions + errors). Rendered as a
+    /// full-screen overlay via `InputMode::Activity`.
+    activity: ActivityLog,
+    /// Per-pane previously-derived display status, parallel to `panes`. Used by
+    /// [`App::record_activity`] to detect transitions (only record on change).
+    last_status: Vec<Option<AgentStatus>>,
+    /// Sidebar nav menu selected index (0 = Activity, 1 = Tasks, 2 = Settings).
+    /// See [`SIDEBAR_NAV_ITEMS`]. Drives `InputMode::Sidebar` dispatch.
+    sidebar_nav: usize,
 }
 
 impl App {
@@ -389,6 +411,9 @@ impl App {
             conn_state: ConnectionState::Standalone,
             toasts: crate::toast::ToastQueue::new(),
             daemon: None,
+            activity: ActivityLog::new(),
+            last_status: Vec::new(),
+            sidebar_nav: 0,
         })
     }
 }
@@ -490,6 +515,9 @@ impl<B: Backend> App<B> {
             // clobbered by) the forwarder's less-informed `Exit{None}`.
             self.reap_exited();
             let had_output = self.drain_bus();
+            // After all updates (reap + bus drain) have landed on the panes,
+            // capture any lifecycle/state transitions into the activity log.
+            self.record_activity();
 
             let now = Instant::now();
             // Fresh agent output counts as activity (keeps the scheduler out of
@@ -570,6 +598,56 @@ impl<B: Backend> App<B> {
             any = true;
         }
         any
+    }
+
+    /// Capture agent lifecycle transitions (and the error message when an agent
+    /// transitions INTO `Failed`) into [`ActivityLog`].
+    ///
+    /// Runs once per loop tick, right after [`App::reap_exited`] +
+    /// [`App::drain_bus`] have settled every pane's state for this frame. Only
+    /// **changes** are recorded (compared against `last_status`), so a steady
+    /// agent produces no events.
+    ///
+    /// Tool events from the OSC `toolName` payload are deliberately NOT recorded
+    /// here: a pane's `activity()` persists across ticks (it is only overwritten
+    /// when a new OSC 9999 payload arrives), so recording per-tick would spam
+    /// duplicate `Tool` events. State + Error transitions are the high-signal
+    /// set; per-tool dedup can be added (via a `last_tool` field) in a follow-up.
+    fn record_activity(&mut self) {
+        // Keep the per-pane previous-status vec in lockstep with `panes` so a
+        // mid-run `spawn_one` (which appends to `panes`) doesn't desync it.
+        self.last_status.resize(self.panes.len(), None);
+        for (i, pane) in self.panes.iter().enumerate() {
+            let name = pane.name().to_string();
+            let new = AgentStatus::derive(pane.state(), pane.activity().map(|a| a.state.as_str()));
+            let prev = self.last_status[i];
+            if prev == Some(new) {
+                continue;
+            }
+            // Only emit a State event when there IS a previous status — the very
+            // first derivation (prev == None) establishes the baseline silently.
+            if let Some(from) = prev {
+                self.activity.record(ActivityEvent::State {
+                    agent: name.clone(),
+                    from,
+                    to: new,
+                    at: SystemTime::now(),
+                });
+            }
+            // An error event whenever an agent transitions INTO Failed.
+            if matches!(new, AgentStatus::Failed) {
+                let message = match pane.state() {
+                    AgentState::Failed(m) => m.clone(),
+                    _ => String::from("failed"),
+                };
+                self.activity.record(ActivityEvent::Error {
+                    agent: name.clone(),
+                    message,
+                    at: SystemTime::now(),
+                });
+            }
+            self.last_status[i] = Some(new);
+        }
     }
 
     /// Poll each still-tracked child for its real exit code and feed it back as
@@ -1353,6 +1431,23 @@ impl<B: Backend> App<B> {
             Vec::new()
         };
         let spawn_selected = self.spawn_selected;
+        // Snapshot the activity timeline BEFORE the mutable `panes` borrow below
+        // so the draw closure never touches `self.activity` (borrow-checker
+        // safety on the 60fps render path). Owned Strings only.
+        let activity_open = mode == InputMode::Activity;
+        let activity_lines: Vec<String> = if activity_open {
+            self.activity
+                .recent(usize::from(total.height))
+                .iter()
+                .map(|e| e.render_line())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // Snapshot the sidebar-nav popup state so the draw closure never
+        // touches `self.sidebar_nav` (borrow-checker safety on the 60fps path).
+        let sidebar_open = mode == InputMode::Sidebar;
+        let sidebar_selected = self.sidebar_nav;
         let panes = &mut self.panes;
         let theme = &self.config.theme;
         // Agent status tallies for the footer status bar (opencode-style).
@@ -1360,15 +1455,7 @@ impl<B: Backend> App<B> {
             .iter()
             .map(|e| AgentStatus::derive(&e.state, e.activity.as_ref().map(|a| a.state.as_str())))
             .collect();
-        let n_working = statuses.iter().filter(|s| s.is_active()).count();
-        let n_failed = statuses
-            .iter()
-            .filter(|s| matches!(s, AgentStatus::Failed))
-            .count();
-        let n_done = statuses
-            .iter()
-            .filter(|s| matches!(s, AgentStatus::Done))
-            .count();
+        let tally = status_tally(&statuses);
         self.terminal.draw(|f| {
             if let Some(sb) = sidebar_area {
                 let conn_status = match self.conn_state {
@@ -1401,20 +1488,44 @@ impl<B: Backend> App<B> {
                 // opencode-style status bar: left = agent tally, right = key-hint.
                 let foot = Layout::horizontal([Constraint::Min(1), Constraint::Length(66)])
                     .split(footer_area);
-                let status_line = Line::from(vec![
-                    Span::styled(
-                        format!(" ● {n_working} working "),
+                let mut status_spans: Vec<Span> = Vec::new();
+                if tally.working > 0 {
+                    status_spans.push(Span::styled(
+                        format!(" ● {} working ", tally.working),
                         Style::default().fg(theme.success()).bg(theme.panel()),
-                    ),
-                    Span::styled(
-                        format!(" ✗ {n_failed} failed "),
+                    ));
+                }
+                if tally.blocked > 0 {
+                    status_spans.push(Span::styled(
+                        format!(" ● {} blocked ", tally.blocked),
                         Style::default().fg(theme.error()).bg(theme.panel()),
-                    ),
-                    Span::styled(
-                        format!(" ✓ {n_done} done "),
+                    ));
+                }
+                if tally.interrupted > 0 {
+                    status_spans.push(Span::styled(
+                        format!(" ● {} interrupted ", tally.interrupted),
+                        Style::default().fg(theme.accent()).bg(theme.panel()),
+                    ));
+                }
+                if tally.waiting > 0 {
+                    status_spans.push(Span::styled(
+                        format!(" ● {} waiting ", tally.waiting),
+                        Style::default().fg(theme.warning()).bg(theme.panel()),
+                    ));
+                }
+                if tally.failed > 0 {
+                    status_spans.push(Span::styled(
+                        format!(" ✗ {} failed ", tally.failed),
+                        Style::default().fg(theme.error()).bg(theme.panel()),
+                    ));
+                }
+                if tally.done > 0 {
+                    status_spans.push(Span::styled(
+                        format!(" ✓ {} done ", tally.done),
                         Style::default().fg(theme.muted()).bg(theme.panel()),
-                    ),
-                ]);
+                    ));
+                }
+                let status_line = Line::from(status_spans);
                 f.render_widget(
                     Paragraph::new(status_line).style(Style::default().bg(theme.panel())),
                     foot[0],
@@ -1426,6 +1537,8 @@ impl<B: Backend> App<B> {
                         InputMode::Pane => FOOTER_PANE,
                         InputMode::Jump => FOOTER_JUMP,
                         InputMode::Spawn => FOOTER_SPAWN,
+                        InputMode::Activity => FOOTER_ACTIVITY,
+                        InputMode::Sidebar => FOOTER_SIDEBAR,
                         InputMode::Normal => FOOTER_NORMAL,
                     }
                 };
@@ -1560,6 +1673,79 @@ impl<B: Backend> App<B> {
                 }
                 f.render_widget(Paragraph::new(lines), inner);
             }
+            // Activity timeline overlay (drawn on top, any key to close).
+            if activity_open {
+                use ratatui::widgets::{Block, BorderType, Borders, Clear};
+                let pop = Rect::new(
+                    total.x + 2,
+                    total.y + 1,
+                    total.width.saturating_sub(4).max(40),
+                    total.height.saturating_sub(2).max(10),
+                );
+                f.render_widget(Clear, pop);
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(theme.accent()))
+                    .title(
+                        Line::from(" Activity (any key to close) ")
+                            .style(Style::default().fg(theme.accent())),
+                    );
+                f.render_widget(&block, pop);
+                let inner = block.inner(pop);
+                // `activity_lines` is newest-first (recent() returns newest-first),
+                // so the most recent transition renders at the top.
+                let lines: Vec<Line> = if activity_lines.is_empty() {
+                    vec![Line::from("(no activity yet)").style(Style::default().fg(theme.muted()))]
+                } else {
+                    activity_lines
+                        .iter()
+                        .take(usize::from(inner.height))
+                        .map(|s| Line::from(s.as_str()).style(Style::default().fg(theme.fg())))
+                        .collect()
+                };
+                f.render_widget(Paragraph::new(lines), inner);
+            }
+            // Sidebar nav popup (Ctrl+S): Activity / Tasks / Settings. Only the
+            // first is wired in Phase 1; the rest are "coming soon" placeholders.
+            if sidebar_open {
+                use ratatui::style::Modifier;
+                use ratatui::widgets::{Block, BorderType, Borders, Clear};
+                let n = SIDEBAR_NAV_ITEMS.len();
+                let pop_h = (n as u16 + 3).min(total.height.saturating_sub(4)).max(5);
+                let pop_w = total.width.min(36).max(24);
+                let pop_x = total.x + (total.width.saturating_sub(pop_w)) / 2;
+                let pop_y = total.y + (total.height.saturating_sub(pop_h)) / 2;
+                let pop = Rect::new(pop_x, pop_y, pop_w, pop_h);
+                f.render_widget(Clear, pop);
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(theme.accent()))
+                    .title(Line::from(" Navigate ").style(Style::default().fg(theme.accent())));
+                f.render_widget(&block, pop);
+                let inner = block.inner(pop);
+                let mut lines: Vec<Line> = Vec::new();
+                for (i, name) in SIDEBAR_NAV_ITEMS.iter().enumerate() {
+                    let selected = i == sidebar_selected;
+                    let prefix = if selected { "▶ " } else { "  " };
+                    let suffix = if i > 0 { " (soon)" } else { "" };
+                    let label = format!("{prefix}{name}{suffix}");
+                    let style = if selected {
+                        Style::default()
+                            .fg(theme.accent())
+                            .add_modifier(Modifier::BOLD)
+                    } else if i > 0 {
+                        // Tasks/Settings placeholders — dimmed.
+                        Style::default().fg(theme.muted())
+                    } else {
+                        // Activity (implemented) — normal weight.
+                        Style::default().fg(theme.fg())
+                    };
+                    lines.push(Line::from(label).style(style));
+                }
+                f.render_widget(Paragraph::new(lines), inner);
+            }
             // Help overlay: full-screen keybindings reference.
             if show_help {
                 use ratatui::widgets::{Block, BorderType, Borders, Clear};
@@ -1606,6 +1792,7 @@ impl<B: Backend> App<B> {
                     Line::from("  x         Close focused pane"),
                     Line::from("  z         Zoom / unzoom focused pane"),
                     Line::from("  /         Jump palette (fuzzy-focus)"),
+                    Line::from("  a         Activity timeline (overlay)"),
                     Line::from("  ?         This help"),
                     Line::from("  Esc       Back to Normal"),
                     Line::raw(""),
@@ -1689,6 +1876,14 @@ impl<B: Backend> App<B> {
             self.sidebar_hidden = !self.sidebar_hidden;
             return;
         }
+        // Ctrl+S → open the sidebar navigation menu (Activity / Tasks /
+        // Settings). NOTE: terminals may swallow Ctrl+S as XOFF flow control
+        // unless `stty -ixon` is set; that's a known limitation.
+        if ctrl && key.code == KeyCode::Char('s') {
+            self.mode = InputMode::Sidebar;
+            self.sidebar_nav = 0;
+            return;
+        }
         match self.mode {
             InputMode::Normal => self.forward_key_to_agent(key),
             InputMode::Pane => match key.code {
@@ -1717,10 +1912,40 @@ impl<B: Backend> App<B> {
                     self.jump_selected = 0;
                     self.mode = InputMode::Jump;
                 }
+                // `a` opens the full-screen activity timeline overlay.
+                KeyCode::Char('a') => self.mode = InputMode::Activity,
                 _ => {}
             },
             InputMode::Jump => self.handle_jump_key(key),
             InputMode::Spawn => self.handle_spawn_key(key),
+            // Activity overlay: any key dismisses it (back to Normal), mirroring
+            // the Help overlay's "any key to close" contract.
+            InputMode::Activity => self.mode = InputMode::Normal,
+            InputMode::Sidebar => match key.code {
+                KeyCode::Esc => self.mode = InputMode::Normal,
+                KeyCode::Up => {
+                    if self.sidebar_nav > 0 {
+                        self.sidebar_nav -= 1;
+                    }
+                }
+                KeyCode::Down => {
+                    if self.sidebar_nav + 1 < SIDEBAR_NAV_ITEMS.len() {
+                        self.sidebar_nav += 1;
+                    }
+                }
+                KeyCode::Enter => match self.sidebar_nav {
+                    0 => self.mode = InputMode::Activity,
+                    _ => {
+                        // Tasks / Settings are not implemented in Phase 1.
+                        let name = SIDEBAR_NAV_ITEMS[self.sidebar_nav];
+                        self.toasts.push(crate::toast::Toast::info(format!(
+                            "{name} \u{2014} coming soon"
+                        )));
+                        self.mode = InputMode::Normal;
+                    }
+                },
+                _ => {}
+            },
         }
     }
 
@@ -2201,6 +2426,9 @@ mod tests {
                 conn_state: ConnectionState::Standalone,
                 toasts: crate::toast::ToastQueue::new(),
                 daemon: None,
+                activity: ActivityLog::new(),
+                last_status: Vec::new(),
+                sidebar_nav: 0,
             }
         }
     }
@@ -2349,6 +2577,82 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_mode_enters_with_ctrl_s() {
+        let mut app = App::for_test(vec![pane(0, "a")]);
+        assert_eq!(app.mode, InputMode::Normal);
+        // Ctrl+S is a global hotkey — enters the sidebar nav menu.
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert_eq!(app.mode, InputMode::Sidebar, "Ctrl+S enters sidebar mode");
+        assert_eq!(app.sidebar_nav, 0, "selection starts at the first item");
+    }
+
+    #[test]
+    fn sidebar_nav_moves_with_arrows() {
+        let mut app = App::for_test(vec![pane(0, "a")]);
+        app.mode = InputMode::Sidebar;
+        app.sidebar_nav = 0;
+        // Down: 0 → 1 → 2 → clamped at 2.
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.sidebar_nav, 1);
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.sidebar_nav, 2);
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.sidebar_nav, 2, "clamped at the last item");
+        // Up: 2 → 1 → 0 → clamped at 0.
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.sidebar_nav, 1);
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.sidebar_nav, 0);
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.sidebar_nav, 0, "clamped at the first item");
+    }
+
+    #[test]
+    fn sidebar_enter_activity_opens_overlay() {
+        let mut app = App::for_test(vec![pane(0, "a")]);
+        app.mode = InputMode::Sidebar;
+        app.sidebar_nav = 0; // Activity
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.mode,
+            InputMode::Activity,
+            "Enter on Activity opens the overlay"
+        );
+    }
+
+    #[test]
+    fn sidebar_enter_stub_shows_toast_and_closes() {
+        // Tasks (index 1).
+        {
+            let mut app = App::for_test(vec![pane(0, "a")]);
+            app.mode = InputMode::Sidebar;
+            app.sidebar_nav = 1;
+            assert!(app.toasts.is_empty(), "no toast before dispatch");
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert_eq!(app.mode, InputMode::Normal, "Tasks closes the sidebar");
+            assert!(!app.toasts.is_empty(), "a 'coming soon' toast is queued");
+        }
+        // Settings (index 2).
+        {
+            let mut app = App::for_test(vec![pane(0, "a")]);
+            app.mode = InputMode::Sidebar;
+            app.sidebar_nav = 2;
+            assert!(app.toasts.is_empty(), "no toast before dispatch");
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert_eq!(app.mode, InputMode::Normal, "Settings closes the sidebar");
+            assert!(!app.toasts.is_empty(), "a 'coming soon' toast is queued");
+        }
+    }
+
+    #[test]
+    fn sidebar_esc_returns_to_normal() {
+        let mut app = App::for_test(vec![pane(0, "a")]);
+        app.mode = InputMode::Sidebar;
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.mode, InputMode::Normal, "Esc exits sidebar mode");
+    }
+
+    #[test]
     fn jump_palette_filters_and_focuses_on_enter() {
         let mut app = App::for_test(vec![
             pane(0, "claude"),
@@ -2449,6 +2753,36 @@ mod tests {
         // The footer key-hints are drawn on the reserved last line.
         assert!(text.contains("Ctrl+P"), "footer rendered");
         assert!(text.contains("quit"));
+    }
+
+    #[test]
+    fn sidebar_nav_popup_renders_items_and_selection() {
+        // In Sidebar mode the Navigate popup shows all three nav items and
+        // marks the selected one with the ▶ marker.
+        let mut app = App::for_test(vec![pane(0, "alpha")]);
+        app.mode = InputMode::Sidebar;
+        app.sidebar_nav = 1; // Tasks (a "coming soon" placeholder)
+        app.render().expect("render into TestBackend");
+
+        let text = buffer_text(&app);
+        // Title + every item label, with placeholders tagged "(soon)".
+        assert!(text.contains("Navigate"), "popup title rendered");
+        assert!(text.contains("Activity"), "first item rendered");
+        assert!(text.contains("Tasks (soon)"), "Tasks placeholder rendered");
+        assert!(
+            text.contains("Settings (soon)"),
+            "Settings placeholder rendered"
+        );
+        // The selected row (index 1 → Tasks) carries the ▶ marker.
+        assert!(
+            text.contains("▶ Tasks"),
+            "selected row carries the ▶ marker"
+        );
+        // Sanity: the non-selected Activity row does NOT carry the marker.
+        assert!(
+            !text.contains("▶ Activity"),
+            "non-selected Activity row has no marker"
+        );
     }
 
     #[test]
@@ -3169,5 +3503,57 @@ mod tests {
         app.render().expect("render with toasts");
         let text = buffer_text(&app);
         assert!(text.contains("daemon error"), "toast message rendered");
+    }
+
+    #[test]
+    fn activity_overlay_toggles_with_a_key() {
+        let mut app = App::for_test(vec![pane(0, "a")]);
+        app.mode = InputMode::Pane;
+        // Bare `a` in Pane mode opens the activity overlay.
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty()));
+        assert_eq!(
+            app.mode,
+            InputMode::Activity,
+            "'a' in Pane mode should open the Activity overlay"
+        );
+        // Esc closes it (back to Normal).
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        assert_eq!(
+            app.mode,
+            InputMode::Normal,
+            "Esc should close the Activity overlay"
+        );
+    }
+
+    #[test]
+    fn activity_log_records_state_transition() {
+        let mut app = App::for_test(vec![pane(0, "a")]);
+        // Pretend pane 0 was previously derived as Working so the first
+        // derivation below is treated as a real transition (prev != new).
+        app.last_status = vec![Some(AgentStatus::Working)];
+        // Flip the pane to a Failed lifecycle state — `record_activity` should
+        // then emit both a State{Working→Failed} and an Error event.
+        app.panes[0].set_state(AgentState::Failed("boom".into()));
+        app.record_activity();
+
+        assert!(
+            app.activity.len() >= 1,
+            "at least one event should be recorded on a real transition"
+        );
+        // At least one recorded event's render_line must mention the pane name
+        // AND contain either the arrow (State) or "error" (Error).
+        let lines: Vec<String> = app
+            .activity
+            .recent(app.activity.len())
+            .iter()
+            .map(|e| e.render_line())
+            .collect();
+        let found = lines
+            .iter()
+            .any(|l| l.contains("a") && (l.contains("error") || l.contains("\u{2192}")));
+        assert!(
+            found,
+            "expected a line naming pane 'a' with an arrow or 'error'; got {lines:?}"
+        );
     }
 }

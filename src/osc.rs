@@ -52,14 +52,15 @@ const PARAM_9999: &[u8] = b"9999";
 /// The parsed agent-status payload carried by an OSC 9999 sequence.
 ///
 /// Mirrors Orca's `AgentStatusPayload`. `state` is the one required field
-/// (`"working"` / `"blocked"` / `"waiting"` / `"done"`); the rest are optional
-/// and absent when the agent did not report them. Field names on the wire are
-/// camelCase (`toolName`, `toolInput`) to match what the agents emit; `tool`
-/// is accepted as an alias for `toolName`.
+/// (`"working"` / `"blocked"` / `"waiting"` / `"interrupted"` / `"done"`); the
+/// rest are optional and absent when the agent did not report them. Field names
+/// on the wire are camelCase (`toolName`, `toolInput`) to match what the agents
+/// emit; `tool` is accepted as an alias for `toolName`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct AgentActivity {
     /// Lifecycle label from the agent: `"working"`, `"blocked"`, `"waiting"`,
-    /// `"done"` (vocabulary defined by the agent's status hooks).
+    /// `"interrupted"`, `"done"` (vocabulary defined by the agent's status
+    /// hooks).
     pub state: String,
     /// Current tool name, e.g. `"Edit"`, `"Bash"`, `"Read"`.
     #[serde(default, rename = "toolName", alias = "tool")]
@@ -638,5 +639,18 @@ mod tests {
         assert_eq!(clean, b"tail");
         assert_eq!(acts.len(), 1);
         assert_eq!(acts[0].state, "done");
+    }
+
+    #[test]
+    fn interrupted_state_round_trips() {
+        // The "interrupted" OSC state (AgentStatus::Interrupted) must parse
+        // into an AgentActivity carrying the literal state string, matching the
+        // derive() vocabulary on the agent side.
+        let input = b"\x1b]9999;{\"state\":\"interrupted\"}\x07";
+        let mut s = OscScanner::new();
+        let (clean, acts) = s.process(input);
+        assert!(clean.is_empty());
+        assert_eq!(acts.len(), 1);
+        assert_eq!(acts[0].state, "interrupted");
     }
 }

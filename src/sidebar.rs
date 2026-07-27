@@ -16,7 +16,7 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, BorderType, Borders};
 use ratatui::Frame;
 
-use crate::agent::{AgentState, AgentStatus};
+use crate::agent::{status_tally, AgentState, AgentStatus};
 use crate::config::ThemeConfig;
 use crate::osc::AgentActivity;
 
@@ -86,6 +86,18 @@ pub fn render_sidebar(
         return;
     }
 
+    // Reserve the bottom row for a compact status tally summary when there is
+    // enough room AND at least one entry to summarize. Entries + section
+    // headers are then windowed into rows up to `entry_bottom` (one above the
+    // summary); the top status line and brand title are unaffected.
+    const SUMMARY_MIN_HEIGHT: u16 = 8;
+    let show_summary = !entries.is_empty() && inner.height >= SUMMARY_MIN_HEIGHT;
+    let entry_bottom = if show_summary {
+        inner.bottom().saturating_sub(1)
+    } else {
+        inner.bottom()
+    };
+
     let bg = theme.panel();
     let bottom = inner.bottom();
     let lines_each = entry_lines(inner.width);
@@ -114,7 +126,7 @@ pub fn render_sidebar(
     let has_pinned = entries.iter().any(|e| e.pinned);
     if has_pinned {
         let pinned_count = entries.iter().filter(|e| e.pinned).count();
-        if y < bottom {
+        if y < entry_bottom {
             let _ = buf.set_stringn(
                 inner.x,
                 y,
@@ -128,7 +140,7 @@ pub fn render_sidebar(
         }
         y = y.saturating_add(1);
         for entry in entries.iter().filter(|e| e.pinned) {
-            let draw = bottom.saturating_sub(y).min(lines_each);
+            let draw = entry_bottom.saturating_sub(y).min(lines_each);
             if draw == 0 {
                 break;
             }
@@ -140,7 +152,7 @@ pub fn render_sidebar(
     // ` IN PROGRESS (n) ` — n counts ACTIVE UNPINNED entries (pinned agents
     // were already listed in their own section, so they don't double-count).
     let active_unpinned = entries.iter().filter(|e| !e.pinned && is_active(e)).count();
-    if y < bottom {
+    if y < entry_bottom {
         let _ = buf.set_stringn(
             inner.x,
             y,
@@ -157,7 +169,7 @@ pub fn render_sidebar(
     // Unpinned entries, tail-windowed to the remaining rows so the newest stay
     // visible when they overflow. Each entry occupies `lines_each` rows.
     let unpinned: Vec<&SidebarEntry> = entries.iter().filter(|e| !e.pinned).collect();
-    let remaining_rows = bottom.saturating_sub(y);
+    let remaining_rows = entry_bottom.saturating_sub(y);
     let fits = if lines_each == 0 {
         0
     } else {
@@ -172,12 +184,69 @@ pub fn render_sidebar(
         _ => unpinned.len().saturating_sub(fits),
     };
     for entry in unpinned[start..].iter() {
-        let draw = bottom.saturating_sub(y).min(lines_each);
+        let draw = entry_bottom.saturating_sub(y).min(lines_each);
         if draw == 0 {
             break;
         }
         render_entry_at(buf, inner.x, y, inner.width, draw, entry, theme);
         y = y.saturating_add(draw);
+    }
+
+    // Bottom status-tally summary: one compact colored line at the last inner
+    // row, shown only when there are entries AND enough height. Each non-zero
+    // bucket renders as `glyph+count`, space-separated, matching the sidebar's
+    // own dot colors so the footer (which may be hidden) stays redundant.
+    if show_summary {
+        let summary_y = inner.bottom().saturating_sub(1);
+        let st: Vec<AgentStatus> = entries
+            .iter()
+            .map(|e| AgentStatus::derive(&e.state, e.activity.as_ref().map(|a| a.state.as_str())))
+            .collect();
+        let tally = status_tally(&st);
+        // Build only non-zero tokens, in display order. The trailing space on
+        // every token except the last is handled by joining with set_stringn
+        // advancing `x` naturally; the final token (done) has no trailing space.
+        let mut tokens: Vec<(String, Color)> = Vec::new();
+        if tally.working > 0 {
+            tokens.push((format!("\u{25CF}{} ", tally.working), theme.success()));
+        }
+        if tally.blocked > 0 {
+            tokens.push((format!("\u{25CF}{} ", tally.blocked), theme.error()));
+        }
+        if tally.interrupted > 0 {
+            tokens.push((format!("\u{25CF}{} ", tally.interrupted), theme.accent()));
+        }
+        if tally.waiting > 0 {
+            tokens.push((format!("\u{25CF}{} ", tally.waiting), theme.warning()));
+        }
+        if tally.failed > 0 {
+            tokens.push((format!("\u{2717}{} ", tally.failed), theme.error()));
+        }
+        if tally.done > 0 {
+            tokens.push((format!("\u{2713}{}", tally.done), theme.muted()));
+        }
+        // Paint the whole summary row with the panel bg first, then lay each
+        // non-zero token left-to-right with its own fg, stopping at inner.right.
+        buf.set_style(
+            Rect::new(inner.x, summary_y, inner.width, 1),
+            Style::default().bg(theme.panel()),
+        );
+        let right = inner.right();
+        let mut x = inner.x;
+        for (s, color) in tokens {
+            if x >= right {
+                break;
+            }
+            let avail = usize::from(right.saturating_sub(x));
+            let p = buf.set_stringn(
+                x,
+                summary_y,
+                &s,
+                avail,
+                Style::default().fg(color).bg(theme.panel()),
+            );
+            x = p.0;
+        }
     }
 }
 
@@ -208,6 +277,7 @@ fn status_style(entry: &SidebarEntry, theme: &ThemeConfig, bg: Color) -> (&'stat
         AgentStatus::Working => ("\u{25CF}", lit(theme.success())), // ●
         AgentStatus::Blocked => ("\u{25CF}", lit(theme.error())),   // ●
         AgentStatus::Waiting => ("\u{25CF}", lit(theme.warning())), // ●
+        AgentStatus::Interrupted => ("\u{25CF}", lit(theme.accent())), // ●
         AgentStatus::Done => ("\u{2713}", dim(theme.fg())),         // ✓
         AgentStatus::Failed => ("\u{2717}", lit(theme.error())),    // ✗
         AgentStatus::Idle => ("\u{25CB}", dim(theme.fg())),         // ○
@@ -972,5 +1042,82 @@ mod tests {
             interior.bg, root_bg,
             "interior cell must NOT carry the root bg"
         );
+    }
+
+    #[test]
+    fn render_sidebar_shows_bottom_tally() {
+        // Three unpinned entries driving three distinct status buckets:
+        // Running (→Working), Failed, Done. Width 28 < 36 ⇒ one-line entries.
+        // Height 14 ⇒ inner height 12 ≥ SUMMARY_MIN_HEIGHT(8), so the bottom
+        // tally row appears on the last inner row.
+        let entries = vec![
+            SidebarEntry {
+                name: "claude".to_owned(),
+                state: AgentState::Running,
+                branch: None,
+                activity: None,
+                focused: false,
+                pinned: false,
+            },
+            SidebarEntry {
+                name: "codex".to_owned(),
+                state: AgentState::Failed("boom".to_owned()),
+                branch: None,
+                activity: None,
+                focused: false,
+                pinned: false,
+            },
+            SidebarEntry {
+                name: "opencode".to_owned(),
+                state: AgentState::Done(Some(0)),
+                branch: None,
+                activity: None,
+                focused: false,
+                pinned: false,
+            },
+        ];
+
+        let backend = TestBackend::new(28, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = ThemeConfig::default();
+        terminal
+            .draw(|f| render_sidebar(f, f.area(), &entries, &theme, None))
+            .expect("draw");
+
+        let buf = terminal.backend().buffer();
+        // The summary lands on the last inner row: inner = (1,1,26,12), so the
+        // last inner row is y=12 (inner.bottom()=13 is exclusive; summary_y is
+        // inner.bottom()-1 = 12).
+        let summary_y = 12u16;
+        let row: String = (0..buf.area().width)
+            .map(|col| buf[(col, summary_y)].symbol().to_owned())
+            .collect();
+        assert!(
+            row.contains("\u{25CF}1"),
+            "working tally token `●1` missing on summary row {:?}: {row:?}",
+            summary_y
+        );
+        assert!(
+            row.contains("\u{2717}1"),
+            "failed tally token `✗1` missing on summary row {:?}: {row:?}",
+            summary_y
+        );
+        assert!(
+            row.contains("\u{2713}1"),
+            "done tally token `✓1` missing on summary row {:?}: {row:?}",
+            summary_y
+        );
+
+        // Sanity: the summary row must be distinct from any entry row (entries
+        // occupy rows 2..=4), so the tally is never conflated with agent dots.
+        for entry_row in 2..=4u16 {
+            let r: String = (0..buf.area().width)
+                .map(|col| buf[(col, entry_row)].symbol().to_owned())
+                .collect();
+            assert!(
+                !r.contains("\u{2713}1") || entry_row == summary_y,
+                "done tally leaked into entry row {entry_row}"
+            );
+        }
     }
 }

@@ -10,6 +10,7 @@
 //! (`benches/`), and reused as a dependency. Built on
 //! [`ratatui-ppalla`](https://crates.io/crates/ratatui-ppalla).
 
+pub mod activity;
 pub mod agent;
 pub mod app;
 pub mod bus;

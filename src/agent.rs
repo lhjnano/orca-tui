@@ -169,6 +169,7 @@ pub enum AgentStatus {
     Working,
     Blocked,
     Waiting,
+    Interrupted,
     Done,
     Failed,
     Idle,
@@ -178,8 +179,8 @@ impl AgentStatus {
     /// Derive the display status from the lifecycle state and the (optional)
     /// OSC 9999 activity state string. Priority:
     ///   1. a `Failed` lifecycle always wins (a crash overrides everything);
-    ///   2. a recognized OSC state ("working"|"blocked"|"waiting"|"done") wins
-    ///      next (it is more granular than the lifecycle);
+    ///   2. a recognized OSC state ("working"|"blocked"|"waiting"|"interrupted"
+    ///      |"done") wins next (it is more granular than the lifecycle);
     ///   3. otherwise fall back to the lifecycle (Running→Working, Done→Done,
     ///      Idle→Idle).
     #[must_use]
@@ -192,6 +193,7 @@ impl AgentStatus {
                 "working" => Self::Working,
                 "blocked" => Self::Blocked,
                 "waiting" => Self::Waiting,
+                "interrupted" => Self::Interrupted,
                 "done" => Self::Done,
                 _ => Self::from_lifecycle(state),
             };
@@ -212,10 +214,10 @@ impl AgentStatus {
     #[must_use]
     pub fn icon(&self) -> &'static str {
         match self {
-            Self::Working | Self::Blocked | Self::Waiting => "\u{25CF}", // ●
-            Self::Done => "\u{2713}",                                    // ✓
-            Self::Failed => "\u{2717}",                                  // ✗
-            Self::Idle => "\u{25CB}",                                    // ○
+            Self::Working | Self::Blocked | Self::Waiting | Self::Interrupted => "\u{25CF}", // ●
+            Self::Done => "\u{2713}",                                                        // ✓
+            Self::Failed => "\u{2717}",                                                      // ✗
+            Self::Idle => "\u{25CB}",                                                        // ○
         }
     }
 
@@ -226,6 +228,7 @@ impl AgentStatus {
             Self::Working => "working",
             Self::Blocked => "blocked",
             Self::Waiting => "waiting",
+            Self::Interrupted => "interrupted",
             Self::Done => "done",
             Self::Failed => "failed",
             Self::Idle => "idle",
@@ -236,7 +239,10 @@ impl AgentStatus {
     /// and auto-scroll targeting). Working/blocked/waiting are all active.
     #[must_use]
     pub fn is_active(&self) -> bool {
-        matches!(self, Self::Working | Self::Blocked | Self::Waiting)
+        matches!(
+            self,
+            Self::Working | Self::Blocked | Self::Waiting | Self::Interrupted
+        )
     }
 
     /// Relative activity ranking for "most active agent" selection (higher =
@@ -245,14 +251,66 @@ impl AgentStatus {
     #[must_use]
     pub fn priority(&self) -> u8 {
         match self {
-            Self::Working => 5,
-            Self::Blocked => 4,
+            Self::Working => 6,
+            Self::Blocked => 5,
+            Self::Interrupted => 4,
             Self::Waiting => 3,
             Self::Idle => 2,
             Self::Done => 1,
             Self::Failed => 0,
         }
     }
+}
+
+/// Tallied counts of each [`AgentStatus`] across a set of agents.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StatusTally {
+    /// Number of agents whose status is [`AgentStatus::Working`].
+    pub working: usize,
+    /// Number of agents whose status is [`AgentStatus::Blocked`].
+    pub blocked: usize,
+    /// Number of agents whose status is [`AgentStatus::Interrupted`].
+    pub interrupted: usize,
+    /// Number of agents whose status is [`AgentStatus::Waiting`].
+    pub waiting: usize,
+    /// Number of agents whose status is [`AgentStatus::Done`].
+    pub done: usize,
+    /// Number of agents whose status is [`AgentStatus::Failed`].
+    pub failed: usize,
+    /// Number of agents whose status is [`AgentStatus::Idle`].
+    pub idle: usize,
+}
+
+impl StatusTally {
+    /// Total number of agents represented by this tally.
+    #[must_use]
+    pub fn total(&self) -> usize {
+        self.working
+            + self.blocked
+            + self.interrupted
+            + self.waiting
+            + self.done
+            + self.failed
+            + self.idle
+    }
+}
+
+/// Count how many statuses fall into each [`AgentStatus`] bucket.
+#[must_use]
+pub fn status_tally(statuses: &[AgentStatus]) -> StatusTally {
+    let mut t = StatusTally::default();
+    for s in statuses {
+        match s {
+            AgentStatus::Working => t.working += 1,
+            AgentStatus::Blocked => t.blocked += 1,
+            AgentStatus::Interrupted => t.interrupted += 1,
+            AgentStatus::Waiting => t.waiting += 1,
+            AgentStatus::Done => t.done += 1,
+            AgentStatus::Failed => t.failed += 1,
+            AgentStatus::Idle => t.idle += 1,
+        }
+    }
+    t
 }
 
 /// Launch specification for one agent.
@@ -493,6 +551,14 @@ mod tests {
     }
 
     #[test]
+    fn status_interrupted_derived_from_osc() {
+        assert_eq!(
+            AgentStatus::derive(&AgentState::Running, Some("interrupted")),
+            AgentStatus::Interrupted
+        );
+    }
+
+    #[test]
     fn status_lifecycle_fallback_running_to_working() {
         assert_eq!(
             AgentStatus::derive(&AgentState::Running, None),
@@ -580,5 +646,47 @@ mod tests {
         assert_eq!(AgentStatus::Done.label(), "done");
         assert_eq!(AgentStatus::Failed.label(), "failed");
         assert_eq!(AgentStatus::Idle.label(), "idle");
+    }
+
+    #[test]
+    fn status_tally_counts_each_bucket() {
+        let statuses = [
+            AgentStatus::Working,
+            AgentStatus::Working,
+            AgentStatus::Blocked,
+            AgentStatus::Interrupted,
+            AgentStatus::Waiting,
+            AgentStatus::Done,
+            AgentStatus::Failed,
+            AgentStatus::Idle,
+            AgentStatus::Done,
+        ];
+        let t = status_tally(&statuses);
+        assert_eq!(t.working, 2);
+        assert_eq!(t.blocked, 1);
+        assert_eq!(t.interrupted, 1);
+        assert_eq!(t.waiting, 1);
+        assert_eq!(t.done, 2);
+        assert_eq!(t.failed, 1);
+        assert_eq!(t.idle, 1);
+        assert_eq!(t.total(), statuses.len());
+    }
+
+    #[test]
+    fn status_tally_empty_is_all_zero() {
+        let t = status_tally(&[]);
+        assert_eq!(
+            t,
+            StatusTally {
+                working: 0,
+                blocked: 0,
+                interrupted: 0,
+                waiting: 0,
+                done: 0,
+                failed: 0,
+                idle: 0,
+            }
+        );
+        assert_eq!(t.total(), 0);
     }
 }
