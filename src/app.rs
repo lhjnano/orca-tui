@@ -25,7 +25,7 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{Context, Result};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseEventKind,
+    KeyModifiers, MouseButton, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -72,6 +72,9 @@ enum InputMode {
     /// Sidebar navigation menu: ↑↓ moves between items, Enter dispatches,
     /// Esc returns to Normal. Ctrl+S enters it from any mode.
     Sidebar,
+    /// Custom-command text-entry modal (reached from the spawn picker's
+    /// "Custom command…" sentinel entry): type a command, Enter spawns it.
+    SpawnCustom,
 }
 
 /// The daemon connection state — drives the sidebar indicator + error handling.
@@ -126,16 +129,16 @@ enum FocusDir {
     Right,
 }
 
-const FOOTER_NORMAL: &str =
-    " Ctrl+P: control \u{00B7} Ctrl+Q: quit \u{00B7} Ctrl+N: new \u{00B7} Ctrl+B: sidebar ";
-const FOOTER_PANE: &str =
-    " hjkl: focus \u{00B7} Tab: next \u{00B7} p: pin \u{00B7} x: close \u{00B7} z: zoom \u{00B7} ?: help \u{00B7} Esc: back ";
+const FOOTER_NORMAL: &str = " Ctrl+Alt+P: control \u{00B7} Ctrl+Q: quit ";
+const FOOTER_PANE: &str = " hjkl: focus \u{00B7} Tab: next \u{00B7} p: pin \u{00B7} x: close \u{00B7} z: zoom \u{00B7} n: new \u{00B7} b: sidebar \u{00B7} s: nav \u{00B7} ?: help \u{00B7} Esc: back ";
 const FOOTER_JUMP: &str =
     " type to filter \u{00B7} \u{2191}\u{2193} select \u{00B7} Enter: focus \u{00B7} Esc: cancel ";
 const FOOTER_SPAWN: &str = " \u{2191}\u{2193} select \u{00B7} Enter: spawn \u{00B7} Esc: cancel ";
 const FOOTER_ACTIVITY: &str = " \u{2191}\u{2193} scroll activity \u{00B7} Esc: close ";
 const FOOTER_SIDEBAR: &str =
     " \u{2191}\u{2193} navigate \u{00B7} Enter: select \u{00B7} Esc: back ";
+const FOOTER_SPAWN_CUSTOM: &str =
+    " type a command \u{00B7} Enter: spawn \u{00B7} Backspace \u{00B7} Esc: cancel ";
 const FOOTER_ZOOM: &str = " z: unzoom \u{00B7} Ctrl+Q: quit \u{00B7} Ctrl+B: sidebar ";
 
 /// Sidebar nav menu items (index == sidebar_nav). Only the first is wired in
@@ -237,6 +240,9 @@ pub struct App<B: Backend = CrosstermBackend<Stdout>> {
     jump_selected: usize,
     /// Spawn-picker: selected index into the agent options list.
     spawn_selected: usize,
+    /// Custom-command modal (`InputMode::SpawnCustom`): the in-progress
+    /// command string the user is typing. Shell-split on Enter.
+    custom_cmd: String,
     /// When true, the focused pane fills the entire content area (other panes
     /// keep running, just not visible). Toggled with `z` in Pane mode.
     zoomed: bool,
@@ -258,6 +264,10 @@ pub struct App<B: Backend = CrosstermBackend<Stdout>> {
     /// Sidebar nav menu selected index (0 = Activity, 1 = Tasks, 2 = Settings).
     /// See [`SIDEBAR_NAV_ITEMS`]. Drives `InputMode::Sidebar` dispatch.
     sidebar_nav: usize,
+    /// Last-rendered OUTER pane rects (one per pane, in `panes` order), cached
+    /// by [`App::render`] for mouse hit-testing in [`App::handle_mouse`].
+    /// Empty until the first frame is drawn.
+    pane_rects: Vec<Rect>,
 }
 
 impl App {
@@ -406,6 +416,7 @@ impl App {
             jump_query: String::new(),
             jump_selected: 0,
             spawn_selected: 0,
+            custom_cmd: String::new(),
             zoomed: false,
             show_help: false,
             conn_state: ConnectionState::Standalone,
@@ -414,6 +425,7 @@ impl App {
             activity: ActivityLog::new(),
             last_status: Vec::new(),
             sidebar_nav: 0,
+            pane_rects: Vec::new(),
         })
     }
 }
@@ -1345,6 +1357,10 @@ impl<B: Backend> App<B> {
         } else {
             split_panes(pane_area, self.panes.len())
         };
+        // Cache the OUTER pane rects so handle_mouse can hit-test against the
+        // exact panes that were last drawn (before the borrow-holding draw
+        // closure below).
+        self.pane_rects = rects.clone();
 
         for (i, pane) in self.panes.iter_mut().enumerate() {
             // In zoom mode, skip all panes except the focused one.
@@ -1431,6 +1447,10 @@ impl<B: Backend> App<B> {
             Vec::new()
         };
         let spawn_selected = self.spawn_selected;
+        // Snapshot the custom-command modal state so the draw closure never
+        // touches `self.custom_cmd` (borrow-checker safety on the 60fps path).
+        let custom_open = mode == InputMode::SpawnCustom;
+        let custom_cmd_view = self.custom_cmd.clone();
         // Snapshot the activity timeline BEFORE the mutable `panes` borrow below
         // so the draw closure never touches `self.activity` (borrow-checker
         // safety on the 60fps render path). Owned Strings only.
@@ -1537,6 +1557,7 @@ impl<B: Backend> App<B> {
                         InputMode::Pane => FOOTER_PANE,
                         InputMode::Jump => FOOTER_JUMP,
                         InputMode::Spawn => FOOTER_SPAWN,
+                        InputMode::SpawnCustom => FOOTER_SPAWN_CUSTOM,
                         InputMode::Activity => FOOTER_ACTIVITY,
                         InputMode::Sidebar => FOOTER_SIDEBAR,
                         InputMode::Normal => FOOTER_NORMAL,
@@ -1564,6 +1585,7 @@ impl<B: Backend> App<B> {
                 let block = Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
+                    .style(Style::default().bg(theme.panel()))
                     .border_style(Style::default().fg(theme.accent()))
                     .title(
                         Line::from(" Jump to agent ").style(Style::default().fg(theme.accent())),
@@ -1605,7 +1627,10 @@ impl<B: Backend> App<B> {
                     let prefix = if selected { "▶ " } else { "  " };
                     lines.push(Line::from(format!("{prefix}{name}")).style(style));
                 }
-                f.render_widget(Paragraph::new(lines), inner);
+                f.render_widget(
+                    Paragraph::new(lines).style(Style::default().bg(theme.panel())),
+                    inner,
+                );
             }
             // Spawn picker overlay (drawn on top, like the jump palette).
             if spawn_open {
@@ -1626,6 +1651,7 @@ impl<B: Backend> App<B> {
                 let block = Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
+                    .style(Style::default().bg(theme.panel()))
                     .border_style(Style::default().fg(theme.accent()))
                     .title(Line::from(" New pane ").style(Style::default().fg(theme.accent())));
                 f.render_widget(&block, pop);
@@ -1671,7 +1697,10 @@ impl<B: Backend> App<B> {
                         lines.push(Line::from(indicator).style(Style::default().fg(theme.muted())));
                     }
                 }
-                f.render_widget(Paragraph::new(lines), inner);
+                f.render_widget(
+                    Paragraph::new(lines).style(Style::default().bg(theme.panel())),
+                    inner,
+                );
             }
             // Activity timeline overlay (drawn on top, any key to close).
             if activity_open {
@@ -1686,6 +1715,7 @@ impl<B: Backend> App<B> {
                 let block = Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
+                    .style(Style::default().bg(theme.panel()))
                     .border_style(Style::default().fg(theme.accent()))
                     .title(
                         Line::from(" Activity (any key to close) ")
@@ -1704,7 +1734,10 @@ impl<B: Backend> App<B> {
                         .map(|s| Line::from(s.as_str()).style(Style::default().fg(theme.fg())))
                         .collect()
                 };
-                f.render_widget(Paragraph::new(lines), inner);
+                f.render_widget(
+                    Paragraph::new(lines).style(Style::default().bg(theme.panel())),
+                    inner,
+                );
             }
             // Sidebar nav popup (Ctrl+S): Activity / Tasks / Settings. Only the
             // first is wired in Phase 1; the rest are "coming soon" placeholders.
@@ -1721,6 +1754,7 @@ impl<B: Backend> App<B> {
                 let block = Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
+                    .style(Style::default().bg(theme.panel()))
                     .border_style(Style::default().fg(theme.accent()))
                     .title(Line::from(" Navigate ").style(Style::default().fg(theme.accent())));
                 f.render_widget(&block, pop);
@@ -1744,7 +1778,10 @@ impl<B: Backend> App<B> {
                     };
                     lines.push(Line::from(label).style(style));
                 }
-                f.render_widget(Paragraph::new(lines), inner);
+                f.render_widget(
+                    Paragraph::new(lines).style(Style::default().bg(theme.panel())),
+                    inner,
+                );
             }
             // Help overlay: full-screen keybindings reference.
             if show_help {
@@ -1759,6 +1796,7 @@ impl<B: Backend> App<B> {
                 let block = Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
+                    .style(Style::default().bg(theme.panel()))
                     .border_style(Style::default().fg(theme.accent()))
                     .title(
                         Line::from(" Keybindings (any key to close) ")
@@ -1774,14 +1812,12 @@ impl<B: Backend> App<B> {
                             .fg(theme.accent())
                             .add_modifier(ratatui::style::Modifier::BOLD),
                     )]),
-                    Line::from("  Ctrl+P    Enter Pane mode"),
+                    Line::from("  Ctrl+Alt+P  Enter Pane mode"),
                     Line::from("  Ctrl+Q    Quit"),
-                    Line::from("  Ctrl+N    Spawn picker (select agent)"),
-                    Line::from("  Ctrl+B    Toggle sidebar"),
                     Line::from("  scroll    Scroll focused pane"),
                     Line::raw(""),
                     Line::from(vec![Span::styled(
-                        "Pane mode (Ctrl+P)",
+                        "Pane mode (Ctrl+Alt+P)",
                         Style::default()
                             .fg(theme.accent())
                             .add_modifier(ratatui::style::Modifier::BOLD),
@@ -1791,6 +1827,9 @@ impl<B: Backend> App<B> {
                     Line::from("  p         Pin / unpin agent"),
                     Line::from("  x         Close focused pane"),
                     Line::from("  z         Zoom / unzoom focused pane"),
+                    Line::from("  n         Spawn picker (new agent)"),
+                    Line::from("  b         Toggle sidebar"),
+                    Line::from("  s         Sidebar nav hub"),
                     Line::from("  /         Jump palette (fuzzy-focus)"),
                     Line::from("  a         Activity timeline (overlay)"),
                     Line::from("  ?         This help"),
@@ -1810,10 +1849,53 @@ impl<B: Backend> App<B> {
                             .fg(theme.accent())
                             .add_modifier(ratatui::style::Modifier::BOLD),
                     )]),
-                    Line::from("  Ctrl+P → z   Unzoom"),
+                    Line::from("  Ctrl+Alt+P → z   Unzoom"),
                     Line::from("  Esc          Normal (interact with agent while zoomed)"),
                 ];
-                f.render_widget(Paragraph::new(help_lines), inner);
+                f.render_widget(
+                    Paragraph::new(help_lines).style(Style::default().bg(theme.panel())),
+                    inner,
+                );
+            }
+            // Custom-command text-entry modal (drawn on top of the spawn
+            // picker, mirroring the jump palette's centered box style).
+            if custom_open {
+                use ratatui::style::Modifier;
+                use ratatui::widgets::{Block, BorderType, Borders, Clear};
+                let pop_w = total.width.min(60).max(40);
+                let pop_h = 5u16;
+                let pop_x = total.x + (total.width.saturating_sub(pop_w)) / 2;
+                let pop_y = total.y + (total.height.saturating_sub(pop_h)) / 2;
+                let pop = Rect::new(pop_x, pop_y, pop_w, pop_h);
+                f.render_widget(Clear, pop);
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(theme.accent()))
+                    .style(Style::default().bg(theme.panel()))
+                    .title(
+                        Line::from(" Custom command ").style(Style::default().fg(theme.accent())),
+                    );
+                f.render_widget(&block, pop);
+                let inner = block.inner(pop);
+                let line = Line::from(vec![
+                    Span::styled("> ", Style::default().fg(theme.accent()).bg(theme.panel())),
+                    Span::styled(
+                        custom_cmd_view.clone(),
+                        Style::default().fg(theme.fg()).bg(theme.panel()),
+                    ),
+                    Span::styled(
+                        "_",
+                        Style::default()
+                            .fg(theme.accent())
+                            .bg(theme.panel())
+                            .add_modifier(Modifier::SLOW_BLINK),
+                    ),
+                ]);
+                f.render_widget(
+                    Paragraph::new(line).style(Style::default().bg(theme.panel())),
+                    inner,
+                );
             }
             // Toast overlay: render transient messages at the bottom of the
             // content area, above the footer. Each toast is one line.
@@ -1855,33 +1937,17 @@ impl<B: Backend> App<B> {
             return;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        // Global hotkeys (any mode): Ctrl+P → pane mode, Ctrl+Q → quit.
-        if ctrl && key.code == KeyCode::Char('p') {
+        // Ctrl+Alt+P gateway (Alt adds an ESC-prefix byte so it's distinct
+        // from Ctrl+P, which opencode uses for its command palette).
+        if ctrl && key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('p') {
             self.mode = InputMode::Pane;
             return;
         }
+        // Ctrl+Q → quit (only other global hotkey; everything else lives
+        // behind the gateway in Pane mode to avoid colliding with agent
+        // shortcuts like opencode's Ctrl+P command palette).
         if ctrl && key.code == KeyCode::Char('q') {
             self.quit = true;
-            return;
-        }
-        // Ctrl+N → open the spawn picker (select which agent to add).
-        if ctrl && key.code == KeyCode::Char('n') {
-            self.spawn_selected = 0;
-            self.mode = InputMode::Spawn;
-            return;
-        }
-        // Ctrl+B → toggle the sidebar (adaptive layout: auto-hides on narrow
-        // terminals; the user can force-show/-hide at any width).
-        if ctrl && key.code == KeyCode::Char('b') {
-            self.sidebar_hidden = !self.sidebar_hidden;
-            return;
-        }
-        // Ctrl+S → open the sidebar navigation menu (Activity / Tasks /
-        // Settings). NOTE: terminals may swallow Ctrl+S as XOFF flow control
-        // unless `stty -ixon` is set; that's a known limitation.
-        if ctrl && key.code == KeyCode::Char('s') {
-            self.mode = InputMode::Sidebar;
-            self.sidebar_nav = 0;
             return;
         }
         match self.mode {
@@ -1896,8 +1962,9 @@ impl<B: Backend> App<B> {
                 KeyCode::Right | KeyCode::Char('l') => self.focus_directional(FocusDir::Right),
                 // Action item #6: toggle the pin flag on the focused pane so it
                 // renders in the dedicated "PINNED" sidebar section. A bare `p`
-                // (no modifiers) — Ctrl+P is intercepted above as the mode-enter
-                // hotkey, so it never reaches this arm.
+                // (no modifiers) — only Ctrl+Alt+P is intercepted above as the
+                // mode-enter gateway, so plain Ctrl+P is forwarded to the agent
+                // and a bare `p` reaches this arm.
                 KeyCode::Char('p') => self.toggle_pin_focused(),
                 // `x` kills the focused pane (closes the agent + removes it
                 // from the grid). Focus moves to the previous pane.
@@ -1914,6 +1981,20 @@ impl<B: Backend> App<B> {
                 }
                 // `a` opens the full-screen activity timeline overlay.
                 KeyCode::Char('a') => self.mode = InputMode::Activity,
+                // `n` opens the spawn picker (moved from global Ctrl+N to
+                // avoid colliding with agent shortcuts).
+                KeyCode::Char('n') => {
+                    self.spawn_selected = 0;
+                    self.mode = InputMode::Spawn;
+                }
+                // `b` toggles the sidebar visibility (moved from Ctrl+B).
+                KeyCode::Char('b') => self.sidebar_hidden = !self.sidebar_hidden,
+                // `s` opens the sidebar navigation hub (moved from Ctrl+S,
+                // which terminals may swallow as XOFF flow control).
+                KeyCode::Char('s') => {
+                    self.mode = InputMode::Sidebar;
+                    self.sidebar_nav = 0;
+                }
                 _ => {}
             },
             InputMode::Jump => self.handle_jump_key(key),
@@ -1944,6 +2025,39 @@ impl<B: Backend> App<B> {
                         self.mode = InputMode::Normal;
                     }
                 },
+                _ => {}
+            },
+            InputMode::SpawnCustom => match key.code {
+                KeyCode::Esc => self.mode = InputMode::Normal,
+                KeyCode::Enter => {
+                    // Shell-split on whitespace (no quote handling — v1).
+                    let parts: Vec<String> = self
+                        .custom_cmd
+                        .split_whitespace()
+                        .map(String::from)
+                        .collect();
+                    if parts.is_empty() {
+                        self.mode = InputMode::Normal;
+                        return;
+                    }
+                    if !self.can_spawn_pane() {
+                        self.toasts.push(crate::toast::Toast::warning(
+                            "Terminal too small for another pane".to_string(),
+                        ));
+                        self.mode = InputMode::Normal;
+                        return;
+                    }
+                    let spec = AgentSpec::from_command(parts);
+                    let idx = self.spawn_one(spec);
+                    self.focus = idx;
+                    self.mode = InputMode::Normal;
+                }
+                KeyCode::Backspace => {
+                    self.custom_cmd.pop();
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.custom_cmd.push(c);
+                }
                 _ => {}
             },
         }
@@ -2001,6 +2115,14 @@ impl<B: Backend> App<B> {
     /// raw bytes / VT escape sequences. The agent receives everything — Tab,
     /// Esc, Ctrl+C, arrows — exactly as if it were a real terminal.
     fn forward_key_to_agent(&mut self, key: KeyEvent) {
+        // IME note: committed Hangul/CJK/emoji/accented input is forwarded
+        // verbatim via the UTF-8 path below and works correctly. Incomplete IME
+        // compositions (e.g. a lone Hangul jamo during preedit) are NOT filtered
+        // here — crossterm 0.28's `KeyEventState` has no `COMPOSING` flag under
+        // the default terminal encoding, so there's no reliable signal to gate
+        // on. Fully fixing preedit cursor desync needs an enhanced keyboard
+        // protocol / OSC 51-style preedit; see the `hangul` module for a
+        // composition building block. Non-composing events are unaffected.
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
@@ -2035,6 +2157,7 @@ impl<B: Backend> App<B> {
 
     /// Mouse scroll: move the focused pane's scrollback (3 lines per notch).
     fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        let (col, row) = (mouse.column, mouse.row);
         match mouse.kind {
             MouseEventKind::ScrollUp => {
                 if let Some(p) = self.focused_pane_mut() {
@@ -2046,8 +2169,78 @@ impl<B: Backend> App<B> {
                     p.scroll_down(3);
                 }
             }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(idx) = self.pane_at(col, row) {
+                    // Clear any selection on other panes, then start a new one here.
+                    for (i, p) in self.panes.iter_mut().enumerate() {
+                        if i != idx {
+                            p.clear_selection();
+                        }
+                    }
+                    self.focus = idx;
+                    if let Some((c, r)) = self.map_to_inner(idx, col, row) {
+                        if let Some(p) = self.panes.get_mut(idx) {
+                            p.start_selection(c, r);
+                        }
+                    }
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(idx) = self.pane_at(col, row) {
+                    if self.panes.get(idx).map_or(false, |p| p.has_selection()) {
+                        if let Some((c, r)) = self.map_to_inner(idx, col, row) {
+                            if let Some(p) = self.panes.get_mut(idx) {
+                                p.extend_selection(c, r);
+                            }
+                        }
+                    }
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                // Copy the focused pane's selection (if any), then clear it.
+                let text = self.panes.get(self.focus).and_then(|p| p.selected_text());
+                if let Some(t) = text {
+                    match crate::clipboard::copy(&t) {
+                        Ok(()) => self.toasts.push(crate::toast::Toast::info("Copied")),
+                        Err(_) => self.toasts.push(crate::toast::Toast::warning(
+                            "No clipboard tool (xclip/xsel/wl-copy/pbcopy)",
+                        )),
+                    }
+                }
+                if let Some(p) = self.panes.get_mut(self.focus) {
+                    p.clear_selection();
+                }
+            }
             _ => {}
         }
+    }
+
+    /// Index of the pane whose last-rendered OUTER rect contains `(col,row)`,
+    /// or `None` when the point is outside every pane (or no rects are cached).
+    fn pane_at(&self, col: u16, row: u16) -> Option<usize> {
+        self.pane_rects
+            .iter()
+            .position(|r| col >= r.x && col < r.right() && row >= r.y && row < r.bottom())
+    }
+
+    /// Map a terminal `(col,row)` to pane `idx`'s INNER grid `(col,row)`.
+    /// The pane content sits 1 cell inside the rounded border on every side,
+    /// so inner = outer shrunk by 1 on each edge. Returns `None` if the point
+    /// is outside the pane or the inner area is too small to hold content.
+    fn map_to_inner(&self, idx: usize, col: u16, row: u16) -> Option<(u16, u16)> {
+        let r = self.pane_rects.get(idx)?;
+        if col < r.x || row < r.y {
+            return None;
+        }
+        let c = col.saturating_sub(r.x).saturating_sub(1);
+        let rr = row.saturating_sub(r.y).saturating_sub(1);
+        // Clamp to the inner dimensions (w-2, h-2); the -2 accounts for both borders.
+        let max_c = r.width.saturating_sub(2);
+        let max_r = r.height.saturating_sub(2);
+        if max_c == 0 || max_r == 0 {
+            return None;
+        }
+        Some((c.min(max_c - 1), rr.min(max_r - 1)))
     }
 
     /// Grid-aware directional focus (Pane mode: arrows / hjkl).
@@ -2136,6 +2329,10 @@ impl<B: Backend> App<B> {
         {
             opts.push((default.clone(), vec![default.clone()]));
         }
+        // Custom-command sentinel: selecting this entry opens the
+        // `InputMode::SpawnCustom` text-entry modal so the user can type any
+        // command. The empty command vector is the sentinel.
+        opts.push(("Custom command\u{2026}".to_string(), Vec::new()));
         opts
     }
 
@@ -2182,6 +2379,12 @@ impl<B: Backend> App<B> {
             }
             KeyCode::Enter => {
                 if let Some((_, cmd)) = opts.get(self.spawn_selected) {
+                    if cmd.is_empty() {
+                        // Custom command sentinel: switch to the text-entry modal.
+                        self.custom_cmd.clear();
+                        self.mode = InputMode::SpawnCustom;
+                        return;
+                    }
                     if !self.can_spawn_pane() {
                         self.toasts.push(crate::toast::Toast::warning(
                             "Terminal too small for another pane".to_string(),
@@ -2421,6 +2624,7 @@ mod tests {
                 jump_query: String::new(),
                 jump_selected: 0,
                 spawn_selected: 0,
+                custom_cmd: String::new(),
                 zoomed: false,
                 show_help: false,
                 conn_state: ConnectionState::Standalone,
@@ -2429,6 +2633,7 @@ mod tests {
                 activity: ActivityLog::new(),
                 last_status: Vec::new(),
                 sidebar_nav: 0,
+                pane_rects: Vec::new(),
             }
         }
     }
@@ -2527,10 +2732,14 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
         assert!(app.quit, "Ctrl+Q quits");
 
-        // Ctrl+P enters pane mode.
+        // Ctrl+Alt+P enters pane mode (gateway — distinct from Ctrl+P which
+        // opencode uses for its command palette).
         app.quit = false;
-        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
-        assert_eq!(app.mode, InputMode::Pane, "Ctrl+P enters pane mode");
+        app.handle_key(KeyEvent::new(
+            KeyCode::Char('p'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ));
+        assert_eq!(app.mode, InputMode::Pane, "Ctrl+Alt+P enters pane mode");
 
         // In pane mode: Tab advances focus.
         app.focus = 0;
@@ -2569,20 +2778,32 @@ mod tests {
     fn ctrl_b_toggles_sidebar_visibility() {
         let mut app = App::for_test(vec![pane(0, "a")]);
         assert!(!app.sidebar_hidden, "sidebar visible by default");
-        // Ctrl+B is a global hotkey — works from any mode.
-        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
-        assert!(app.sidebar_hidden, "Ctrl+B hides the sidebar");
-        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
-        assert!(!app.sidebar_hidden, "Ctrl+B again re-shows it");
+        // Sidebar toggle moved behind the gateway: enter Pane (Ctrl+Alt+P),
+        // then press `b`. (Was a global Ctrl+B hotkey; moved to avoid
+        // colliding with agent shortcuts.)
+        app.handle_key(KeyEvent::new(
+            KeyCode::Char('p'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ));
+        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+        assert!(app.sidebar_hidden, "Pane + b hides the sidebar");
+        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+        assert!(!app.sidebar_hidden, "b again re-shows it");
     }
 
     #[test]
     fn sidebar_mode_enters_with_ctrl_s() {
         let mut app = App::for_test(vec![pane(0, "a")]);
         assert_eq!(app.mode, InputMode::Normal);
-        // Ctrl+S is a global hotkey — enters the sidebar nav menu.
-        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
-        assert_eq!(app.mode, InputMode::Sidebar, "Ctrl+S enters sidebar mode");
+        // Sidebar nav moved behind the gateway: enter Pane (Ctrl+Alt+P),
+        // then press `s`. (Was a global Ctrl+S hotkey; moved to avoid both
+        // collision with agent shortcuts and terminals' XOFF flow control.)
+        app.handle_key(KeyEvent::new(
+            KeyCode::Char('p'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ));
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert_eq!(app.mode, InputMode::Sidebar, "Pane + s enters sidebar mode");
         assert_eq!(app.sidebar_nav, 0, "selection starts at the first item");
     }
 
@@ -2751,7 +2972,7 @@ mod tests {
         // Fed agent output is painted into pane 0's body.
         assert!(text.contains("hello-world"), "fed content rendered");
         // The footer key-hints are drawn on the reserved last line.
-        assert!(text.contains("Ctrl+P"), "footer rendered");
+        assert!(text.contains("Ctrl+Alt+P"), "footer rendered");
         assert!(text.contains("quit"));
     }
 
@@ -3012,6 +3233,112 @@ mod tests {
     }
 
     #[test]
+    fn mouse_down_starts_selection_in_hit_pane() {
+        use crossterm::event::MouseEvent;
+        let mut app = App::for_test(vec![pane(0, "a")]);
+        // Give the pane some content so a selection has something to anchor on.
+        app.apply_update(AgentUpdate::Output {
+            pane_id: 0,
+            bytes: b"hello world".to_vec(),
+        });
+        // One pane filling the content area with a 1-cell rounded border, so a
+        // click at terminal (5,1) maps to inner grid (4,0) — the "hello" row.
+        app.pane_rects = vec![Rect::new(0, 0, 40, 12)];
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(
+            app.panes[0].has_selection(),
+            "Down inside a pane starts a selection"
+        );
+        assert_eq!(app.focus, 0, "Down also moves focus to the hit pane");
+    }
+
+    #[test]
+    fn mouse_drag_extends_selection() {
+        use crossterm::event::MouseEvent;
+        let mut app = App::for_test(vec![pane(0, "a")]);
+        app.apply_update(AgentUpdate::Output {
+            pane_id: 0,
+            bytes: b"hello world".to_vec(),
+        });
+        app.pane_rects = vec![Rect::new(0, 0, 40, 12)];
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 10,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(
+            app.panes[0].has_selection(),
+            "Drag while a selection is active extends it"
+        );
+    }
+
+    #[test]
+    fn mouse_up_clears_selection() {
+        use crossterm::event::MouseEvent;
+        let mut app = App::for_test(vec![pane(0, "a")]);
+        app.apply_update(AgentUpdate::Output {
+            pane_id: 0,
+            bytes: b"hello world".to_vec(),
+        });
+        app.pane_rects = vec![Rect::new(0, 0, 40, 12)];
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 10,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 10,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        // Do NOT assert clipboard success — CI has no clipboard tool; copy
+        // returns Err and pushes a warning toast, but selection is cleared
+        // regardless on Up.
+        assert!(
+            !app.panes[0].has_selection(),
+            "Up clears the selection after (attempted) copy"
+        );
+    }
+
+    #[test]
+    fn mouse_down_outside_any_pane_is_noop() {
+        use crossterm::event::MouseEvent;
+        let mut app = App::for_test(vec![pane(0, "a")]);
+        // A small pane in the corner; click far outside it.
+        app.pane_rects = vec![Rect::new(0, 0, 10, 5)];
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 50,
+            row: 50,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(
+            !app.panes[0].has_selection(),
+            "a click outside every pane is a no-op (no selection, no panic)"
+        );
+    }
+
+    #[test]
     fn focus_directional_moves_focus_on_a_grid() {
         // 4 panes ⇒ cols = ceil(sqrt(4)) = 2 ⇒ a 2×2 grid:
         //   0 1
@@ -3229,12 +3556,21 @@ mod tests {
     fn ctrl_n_spawns_a_new_pane_and_keeps_parallel_vecs_aligned() {
         let mut app = App::for_test(vec![pane(0, "a"), pane(1, "b")]);
         let before = app.panes.len();
-        // Ctrl+N opens the spawn picker; Enter spawns the selected agent.
-        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
-        assert_eq!(app.mode, InputMode::Spawn, "Ctrl+N opens spawn picker");
+        // Spawn picker moved behind the gateway: enter Pane (Ctrl+Alt+P),
+        // then press `n` to open the picker; Enter spawns the selected agent.
+        app.handle_key(KeyEvent::new(
+            KeyCode::Char('p'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ));
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert_eq!(app.mode, InputMode::Spawn, "Pane + n opens spawn picker");
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.mode, InputMode::Normal, "Enter closes the picker");
-        assert_eq!(app.panes.len(), before + 1, "Ctrl+N → Enter adds one pane");
+        assert_eq!(
+            app.panes.len(),
+            before + 1,
+            "Pane + n → Enter adds one pane"
+        );
         // Every parallel per-pane vector must stay aligned with `panes`.
         let n = app.panes.len();
         assert_eq!(app.sessions.len(), n, "sessions aligned");
@@ -3393,7 +3729,7 @@ mod tests {
         // A key RELEASE event should NOT enter pane mode (only Press does).
         app.handle_event(Event::Key(KeyEvent {
             code: KeyCode::Char('p'),
-            modifiers: KeyModifiers::CONTROL,
+            modifiers: KeyModifiers::CONTROL | KeyModifiers::ALT,
             kind: KeyEventKind::Release,
             state: crossterm::event::KeyEventState::NONE,
         }));
@@ -3554,6 +3890,64 @@ mod tests {
         assert!(
             found,
             "expected a line naming pane 'a' with an arrow or 'error'; got {lines:?}"
+        );
+    }
+
+    #[test]
+    fn spawn_options_includes_custom_command_entry() {
+        let app = App::for_test(vec![pane(0, "a")]);
+        let opts = app.spawn_options();
+        // The custom-command sentinel must be the LAST entry.
+        let last = opts
+            .last()
+            .expect("spawn_options should always have at least bash + custom");
+        assert!(
+            last.0.contains("Custom command"),
+            "last entry name should contain 'Custom command'; got {:?}",
+            last.0
+        );
+        assert!(
+            last.1.is_empty(),
+            "custom-command sentinel must have an empty command vector; got {:?}",
+            last.1
+        );
+    }
+
+    #[test]
+    fn custom_command_modal_types_and_spawns() {
+        let mut app = App::for_test(vec![pane(0, "a")]);
+        // Enter the spawn picker and navigate to the custom-command sentinel
+        // (the last entry).
+        app.mode = InputMode::Spawn;
+        app.spawn_selected = app.spawn_options().len() - 1;
+        // Enter on the sentinel switches to the text-entry modal.
+        app.handle_spawn_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert_eq!(
+            app.mode,
+            InputMode::SpawnCustom,
+            "Enter on the custom sentinel should open SpawnCustom mode"
+        );
+        assert!(
+            app.custom_cmd.is_empty(),
+            "custom_cmd should be cleared when entering SpawnCustom"
+        );
+        // Type "bash".
+        for ch in "bash".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::empty()));
+        }
+        assert_eq!(
+            app.custom_cmd, "bash",
+            "typing should accumulate into custom_cmd"
+        );
+        // Backspace pops one char.
+        app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::empty()));
+        assert_eq!(app.custom_cmd, "bas", "Backspace should pop the last char");
+        // Esc cancels back to Normal (without spawning).
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        assert_eq!(
+            app.mode,
+            InputMode::Normal,
+            "Esc should cancel SpawnCustom back to Normal"
         );
     }
 }

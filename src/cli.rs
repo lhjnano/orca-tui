@@ -466,7 +466,10 @@ fn run_attach(socket_path: &Path) -> Result<()> {
     use crate::layout::split_panes;
     use crate::pane::Pane;
     use base64::{engine::general_purpose, Engine as _};
-    use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+    use crossterm::event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        MouseEventKind,
+    };
     use crossterm::terminal::size as term_size;
     use crossterm::{
         execute,
@@ -482,7 +485,7 @@ fn run_attach(socket_path: &Path) -> Result<()> {
     // Set up terminal.
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -600,6 +603,20 @@ fn run_attach(socket_path: &Path) -> Result<()> {
                             _ => {}
                         }
                     }
+                } else if let Event::Mouse(mouse) = ev {
+                    match mouse.kind {
+                        MouseEventKind::ScrollUp => {
+                            if let Some(p) = panes.get_mut(focus) {
+                                p.scroll_up(3);
+                            }
+                        }
+                        MouseEventKind::ScrollDown => {
+                            if let Some(p) = panes.get_mut(focus) {
+                                p.scroll_down(3);
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
 
@@ -620,7 +637,11 @@ fn run_attach(socket_path: &Path) -> Result<()> {
 
     // Restore terminal.
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
 
     result
 }

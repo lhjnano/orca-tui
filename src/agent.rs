@@ -33,6 +33,16 @@ pub enum AgentKind {
     Amp,
     /// Cursor CLI (`cursor`).
     Cursor,
+    /// Paul Gauthier's `aider` AI pair-programming CLI.
+    Aider,
+    /// Block's `goose` AI agent CLI.
+    Goose,
+    /// Charm's `crush` terminal AI coding agent.
+    Crush,
+    /// Sourcegraph's `cody` agent CLI.
+    Cody,
+    /// Alibaba's Qwen Code (`qwen`) CLI.
+    Qwen,
     /// Anything else; resolved from the verbatim command.
     Generic,
 }
@@ -48,6 +58,11 @@ impl AgentKind {
             Self::Gemini => "Gemini",
             Self::Amp => "Amp",
             Self::Cursor => "Cursor",
+            Self::Aider => "Aider",
+            Self::Goose => "Goose",
+            Self::Crush => "Crush",
+            Self::Cody => "Cody",
+            Self::Qwen => "Qwen Code",
             Self::Generic => "Custom",
         }
     }
@@ -62,11 +77,16 @@ impl AgentKind {
             Self::Gemini => "gemini",
             Self::Amp => "amp",
             Self::Cursor => "cursor",
+            Self::Aider => "aider",
+            Self::Goose => "goose",
+            Self::Crush => "crush",
+            Self::Cody => "cody",
+            Self::Qwen => "qwen",
             Self::Generic => "",
         }
     }
 
-    /// The six concrete agent kinds (excludes [`Generic`]) in canonical order.
+    /// The concrete agent kinds (excludes [`Generic`]) in canonical order.
     #[must_use]
     pub fn all_known() -> &'static [AgentKind] {
         &[
@@ -76,6 +96,11 @@ impl AgentKind {
             Self::Gemini,
             Self::Amp,
             Self::Cursor,
+            Self::Aider,
+            Self::Goose,
+            Self::Crush,
+            Self::Cody,
+            Self::Qwen,
         ]
     }
 
@@ -436,10 +461,42 @@ mod tests {
     #[test]
     fn all_known_excludes_generic() {
         let known = AgentKind::all_known();
-        assert_eq!(known.len(), 6);
+        assert_eq!(known.len(), 11);
         assert!(!known.contains(&AgentKind::Generic));
         // Canonical order: Claude Code first.
         assert_eq!(known[0], AgentKind::ClaudeCode);
+        // Defensive: every known kind has a non-empty binary and display name,
+        // catching a future arm that forgets to wire up both methods.
+        for k in known {
+            assert!(!k.binary().is_empty(), "{k:?} has empty binary()");
+            assert!(
+                !k.display_name().is_empty(),
+                "{k:?} has empty display_name()"
+            );
+        }
+    }
+
+    #[test]
+    fn new_agents_classify_from_binary() {
+        // Each of the five new binaries must classify to its kind via the
+        // shared from_binary path exercised by AgentSpec::from_command.
+        let cases = [
+            ("aider", AgentKind::Aider),
+            ("goose", AgentKind::Goose),
+            ("crush", AgentKind::Crush),
+            ("cody", AgentKind::Cody),
+            ("qwen", AgentKind::Qwen),
+        ];
+        for (bin, expected) in cases {
+            let spec = AgentSpec::from_command(vec![bin.to_owned()]);
+            assert_eq!(spec.kind, expected, "binary {bin:?}");
+            assert_eq!(spec.name, expected.display_name());
+        }
+        // Path-style binaries resolve by basename too.
+        assert_eq!(
+            AgentSpec::from_command(vec!["/usr/local/bin/goose".to_owned()]).kind,
+            AgentKind::Goose
+        );
     }
 
     #[test]

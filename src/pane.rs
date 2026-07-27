@@ -32,6 +32,14 @@ const SCROLLBACK: usize = 1000;
 /// terminal).
 const DEFAULT_FG: Color = Color::Gray;
 
+/// A linear text selection in visible-grid coordinates (col, row). The two
+/// endpoints may be in any order; [`Pane::selected_text`] normalizes them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Selection {
+    start: (u16, u16), // (col, row)
+    end: (u16, u16),
+}
+
 /// One agent pane: emulator + metadata + scroll cursor.
 ///
 /// A manual `Debug` impl avoids requiring `TerminalEmulator: Debug`.
@@ -64,6 +72,9 @@ pub struct Pane {
     /// Last block title rendered, to detect header changes (the only thing that
     /// can invalidate the block layout cache besides a resize).
     last_title: String,
+    /// Active in-pane text selection (visible-grid col,row coordinates), if any.
+    /// Rendered as a reverse-video highlight; extracted by [`Pane::selected_text`].
+    selection: Option<Selection>,
 }
 
 impl fmt::Debug for Pane {
@@ -99,6 +110,7 @@ impl Pane {
             query_responder: crate::query::QueryResponder::new(),
             block: PreparedBlockState::default(),
             last_title: String::new(),
+            selection: None,
         }
     }
 
@@ -205,6 +217,83 @@ impl Pane {
     #[must_use]
     pub fn scroll(&self) -> usize {
         self.scroll
+    }
+
+    /// Begin a drag-selection at the given visible-grid cell.
+    pub fn start_selection(&mut self, col: u16, row: u16) {
+        self.selection = Some(Selection {
+            start: (col, row),
+            end: (col, row),
+        });
+    }
+
+    /// Extend the in-progress selection to the given cell (no-op if none active).
+    pub fn extend_selection(&mut self, col: u16, row: u16) {
+        if let Some(s) = &mut self.selection {
+            s.end = (col, row);
+        }
+    }
+
+    /// Clear any active selection.
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
+    /// Whether a selection is currently active (for render highlighting).
+    #[must_use]
+    pub fn has_selection(&self) -> bool {
+        self.selection.is_some()
+    }
+
+    /// Extract the selected text from the visible grid as a single `String`
+    /// (rows joined by `\n`, each row's trailing whitespace trimmed, fully-empty
+    /// trailing rows dropped). Returns `None` if there is no selection.
+    ///
+    /// The selection is treated as *linear* / in reading order: the two
+    /// endpoints are normalized to a top-left .. bottom-right range, and every
+    /// column on a middle row counts as selected (a rectangle, not just the two
+    /// endpoint columns).
+    #[must_use]
+    pub fn selected_text(&self) -> Option<String> {
+        let s = self.selection?;
+        // Normalize to reading order (top-left .. bottom-right).
+        let (sc, sr) = s.start;
+        let (ec, er) = s.end;
+        let (start_row, start_col, end_row, end_col) = if (sr, sc) <= (er, ec) {
+            (sr, sc, er, ec)
+        } else {
+            (er, ec, sr, sc)
+        };
+        let grid = self.emu.grid();
+        let mut lines: Vec<String> = Vec::new();
+        for row in start_row..=end_row {
+            let Some(row_cells) = grid.get(row as usize) else {
+                break;
+            };
+            let col_start = if row == start_row {
+                start_col as usize
+            } else {
+                0
+            };
+            let col_end_exclusive = if row == end_row {
+                (end_col as usize + 1).min(row_cells.len())
+            } else {
+                row_cells.len()
+            };
+            let mut text = String::new();
+            for c in col_start..col_end_exclusive.min(row_cells.len()) {
+                text.push_str(&row_cells[c].chars);
+            }
+            lines.push(text.trim_end().to_string());
+        }
+        // Drop trailing fully-empty lines.
+        while lines.last().map_or(false, |l| l.is_empty()) {
+            lines.pop();
+        }
+        if lines.is_empty() {
+            return None;
+        }
+        Some(lines.join("\n"))
     }
 
     /// A read-only view of the underlying emulator (for snapshot tests / Task 4).
@@ -316,6 +405,18 @@ impl Pane {
         let grid = self.emu.grid();
         let max_rows = usize::from(area.height);
         let max_cols = usize::from(area.width);
+        // Normalize the active selection once (top-left .. bottom-right) so the
+        // per-cell highlight check is a cheap range test. `Selection` is `Copy`,
+        // so this reads out without holding a borrow on `self`.
+        let sel: Option<(u16, u16, u16, u16)> = self.selection.map(|s| {
+            let (sc, sr) = s.start;
+            let (ec, er) = s.end;
+            if (sr, sc) <= (er, ec) {
+                (sr, sc, er, ec)
+            } else {
+                (er, ec, sr, sc)
+            }
+        });
         // Optional live debug: does the painted window overlap the content?
         if std::env::var("ORCA_DEBUG_LOG").is_ok() {
             let gh = grid.len();
@@ -354,6 +455,35 @@ impl Pane {
                 let cell = &row[col_idx];
                 let x = area.x.saturating_add(col_idx as u16);
                 paint_cell(buf, x, y, cell, bg_fill);
+                // Selection highlight: reverse fg/bg for cells within the active
+                // selection's normalized bounds. Applied AFTER paint_cell so it
+                // overrides the just-written colors. Uses the same (x, y) the
+                // paint call used, so the reverse targets the correct cell.
+                if let Some((sr, sc, er, ec)) = sel {
+                    let in_sel = row_idx as u16 >= sr && row_idx as u16 <= er && {
+                        // Within-row column bounds: for a single-row
+                        // selection both bounds apply; on the first row
+                        // everything from `sc` rightwards counts; on the
+                        // last row everything up to `ec` counts; middle
+                        // rows are fully selected.
+                        if row_idx as u16 == sr && row_idx as u16 == er {
+                            col_idx as u16 >= sc && col_idx as u16 <= ec
+                        } else if row_idx as u16 == sr {
+                            col_idx as u16 >= sc
+                        } else if row_idx as u16 == er {
+                            col_idx as u16 <= ec
+                        } else {
+                            true
+                        }
+                    };
+                    if in_sel {
+                        let bc = &mut buf[(x, y)];
+                        let fg = bc.fg;
+                        let bg = bc.bg;
+                        bc.set_fg(bg);
+                        bc.set_bg(fg);
+                    }
+                }
                 col_idx += if cell.wide { 2 } else { 1 };
             }
         }
@@ -597,5 +727,116 @@ mod tests {
         let act = pane.activity();
         assert!(act.is_some(), "OSC 9999 activity was captured");
         assert_eq!(act.unwrap().state, "thinking");
+    }
+
+    #[test]
+    fn selected_text_extracts_single_row() {
+        // Feed "hello world" (11 chars) which lands on row 0 cols 0..=10.
+        let mut pane = Pane::new(0, "sel", 20, 4);
+        pane.feed(b"hello world");
+        // Select the whole first row segment and assert against the ACTUAL grid
+        // content (robust to any vt100 cursor/width quirk).
+        pane.start_selection(0, 0);
+        pane.extend_selection(10, 0);
+        let expected: String = pane.emulator().grid()[0]
+            .iter()
+            .take(11)
+            .map(|c| c.chars.as_str())
+            .collect::<String>()
+            .trim_end()
+            .to_string();
+        assert_eq!(pane.selected_text().as_deref(), Some(expected.as_str()));
+        // Sanity: the printed text really is "hello world".
+        assert_eq!(pane.selected_text().as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn selected_text_normalizes_reversed_drag() {
+        // Drag right-to-left: end is top-left of start. Extraction must still
+        // return reading-order text.
+        let mut pane = Pane::new(0, "sel", 20, 4);
+        pane.feed(b"hello world");
+        pane.start_selection(10, 0); // bottom-right first
+        pane.extend_selection(0, 0); // ...then top-left
+        assert_eq!(
+            pane.selected_text().as_deref(),
+            Some("hello world"),
+            "reversed drag must normalize to reading order"
+        );
+    }
+
+    #[test]
+    fn clear_selection_empties() {
+        let mut pane = Pane::new(0, "sel", 20, 4);
+        pane.feed(b"hello world");
+        pane.start_selection(0, 0);
+        pane.extend_selection(10, 0);
+        assert!(pane.has_selection());
+        assert!(pane.selected_text().is_some());
+        pane.clear_selection();
+        assert!(!pane.has_selection(), "has_selection is false after clear");
+        assert_eq!(
+            pane.selected_text(),
+            None,
+            "selected_text is None after clear"
+        );
+    }
+
+    #[test]
+    fn selected_text_none_without_selection() {
+        let pane = Pane::new(0, "sel", 20, 4);
+        assert!(!pane.has_selection());
+        assert_eq!(pane.selected_text(), None);
+    }
+
+    #[test]
+    fn selection_highlight_reverses_cells_in_range() {
+        // Render with a selection covering row 0 cols 0..=1 ("he") and confirm
+        // those cells' fg/bg are swapped relative to an unselected render,
+        // while a cell OUTSIDE the selection (col 2 = 'l') is untouched.
+        let theme = ThemeConfig::default();
+
+        // Unselected baseline: capture the fg/bg of the first three inner cells.
+        let mut baseline = Pane::new(0, "sel", 12, 3);
+        baseline.feed(b"hello world");
+        let backend = TestBackend::new(12, 3);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| baseline.render(f, f.area(), true, &theme))
+            .expect("baseline draw");
+        let buf = term.backend().buffer();
+        // Inner area starts at (1,1) due to the 1-cell rounded border, so grid
+        // col 0 -> buffer x=1, col 1 -> buffer x=2, col 2 -> buffer x=3.
+        let (base_fg0, base_bg0) = (buf[(1, 1)].fg, buf[(1, 1)].bg);
+        let (base_fg1, base_bg1) = (buf[(2, 1)].fg, buf[(2, 1)].bg);
+        let (base_fg2, base_bg2) = (buf[(3, 1)].fg, buf[(3, 1)].bg);
+
+        // Selected: same feed, select (0,0)..(1,0) (cols 0 and 1 = 'h','e').
+        let mut pane = Pane::new(0, "sel", 12, 3);
+        pane.feed(b"hello world");
+        pane.start_selection(0, 0);
+        pane.extend_selection(1, 0);
+        let backend = TestBackend::new(12, 3);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| pane.render(f, f.area(), true, &theme))
+            .expect("selected draw");
+        let buf = term.backend().buffer();
+
+        // Cells inside the selection have swapped fg/bg.
+        assert_eq!(
+            (buf[(1, 1)].fg, buf[(1, 1)].bg),
+            (base_bg0, base_fg0),
+            "selected cell 0 has swapped fg/bg"
+        );
+        assert_eq!(
+            (buf[(2, 1)].fg, buf[(2, 1)].bg),
+            (base_bg1, base_fg1),
+            "selected cell 1 has swapped fg/bg"
+        );
+        // A cell outside the selection is untouched.
+        assert_eq!(
+            (buf[(3, 1)].fg, buf[(3, 1)].bg),
+            (base_fg2, base_bg2),
+            "unselected cell 2 keeps its original fg/bg"
+        );
     }
 }
