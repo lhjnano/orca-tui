@@ -205,27 +205,32 @@ orcatui --version
 ### Key bindings (detailed)
 
 orcatui uses **zellij-style modes**. The one key to remember:
-**`Ctrl+P` is the gateway to controlling orcatui.** In the default mode every
-other key is sent straight to the focused agent — press `Ctrl+P` first to drive
-orcatui itself.
+**`Ctrl+Alt+P` is the gateway to controlling orcatui.** In the default mode every
+other key is sent straight to the focused agent — press `Ctrl+Alt+P` first to
+drive orcatui itself. (The `Alt` modifier makes the chord byte-distinct from
+`Ctrl+P`, which inner agents like opencode use for their own command palette.)
+
+> Only `Ctrl+Alt+P` (gateway) and `Ctrl+Q` (quit) are global — everything else
+> lives behind the gateway in **Pane mode**, so it never collides with agent
+> shortcuts. (`Ctrl+Q` may need `stty -ixon` if your terminal swallows it as
+> XOFF flow control.)
 
 #### Global — work in any mode
 
 | Key | Action |
 |-----|--------|
-| `Ctrl+P` | Enter **Pane mode** (control orcatui: focus, pin, close, …) |
+| `Ctrl+Alt+P` | Enter **Pane mode** (control orcatui: focus, pin, close, …) |
 | `Ctrl+Q` | Quit orcatui |
-| `Ctrl+N` | **Spawn picker** — select which agent to add (bash, opencode, claude, …) |
-| `Ctrl+B` | **Toggle the sidebar** (adaptive: auto-hides on narrow terminals; force show/hide at any width) |
 | Mouse scroll | Scroll the focused pane's scrollback (1000 lines, 3 lines/notch) |
+| Mouse drag | Select text in a pane; release to copy to the clipboard (`pbcopy` / `xclip` / `xsel` / `wl-copy`) |
 
 #### Normal mode (default) — passthrough
 
 Every key — `Tab`, `Esc`, `Ctrl+C`, arrows, all typing — is forwarded to the
 focused agent's PTY exactly as if it were a real terminal. This is how you talk
-to the agent. To control orcatui, enter Pane mode with `Ctrl+P`.
+to the agent. To control orcatui, enter Pane mode with `Ctrl+Alt+P`.
 
-#### Pane mode (`Ctrl+P`) — navigation & control
+#### Pane mode (`Ctrl+Alt+P`) — navigation & control
 
 | Key | Action |
 |-----|--------|
@@ -234,21 +239,27 @@ to the agent. To control orcatui, enter Pane mode with `Ctrl+P`.
 | `p` | **Pin / unpin** the focused agent → sidebar "PINNED" section |
 | `x` | **Close** the focused pane (kill the agent + remove from grid) |
 | `z` | **Zoom** — toggle the focused pane to fill the screen (press again to unzoom) |
-| `?` | **Help** — full-screen keybindings reference (any key to close) |
+| `n` | **Spawn picker** — add a new agent (named catalog or a custom command) |
+| `b` | **Toggle the sidebar** (adaptive: auto-hides on narrow terminals) |
+| `s` | **Sidebar nav hub** — Activity / Tasks / Settings |
+| `a` | **Activity timeline** — fullscreen event log (state changes, errors) |
 | `/` | **Jump palette** — fuzzy-focus any agent (type to filter, Enter to focus) |
+| `?` | **Help** — full-screen keybindings reference (any key to close) |
 | `Esc` | Return to Normal (passthrough) |
 
-#### Spawn picker (`Ctrl+N`) — add a new agent
+#### Spawn picker (`n` in Pane mode) — add a new agent
 
 | Key | Action |
 |-----|--------|
-| `↑` / `↓` | Select an agent (bash, opencode, claude, codex, …) |
+| `↑` / `↓` | Select an agent (bash, opencode, claude, codex, aider, goose, …) or **Custom command…** |
+| *(Custom command…)* | Type any command + flags; `Enter` spawns it (shell-split on whitespace) |
 | `Enter` | **Spawn** the selected agent in a new pane |
 | `Esc` | Cancel |
 
-> The picker shows 2–6 agents depending on terminal height (scrolls if more).
-> Pane count is limited by terminal size — if panes would drop below 24×5
-> inner, a toast warns *"Terminal too small for another pane"*.
+> The picker lists bash + PATH-detected agents + your configured default + a
+> **Custom command…** entry (type any agent / flags). Pane count is limited by
+> terminal size — if panes would drop below 24×5 inner, a toast warns
+> *"Terminal too small for another pane"*.
 
 #### Jump mode (`/` from Pane mode) — fuzzy-focus
 
@@ -260,8 +271,8 @@ to the agent. To control orcatui, enter Pane mode with `Ctrl+P`.
 | `Esc` | Cancel and return to Pane mode |
 
 > The sidebar auto-scrolls to keep the focused agent visible. The footer always
-> shows the current mode's hints in accent color, plus a live tally:
-> `● N working · ✗ N failed · ✓ N done`.
+> shows the current mode's hints in accent color, plus a live granular tally
+> (non-zero buckets only): `● N working · ● N blocked · ● N interrupted · ● N waiting · ✗ N failed · ✓ N done`.
 
 ## Configuration
 
