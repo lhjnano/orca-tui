@@ -182,6 +182,41 @@ pub fn list_issues(repo: &RepoRef) -> Result<Vec<Issue>> {
     Ok(issues)
 }
 
+/// Fetch a single issue's full detail (including `body`) via `gh issue view`.
+///
+/// The list endpoint ([`list_issues`]) omits `body`, so this is the way to get
+/// the issue body for dispatch — `gh issue view <number> --json number,title,body`
+/// returns a single JSON object with all three fields. `gh` must be installed
+/// and authenticated.
+///
+/// *Not covered by the offline test suite* — needs `gh` + network + auth.
+pub fn fetch_issue(repo: &RepoRef, number: u64) -> Result<Issue> {
+    let repo_arg = repo.to_string();
+    let number_arg = number.to_string();
+    let json = run_gh(&[
+        "issue",
+        "view",
+        &number_arg,
+        "--repo",
+        &repo_arg,
+        "--json",
+        "number,title,body",
+    ])?;
+    let issue: Issue = serde_json::from_str(&json)
+        .with_context(|| format!("failed to parse `gh issue view` JSON: {json}"))?;
+    Ok(issue)
+}
+
+/// Render a [`PullRequest`] into a short prompt string to hand to a coding agent.
+///
+/// Includes the PR number and title, suffixed with `(PR)` so a dispatched agent
+/// (and the operator reading the pane title) can tell a PR-derived task apart
+/// from an issue-derived one. PR bodies are not fetched (`gh pr view` adds a
+/// round-trip and the title is usually enough to seed the agent).
+pub fn pr_to_prompt(pr: &PullRequest) -> String {
+    format!("#{} {} (PR)", pr.number, pr.title)
+}
+
 /// Render an [`Issue`] into a short prompt string to hand to a coding agent.
 ///
 /// Always includes the issue number and title; appends the trimmed body when
@@ -565,5 +600,40 @@ mod tests {
         let src = GitHubSource::new(repo);
         let res = src.list_open();
         assert!(res.is_err(), "list_open should fail offline: {res:?}");
+    }
+
+    // ---- fetch_issue / pr_to_prompt (Phase 2: Tasks view) -------------------
+
+    #[test]
+    fn fetch_issue_errors_for_nonexistent_repo() {
+        // Mirrors `list_issues_errors_for_nonexistent_repo`: a bogus repo makes
+        // `gh` fail everywhere (spawn error if gh is missing, non-zero exit
+        // otherwise), so asserting Err is environment-independent.
+        let repo =
+            RepoRef::parse("orcatui-nonexistent-owner/does-not-exist").expect("valid reporef");
+        let res = fetch_issue(&repo, 1);
+        assert!(res.is_err(), "fetch_issue should fail offline: {res:?}");
+    }
+
+    #[test]
+    fn pr_to_prompt_includes_number_title_and_pr_suffix() {
+        let pr = PullRequest {
+            number: 4242,
+            title: "Rewrite the renderer".to_owned(),
+            branch: Some("feat/renderer".to_owned()),
+        };
+        let prompt = pr_to_prompt(&pr);
+        // Number + title are present, plus the `(PR)` discriminator so an
+        // issue- and a PR-derived task with the same number are distinguishable.
+        assert_eq!(prompt, "#4242 Rewrite the renderer (PR)");
+        assert!(
+            prompt.contains("(PR)"),
+            "prompt must carry the PR marker: {prompt}"
+        );
+        // branch is intentionally NOT part of the prompt (kept for display only).
+        assert!(
+            !prompt.contains("feat/renderer"),
+            "branch should not leak into the agent prompt: {prompt}"
+        );
     }
 }

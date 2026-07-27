@@ -41,8 +41,9 @@ use ratatui::Terminal;
 use crate::activity::{ActivityEvent, ActivityLog};
 use crate::agent::{status_tally, AgentKind, AgentSpec, AgentState, AgentStatus};
 use crate::bus::{self, AgentUpdate, AgentUpdateReceiver, AgentUpdateSender};
-use crate::config::Config;
+use crate::config::{Config, LayoutConfig};
 use crate::coordinator::{self, Coordinator};
+use crate::integrations::RepoRef;
 use crate::layout::split_panes;
 use crate::mobile::AgentSnapshot;
 use crate::pane::Pane;
@@ -69,12 +70,30 @@ enum InputMode {
     Spawn,
     /// Full-screen activity timeline overlay: any key closes it.
     Activity,
+    /// Read-only 3-bucket agent dashboard overlay (Phase 2): groups the
+    /// live per-pane statuses into needs-attention / working / done columns.
+    /// Opened with `d` in Pane mode; any key dismisses it back to Normal.
+    Dashboard,
     /// Sidebar navigation menu: ↑↓ moves between items, Enter dispatches,
     /// Esc returns to Normal. Ctrl+S enters it from any mode.
     Sidebar,
     /// Custom-command text-entry modal (reached from the spawn picker's
     /// "Custom command…" sentinel entry): type a command, Enter spawns it.
     SpawnCustom,
+    /// Tasks view (Phase 2): repo-input text modal. Reached from the sidebar
+    /// nav hub. User types `owner/name`, Enter fetches open issues + PRs and
+    /// switches to [`InputMode::TasksList`].
+    TasksRepo,
+    /// Tasks view (Phase 2): the fetched issues/PRs list browser. ↑↓ selects,
+    /// Enter dispatches a new agent pane with the issue/PR body as the prompt,
+    /// Esc returns to Normal.
+    TasksList,
+    /// Settings overlay (Phase 2): live toggle/cycle of layout, default-agent,
+    /// and theme. ↑↓ moves the cursor, Enter/Space toggles the focused row
+    /// (applied live to the render), Esc persists the whole config to
+    /// `~/.config/orcatui/config.toml` via [`Config::save`] and returns to
+    /// Normal.
+    Settings,
 }
 
 /// The daemon connection state — drives the sidebar indicator + error handling.
@@ -135,20 +154,52 @@ const FOOTER_JUMP: &str =
     " type to filter \u{00B7} \u{2191}\u{2193} select \u{00B7} Enter: focus \u{00B7} Esc: cancel ";
 const FOOTER_SPAWN: &str = " \u{2191}\u{2193} select \u{00B7} Enter: spawn \u{00B7} Esc: cancel ";
 const FOOTER_ACTIVITY: &str = " \u{2191}\u{2193} scroll activity \u{00B7} Esc: close ";
+const FOOTER_DASHBOARD: &str = " Esc: close ";
 const FOOTER_SIDEBAR: &str =
     " \u{2191}\u{2193} navigate \u{00B7} Enter: select \u{00B7} Esc: back ";
 const FOOTER_SPAWN_CUSTOM: &str =
     " type a command \u{00B7} Enter: spawn \u{00B7} Backspace \u{00B7} Esc: cancel ";
+const FOOTER_TASKS_REPO: &str =
+    " type owner/name \u{00B7} Enter: fetch \u{00B7} Backspace \u{00B7} Esc: cancel ";
+const FOOTER_TASKS_LIST: &str =
+    " \u{2191}\u{2193} select \u{00B7} Enter: dispatch agent \u{00B7} Esc: back ";
+const FOOTER_SETTINGS: &str =
+    " \u{2191}\u{2193} select \u{00B7} Enter/Space: toggle \u{00B7} Esc: save & close ";
 const FOOTER_ZOOM: &str = " z: unzoom \u{00B7} Ctrl+Q: quit \u{00B7} Ctrl+B: sidebar ";
 
-/// Sidebar nav menu items (index == sidebar_nav). Only the first is wired in
-/// Phase 1; the others are "coming soon" placeholders.
+/// Sidebar nav menu items (index == sidebar_nav). Activity / Tasks / Settings
+/// are all implemented (Phase 1 / 2); a hypothetical future fourth item would
+/// be the next "coming soon" placeholder.
 const SIDEBAR_NAV_ITEMS: &[&str] = &["Activity", "Tasks", "Settings"];
 
 /// Practical minimum pane inner size for agents to render. Below this, the
 /// pane is too small for most TUI agents and spawning is blocked.
 const MIN_PANE_COLS: u16 = 24;
 const MIN_PANE_ROWS: u16 = 5;
+
+/// One row in the Tasks browser (Phase 2). `prompt` is the full string to hand
+/// to the dispatched agent (composed via [`crate::integrations::issue_to_prompt`]
+/// or [`crate::integrations::pr_to_prompt`]).
+#[derive(Debug, Clone)]
+struct TasksEntry {
+    /// Issue or pull request.
+    kind: TaskKind,
+    /// GitHub number (e.g. `42`).
+    number: u64,
+    /// Issue/PR title.
+    title: String,
+    /// The prompt string to pass to the agent on Enter. For issues this is the
+    /// title-only form initially (the body is fetched lazily on dispatch via
+    /// [`crate::integrations::fetch_issue`]); for PRs it is the final form.
+    prompt: String,
+}
+
+/// Which kind of GitHub item a [`TasksEntry`] represents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskKind {
+    Issue,
+    PullRequest,
+}
 
 /// The interactive Orca TUI application.
 ///
@@ -268,6 +319,25 @@ pub struct App<B: Backend = CrosstermBackend<Stdout>> {
     /// by [`App::render`] for mouse hit-testing in [`App::handle_mouse`].
     /// Empty until the first frame is drawn.
     pane_rects: Vec<Rect>,
+    /// Phase 2 — Tasks view: the in-progress `owner/name` repo string the user
+    /// is typing in [`InputMode::TasksRepo`].
+    tasks_repo_input: String,
+    /// Phase 2 — Tasks view: the parsed repo once submitted (set on Enter in
+    /// [`InputMode::TasksRepo`], consumed for lazy body-fetch on dispatch).
+    tasks_repo: Option<RepoRef>,
+    /// Phase 2 — Tasks view: the fetched issues + PRs being browsed in
+    /// [`InputMode::TasksList`]. Empty until a successful fetch.
+    tasks_items: Vec<TasksEntry>,
+    /// Phase 2 — Tasks view: selected index into `tasks_items`.
+    tasks_selected: usize,
+    /// Phase 2 — Tasks view: a fetch error (bad repo, gh failure, no network).
+    /// When `Some`, the [`InputMode::TasksList`] overlay shows the error
+    /// message + "press Esc" instead of the item list.
+    tasks_error: Option<String>,
+    /// Phase 2 — Settings overlay: the focused row index (0..=3). 0 = Sidebar,
+    /// 1 = Status bar, 2 = Default agent, 3 = Theme. Drives the ▶ cursor in
+    /// [`InputMode::Settings`].
+    settings_cursor: usize,
 }
 
 impl App {
@@ -426,6 +496,12 @@ impl App {
             last_status: Vec::new(),
             sidebar_nav: 0,
             pane_rects: Vec::new(),
+            tasks_repo_input: String::new(),
+            tasks_repo: None,
+            tasks_items: Vec::new(),
+            tasks_selected: 0,
+            tasks_error: None,
+            settings_cursor: 0,
         })
     }
 }
@@ -1468,6 +1544,51 @@ impl<B: Backend> App<B> {
         // touches `self.sidebar_nav` (borrow-checker safety on the 60fps path).
         let sidebar_open = mode == InputMode::Sidebar;
         let sidebar_selected = self.sidebar_nav;
+        // Snapshot the Tasks view state (Phase 2) BEFORE the mutable `panes`
+        // borrow so the draw closure never touches the tasks_* fields.
+        let tasks_repo_open = mode == InputMode::TasksRepo;
+        let tasks_repo_input_view = self.tasks_repo_input.clone();
+        let tasks_list_open = mode == InputMode::TasksList;
+        let tasks_items_view: Vec<TasksEntry> = if tasks_list_open {
+            self.tasks_items.clone()
+        } else {
+            Vec::new()
+        };
+        let tasks_selected_view = self.tasks_selected;
+        let tasks_error_view = self.tasks_error.clone();
+        // Snapshot the Settings overlay state (Phase 2) BEFORE the mutable
+        // `panes` borrow so the draw closure never touches the config / cursor.
+        // All four row display-values are derived here as owned Strings.
+        let settings_open = mode == InputMode::Settings;
+        let settings_cursor = self.settings_cursor;
+        let settings_sidebar_on = self.config.layout.sidebar_width > 0;
+        let settings_status_bar = self.config.layout.show_status_bar;
+        let settings_default_agent = self.config.default_agent.clone();
+        // Match the live theme against a preset by accent-hex equality; if none
+        // match (a hand-edited custom theme), label it "Custom" so the user
+        // still sees *something* informative and the cycle has a defined start.
+        let settings_theme_name = Config::theme_presets()
+            .iter()
+            .find(|(_, t)| t.accent.eq_ignore_ascii_case(&self.config.theme.accent))
+            .map(|(n, _)| (*n).to_string())
+            .unwrap_or_else(|| "Custom".to_string());
+        // Snapshot the dashboard overlay state (Phase 2) BEFORE the mutable
+        // `panes` borrow so the draw closure never touches `self.panes` (borrow-
+        // checker safety on the 60fps path). Derived from each pane's lifecycle
+        // state + OSC 9999 activity, exactly like the sidebar tallies.
+        let dashboard_open = mode == InputMode::Dashboard;
+        let dashboard_entries: Vec<(String, AgentStatus)> = if dashboard_open {
+            self.panes
+                .iter()
+                .map(|p| {
+                    let status =
+                        AgentStatus::derive(p.state(), p.activity().map(|a| a.state.as_str()));
+                    (p.name().to_string(), status)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let panes = &mut self.panes;
         let theme = &self.config.theme;
         // Agent status tallies for the footer status bar (opencode-style).
@@ -1558,7 +1679,11 @@ impl<B: Backend> App<B> {
                         InputMode::Jump => FOOTER_JUMP,
                         InputMode::Spawn => FOOTER_SPAWN,
                         InputMode::SpawnCustom => FOOTER_SPAWN_CUSTOM,
+                        InputMode::TasksRepo => FOOTER_TASKS_REPO,
+                        InputMode::TasksList => FOOTER_TASKS_LIST,
+                        InputMode::Settings => FOOTER_SETTINGS,
                         InputMode::Activity => FOOTER_ACTIVITY,
+                        InputMode::Dashboard => FOOTER_DASHBOARD,
                         InputMode::Sidebar => FOOTER_SIDEBAR,
                         InputMode::Normal => FOOTER_NORMAL,
                     }
@@ -1739,8 +1864,85 @@ impl<B: Backend> App<B> {
                     inner,
                 );
             }
-            // Sidebar nav popup (Ctrl+S): Activity / Tasks / Settings. Only the
-            // first is wired in Phase 1; the rest are "coming soon" placeholders.
+            // Agent dashboard overlay (Phase 2): a read-only 3-bucket board
+            // grouping the live per-pane statuses into needs-attention /
+            // working / done columns. Any key dismisses it back to Normal.
+            if dashboard_open {
+                use ratatui::widgets::{Block, BorderType, Borders, Clear};
+                let pop = Rect::new(
+                    total.x + 2,
+                    total.y + 1,
+                    total.width.saturating_sub(4).max(40),
+                    total.height.saturating_sub(2).max(10),
+                );
+                f.render_widget(Clear, pop);
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .style(Style::default().bg(theme.panel()))
+                    .border_style(Style::default().fg(theme.accent()))
+                    .title(
+                        Line::from(" Agent Dashboard (any key to close) ")
+                            .style(Style::default().fg(theme.accent())),
+                    );
+                f.render_widget(&block, pop);
+                let inner = block.inner(pop);
+                // Split the inner area into 3 equal columns. Using Min(1) × 3
+                // fills evenly regardless of odd widths (ratatui distributes any
+                // remainder rather than leaving a gap).
+                let cols = Layout::horizontal([
+                    Constraint::Min(1),
+                    Constraint::Min(1),
+                    Constraint::Min(1),
+                ])
+                .split(inner);
+
+                // Status → bucket mapping (see docs/ROADMAP.md Phase 2):
+                //   needs-attention = Blocked | Interrupted | Failed
+                //   working         = Working  | Waiting     | Idle
+                //   done            = Done
+                let mut needs: Vec<&str> = Vec::new();
+                let mut working_b: Vec<&str> = Vec::new();
+                let mut done: Vec<&str> = Vec::new();
+                for (name, status) in &dashboard_entries {
+                    match status {
+                        AgentStatus::Blocked | AgentStatus::Interrupted | AgentStatus::Failed => {
+                            needs.push(name.as_str());
+                        }
+                        AgentStatus::Working | AgentStatus::Waiting | AgentStatus::Idle => {
+                            working_b.push(name.as_str());
+                        }
+                        AgentStatus::Done => done.push(name.as_str()),
+                    }
+                }
+
+                let buckets: [(&str, &Vec<&str>, ratatui::style::Color); 3] = [
+                    ("needs-attention", &needs, theme.error()),
+                    ("working", &working_b, theme.success()),
+                    ("done", &done, theme.muted()),
+                ];
+                for (i, (label, members, color)) in buckets.into_iter().enumerate() {
+                    let mut lines: Vec<Line> = Vec::new();
+                    // Header: "label (count)" in the bucket color.
+                    lines.push(
+                        Line::from(format!("{label} ({})", members.len()))
+                            .style(Style::default().fg(color)),
+                    );
+                    if members.is_empty() {
+                        lines.push(Line::from("(none)").style(Style::default().fg(theme.muted())));
+                    } else {
+                        for name in members {
+                            lines.push(Line::from(*name).style(Style::default().fg(theme.fg())));
+                        }
+                    }
+                    f.render_widget(
+                        Paragraph::new(lines).style(Style::default().bg(theme.panel())),
+                        cols[i],
+                    );
+                }
+            }
+            // Sidebar nav popup (Ctrl+S / `s` in Pane mode): Activity / Tasks /
+            // Settings. All three are wired in Phase 1/2 — no placeholders remain.
             if sidebar_open {
                 use ratatui::style::Modifier;
                 use ratatui::widgets::{Block, BorderType, Borders, Clear};
@@ -1763,17 +1965,19 @@ impl<B: Backend> App<B> {
                 for (i, name) in SIDEBAR_NAV_ITEMS.iter().enumerate() {
                     let selected = i == sidebar_selected;
                     let prefix = if selected { "▶ " } else { "  " };
-                    let suffix = if i > 0 { " (soon)" } else { "" };
+                    // Activity (0), Tasks (1), and Settings (2) are all
+                    // implemented in Phase 1/2; no "(soon)" placeholders remain.
+                    let suffix = if i > 2 { " (soon)" } else { "" };
                     let label = format!("{prefix}{name}{suffix}");
                     let style = if selected {
                         Style::default()
                             .fg(theme.accent())
                             .add_modifier(Modifier::BOLD)
-                    } else if i > 0 {
-                        // Tasks/Settings placeholders — dimmed.
+                    } else if i > 2 {
+                        // Hypothetical future placeholder — dimmed.
                         Style::default().fg(theme.muted())
                     } else {
-                        // Activity (implemented) — normal weight.
+                        // Activity / Tasks (implemented) — normal weight.
                         Style::default().fg(theme.fg())
                     };
                     lines.push(Line::from(label).style(style));
@@ -1832,6 +2036,7 @@ impl<B: Backend> App<B> {
                     Line::from("  s         Sidebar nav hub"),
                     Line::from("  /         Jump palette (fuzzy-focus)"),
                     Line::from("  a         Activity timeline (overlay)"),
+                    Line::from("  d         Agent dashboard (overlay)"),
                     Line::from("  ?         This help"),
                     Line::from("  Esc       Back to Normal"),
                     Line::raw(""),
@@ -1894,6 +2099,191 @@ impl<B: Backend> App<B> {
                 ]);
                 f.render_widget(
                     Paragraph::new(line).style(Style::default().bg(theme.panel())),
+                    inner,
+                );
+            }
+            // Tasks view — repo-input modal (Phase 2). Mirrors the custom-command
+            // modal shape: a centered single-line text entry with a block cursor.
+            if tasks_repo_open {
+                use ratatui::style::Modifier;
+                use ratatui::widgets::{Block, BorderType, Borders, Clear};
+                let pop_w = total.width.min(60).max(40);
+                let pop_h = 5u16;
+                let pop_x = total.x + (total.width.saturating_sub(pop_w)) / 2;
+                let pop_y = total.y + (total.height.saturating_sub(pop_h)) / 2;
+                let pop = Rect::new(pop_x, pop_y, pop_w, pop_h);
+                f.render_widget(Clear, pop);
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(theme.accent()))
+                    .style(Style::default().bg(theme.panel()))
+                    .title(
+                        Line::from(" Tasks \u{2014} owner/name ")
+                            .style(Style::default().fg(theme.accent())),
+                    );
+                f.render_widget(&block, pop);
+                let inner = block.inner(pop);
+                let line = Line::from(vec![
+                    Span::styled("> ", Style::default().fg(theme.accent()).bg(theme.panel())),
+                    Span::styled(
+                        tasks_repo_input_view.clone(),
+                        Style::default().fg(theme.fg()).bg(theme.panel()),
+                    ),
+                    Span::styled(
+                        "_",
+                        Style::default()
+                            .fg(theme.accent())
+                            .bg(theme.panel())
+                            .add_modifier(Modifier::SLOW_BLINK),
+                    ),
+                ]);
+                f.render_widget(
+                    Paragraph::new(line).style(Style::default().bg(theme.panel())),
+                    inner,
+                );
+            }
+            // Tasks view — issues/PRs list browser (Phase 2). Mirrors the spawn
+            // picker shape: a scrollable list with ↑↓ selection + a scroll
+            // indicator, or an error message when the fetch failed.
+            if tasks_list_open {
+                use ratatui::style::Modifier;
+                use ratatui::widgets::{Block, BorderType, Borders, Clear};
+                let n = tasks_items_view.len();
+                // ~3 items per 12 rows of terminal height, clamped to [2, 8].
+                let max_visible = ((total.height / 12) as usize).clamp(2, 8);
+                let body_rows = if tasks_error_view.is_some() { 3 } else { n };
+                let visible = body_rows.min(max_visible);
+                let pop_h = (visible as u16 + 3)
+                    .min(total.height.saturating_sub(4))
+                    .max(5);
+                let pop_w = total.width.min(72).max(40);
+                let pop_x = total.x + (total.width.saturating_sub(pop_w)) / 2;
+                let pop_y = total.y + (total.height.saturating_sub(pop_h)) / 2;
+                let pop = Rect::new(pop_x, pop_y, pop_w, pop_h);
+                f.render_widget(Clear, pop);
+                let title = match &tasks_error_view {
+                    Some(_) => " Tasks \u{2014} error ",
+                    None => " Tasks \u{2014} open issues + PRs ",
+                };
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .style(Style::default().bg(theme.panel()))
+                    .border_style(Style::default().fg(theme.accent()))
+                    .title(Line::from(title).style(Style::default().fg(theme.accent())));
+                f.render_widget(&block, pop);
+                let inner = block.inner(pop);
+
+                let mut lines: Vec<Line> = Vec::new();
+                if let Some(err) = &tasks_error_view {
+                    // Fetch failure: show the error + an Esc hint, no list.
+                    lines.push(Line::from(err.as_str()).style(Style::default().fg(theme.error())));
+                    lines.push(Line::default());
+                    lines.push(
+                        Line::from("press Esc to close").style(Style::default().fg(theme.muted())),
+                    );
+                } else {
+                    // Scroll offset: keep the selected item visible (spawn-picker
+                    // pattern).
+                    let scroll = tasks_selected_view.saturating_sub(max_visible.saturating_sub(1));
+                    for (i, entry) in tasks_items_view
+                        .iter()
+                        .enumerate()
+                        .skip(scroll)
+                        .take(usize::from(inner.height))
+                    {
+                        let selected = i == tasks_selected_view;
+                        let style = if selected {
+                            Style::default()
+                                .fg(theme.accent())
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(theme.fg())
+                        };
+                        let prefix = if selected { "▶ " } else { "  " };
+                        let tag = match entry.kind {
+                            TaskKind::Issue => "issue",
+                            TaskKind::PullRequest => "pr",
+                        };
+                        // `▶ #NNN title  [issue|pr]` — tag right-aligned-ish by
+                        // a fixed 2-space gap (titles vary in width).
+                        lines.push(
+                            Line::from(format!(
+                                "{prefix}#{:<4} {}  [{tag}]",
+                                entry.number, entry.title
+                            ))
+                            .style(style),
+                        );
+                    }
+                    // Scroll indicator (only when there are more items than
+                    // visible and no error).
+                    if n > max_visible {
+                        let more_below = tasks_selected_view + 1 < n;
+                        let more_above = scroll > 0;
+                        let indicator = match (more_above, more_below) {
+                            (true, true) => " \u{2191}\u{2193} more ",
+                            (true, false) => " \u{2191} end ",
+                            (false, true) => " \u{2193} more ",
+                            (false, false) => "",
+                        };
+                        if !indicator.is_empty() {
+                            lines.push(
+                                Line::from(indicator).style(Style::default().fg(theme.muted())),
+                            );
+                        }
+                    }
+                }
+                f.render_widget(
+                    Paragraph::new(lines).style(Style::default().bg(theme.panel())),
+                    inner,
+                );
+            }
+            // Settings overlay (Phase 2): four toggle/cycle rows. Mirrors the
+            // spawn-picker shape — a centered rounded box with a ▶ cursor.
+            // Changes are applied live to `self.config` by `toggle_setting`;
+            // this render just reflects the current values.
+            if settings_open {
+                use ratatui::style::Modifier;
+                use ratatui::widgets::{Block, BorderType, Borders, Clear};
+                let rows = [
+                    ("Sidebar", if settings_sidebar_on { "on" } else { "off" }),
+                    ("Status bar", if settings_status_bar { "on" } else { "off" }),
+                    ("Default agent", settings_default_agent.as_str()),
+                    ("Theme", settings_theme_name.as_str()),
+                ];
+                let pop_h = (rows.len() as u16 + 3)
+                    .min(total.height.saturating_sub(4))
+                    .max(5);
+                let pop_w = total.width.min(44).max(32);
+                let pop_x = total.x + (total.width.saturating_sub(pop_w)) / 2;
+                let pop_y = total.y + (total.height.saturating_sub(pop_h)) / 2;
+                let pop = Rect::new(pop_x, pop_y, pop_w, pop_h);
+                f.render_widget(Clear, pop);
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .style(Style::default().bg(theme.panel()))
+                    .border_style(Style::default().fg(theme.accent()))
+                    .title(Line::from(" Settings ").style(Style::default().fg(theme.accent())));
+                f.render_widget(&block, pop);
+                let inner = block.inner(pop);
+
+                let mut lines: Vec<Line> = Vec::new();
+                for (i, (label, value)) in rows.iter().enumerate() {
+                    let selected = i == settings_cursor;
+                    let prefix = if selected { "\u{25B6} " } else { "  " };
+                    let style = if selected {
+                        Style::default()
+                            .fg(theme.accent())
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(theme.fg())
+                    };
+                    lines.push(Line::from(format!("{prefix}{label}: {value}")).style(style));
+                }
+                f.render_widget(
+                    Paragraph::new(lines).style(Style::default().bg(theme.panel())),
                     inner,
                 );
             }
@@ -1981,6 +2371,10 @@ impl<B: Backend> App<B> {
                 }
                 // `a` opens the full-screen activity timeline overlay.
                 KeyCode::Char('a') => self.mode = InputMode::Activity,
+                // `d` opens the read-only 3-bucket agent dashboard overlay
+                // (Phase 2): groups live statuses into needs-attention /
+                // working / done columns. Any key dismisses it.
+                KeyCode::Char('d') => self.mode = InputMode::Dashboard,
                 // `n` opens the spawn picker (moved from global Ctrl+N to
                 // avoid colliding with agent shortcuts).
                 KeyCode::Char('n') => {
@@ -2002,6 +2396,9 @@ impl<B: Backend> App<B> {
             // Activity overlay: any key dismisses it (back to Normal), mirroring
             // the Help overlay's "any key to close" contract.
             InputMode::Activity => self.mode = InputMode::Normal,
+            // Dashboard overlay (Phase 2): read-only status board. Any key
+            // dismisses it back to Normal, mirroring the Activity/Help contract.
+            InputMode::Dashboard => self.mode = InputMode::Normal,
             InputMode::Sidebar => match key.code {
                 KeyCode::Esc => self.mode = InputMode::Normal,
                 KeyCode::Up => {
@@ -2016,8 +2413,26 @@ impl<B: Backend> App<B> {
                 }
                 KeyCode::Enter => match self.sidebar_nav {
                     0 => self.mode = InputMode::Activity,
+                    1 => {
+                        // Phase 2: Tasks view — reset state and open the
+                        // repo-input modal. The fetch runs on Enter (see
+                        // `handle_tasks_repo_key`).
+                        self.tasks_repo_input.clear();
+                        self.tasks_items.clear();
+                        self.tasks_repo = None;
+                        self.tasks_selected = 0;
+                        self.tasks_error = None;
+                        self.mode = InputMode::TasksRepo;
+                    }
+                    2 => {
+                        // Phase 2: Settings overlay — reset the cursor and open
+                        // the live toggle/cycle panel. Persistence runs on Esc
+                        // (see `handle_settings_key`).
+                        self.settings_cursor = 0;
+                        self.mode = InputMode::Settings;
+                    }
                     _ => {
-                        // Tasks / Settings are not implemented in Phase 1.
+                        // Any future nav item beyond Settings stays a stub.
                         let name = SIDEBAR_NAV_ITEMS[self.sidebar_nav];
                         self.toasts.push(crate::toast::Toast::info(format!(
                             "{name} \u{2014} coming soon"
@@ -2060,6 +2475,9 @@ impl<B: Backend> App<B> {
                 }
                 _ => {}
             },
+            InputMode::TasksRepo => self.handle_tasks_repo_key(key),
+            InputMode::TasksList => self.handle_tasks_list_key(key),
+            InputMode::Settings => self.handle_settings_key(key),
         }
     }
 
@@ -2109,6 +2527,269 @@ impl<B: Backend> App<B> {
             .filter(|(_, p)| q.is_empty() || p.name().to_ascii_lowercase().contains(&q))
             .map(|(i, _)| i)
             .collect()
+    }
+
+    /// Phase 2 — Tasks view: repo-input modal key handling. Type `owner/name`,
+    /// Enter parses + fetches open issues + PRs (synchronously for v1; the gh
+    /// CLI is sub-second so this is acceptable — async background fetch is a
+    /// documented follow-up), Backspace deletes, Esc cancels.
+    fn handle_tasks_repo_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => self.mode = InputMode::Normal,
+            KeyCode::Backspace => {
+                self.tasks_repo_input.pop();
+            }
+            KeyCode::Enter => {
+                // Parse the repo reference. On error, surface the message and
+                // stay in the repo-input modal so the user can fix the typo.
+                match RepoRef::parse(&self.tasks_repo_input) {
+                    Ok(repo) => {
+                        self.tasks_repo = Some(repo.clone());
+                        // v1: synchronous fetch. gh is sub-second; a background
+                        // async fetch (tokio task + event-channel redraw) is a
+                        // follow-up noted in docs/ROADMAP.md §2.
+                        let res = self.fetch_tasks(&repo);
+                        match res {
+                            Ok(items) => {
+                                self.tasks_items = items;
+                                self.tasks_selected = 0;
+                                self.tasks_error = None;
+                                self.mode = InputMode::TasksList;
+                            }
+                            Err(e) => {
+                                // Fetch failed: switch to the list overlay
+                                // anyway, which renders the error + Esc hint.
+                                self.tasks_items = Vec::new();
+                                self.tasks_selected = 0;
+                                self.tasks_error = Some(format!("{e:#}"));
+                                self.mode = InputMode::TasksList;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        self.tasks_error = Some(format!("{e:#}"));
+                        self.toasts
+                            .push(crate::toast::Toast::warning(format!("{e:#}")));
+                    }
+                }
+            }
+            KeyCode::Char(c) if !ctrl => {
+                self.tasks_repo_input.push(c);
+            }
+            _ => {}
+        }
+    }
+
+    /// Phase 2 — Tasks view: fetch open issues + PRs for `repo` and merge them
+    /// into a single [`Vec<TasksEntry>`] sorted by number ascending. Issues
+    /// store a title-only prompt initially (body is fetched lazily on
+    /// dispatch); PRs store the final `pr_to_prompt` form.
+    fn fetch_tasks(&self, repo: &RepoRef) -> anyhow::Result<Vec<TasksEntry>> {
+        use crate::integrations::{issue_to_prompt, list_issues, list_pull_requests, pr_to_prompt};
+        let mut items: Vec<TasksEntry> = Vec::new();
+        // Issues — body is None from the list endpoint; the issue_to_prompt
+        // form here is title-only. The real body is fetched on Enter via
+        // `integrations::fetch_issue` so the dispatch prompt includes it.
+        let issues = list_issues(repo).context("fetching open issues via `gh issue list`")?;
+        for iss in issues {
+            // Build a body-less copy for the initial prompt; the lazy fetch
+            // replaces this with the full-body prompt on dispatch.
+            let title_only = crate::integrations::Issue {
+                number: iss.number,
+                title: iss.title.clone(),
+                body: None,
+            };
+            items.push(TasksEntry {
+                kind: TaskKind::Issue,
+                number: iss.number,
+                title: iss.title,
+                prompt: issue_to_prompt(&title_only),
+            });
+        }
+        // Pull requests — pr_to_prompt is the final form (no lazy body fetch).
+        let prs = list_pull_requests(repo).context("fetching open PRs via `gh pr list`")?;
+        for pr in prs {
+            // Borrow `pr` for the prompt before partially moving `pr.title`.
+            let prompt = pr_to_prompt(&pr);
+            items.push(TasksEntry {
+                kind: TaskKind::PullRequest,
+                number: pr.number,
+                title: pr.title,
+                prompt,
+            });
+        }
+        // Sort ascending by number so the list is stable + scannable.
+        items.sort_by_key(|e| e.number);
+        Ok(items)
+    }
+
+    /// Phase 2 — Tasks view: issues/PRs list browser key handling. ↑↓ moves
+    /// the selection (clamped), Enter dispatches a new agent pane with the
+    /// issue/PR body as the prompt, Esc returns to Normal.
+    fn handle_tasks_list_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.tasks_error = None;
+                self.mode = InputMode::Normal;
+            }
+            KeyCode::Up => {
+                if self.tasks_selected > 0 {
+                    self.tasks_selected -= 1;
+                }
+            }
+            KeyCode::Down => {
+                let n = self.tasks_items.len();
+                if n > 0 && self.tasks_selected + 1 < n {
+                    self.tasks_selected += 1;
+                }
+            }
+            KeyCode::Enter => {
+                // Nothing to dispatch if the list is empty (e.g. a fetch error
+                // left tasks_items empty and the overlay is showing the error).
+                let Some(entry) = self.tasks_items.get(self.tasks_selected).cloned() else {
+                    return;
+                };
+                if !self.can_spawn_pane() {
+                    self.toasts.push(crate::toast::Toast::warning(
+                        "Terminal too small for another pane".to_string(),
+                    ));
+                    return;
+                }
+                // For issues, lazily enrich the prompt with the real body so
+                // the dispatched agent gets the full issue text. PRs already
+                // carry their final prompt. On body-fetch failure, fall back
+                // to the stored title-only prompt + warn the operator.
+                let final_prompt = match entry.kind {
+                    TaskKind::PullRequest => entry.prompt.clone(),
+                    TaskKind::Issue => {
+                        if let Some(repo) = self.tasks_repo.clone() {
+                            match crate::integrations::fetch_issue(&repo, entry.number) {
+                                Ok(full) => crate::integrations::issue_to_prompt(&full),
+                                Err(e) => {
+                                    self.toasts.push(crate::toast::Toast::warning(format!(
+                                        "could not fetch issue body: {e:#} \u{2014} using title only"
+                                    )));
+                                    entry.prompt.clone()
+                                }
+                            }
+                        } else {
+                            // No stored repo (shouldn't happen — set on
+                            // TasksRepo submit). Fall back to the title-only
+                            // prompt rather than blocking dispatch.
+                            entry.prompt.clone()
+                        }
+                    }
+                };
+                let agent = self.config.default_agent.clone();
+                let mut spec = AgentSpec::from_command(vec![agent, final_prompt]);
+                spec.name = format!(
+                    "{}-#{}",
+                    match entry.kind {
+                        TaskKind::Issue => "issue",
+                        TaskKind::PullRequest => "pr",
+                    },
+                    entry.number
+                );
+                let idx = self.spawn_one(spec);
+                self.focus = idx;
+                self.mode = InputMode::Normal;
+            }
+            _ => {}
+        }
+    }
+
+    /// The fixed list of selectable default-agent binaries, in cycle order.
+    /// Mirrors the spawn-picker agent registry — `bash` first (matches the
+    /// Config default), then the AI coding agents.
+    const SETTINGS_AGENTS: &'static [&'static str] =
+        &["bash", "opencode", "claude", "codex", "gemini", "aider"];
+
+    /// Phase 2 — Settings overlay key handling. ↑↓ moves the cursor (clamped
+    /// to 0..=3), Enter OR Space toggles/cycles the focused row LIVE (the very
+    /// next render reflects it), Esc persists the whole config via
+    /// [`Config::save`] and returns to Normal.
+    ///
+    /// Persistence is best-effort: on IO failure (e.g. no writable config dir
+    /// in a sandboxed test environment) a warning toast is queued but the mode
+    /// still returns to Normal so the user isn't trapped in the overlay.
+    fn handle_settings_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                // Persist the whole (possibly mutated) config. A failure here
+                // is non-fatal — warn + close so the user isn't stuck.
+                match self.config.save() {
+                    Ok(()) => self
+                        .toasts
+                        .push(crate::toast::Toast::success("Settings saved".to_string())),
+                    Err(e) => self.toasts.push(crate::toast::Toast::warning(format!(
+                        "config save failed: {e:#}"
+                    ))),
+                }
+                self.mode = InputMode::Normal;
+            }
+            KeyCode::Up => {
+                if self.settings_cursor > 0 {
+                    self.settings_cursor -= 1;
+                }
+            }
+            KeyCode::Down => {
+                if self.settings_cursor < 3 {
+                    self.settings_cursor += 1;
+                }
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                self.toggle_setting(self.settings_cursor);
+            }
+            _ => {}
+        }
+    }
+
+    /// Apply a single settings-row toggle LIVE to `self.config`. Row 0 toggles
+    /// the sidebar (sidebar_width 0 hides it via the existing render logic; the
+    /// default width 26 is restored on the next toggle). Row 1 flips the status
+    /// bar. Row 2 cycles the default agent through [`SETTINGS_AGENTS`]. Row 3
+    /// cycles the theme through [`Config::theme_presets`] (matched by accent).
+    fn toggle_setting(&mut self, row: usize) {
+        match row {
+            0 => {
+                // Sidebar toggle: 0 hides it; non-zero restores the default
+                // width. `sidebar_hidden` (the Ctrl+B user override) is left
+                // alone — it's a separate, render-time concern.
+                if self.config.layout.sidebar_width > 0 {
+                    self.config.layout.sidebar_width = 0;
+                } else {
+                    self.config.layout.sidebar_width = LayoutConfig::default().sidebar_width;
+                }
+            }
+            1 => {
+                self.config.layout.show_status_bar = !self.config.layout.show_status_bar;
+            }
+            2 => {
+                // Cycle the default agent through the fixed list, wrapping.
+                let cur = self.config.default_agent.clone();
+                let next = Self::SETTINGS_AGENTS
+                    .iter()
+                    .position(|a| a.eq_ignore_ascii_case(&cur))
+                    .map(|i| Self::SETTINGS_AGENTS[(i + 1) % Self::SETTINGS_AGENTS.len()])
+                    .unwrap_or(Self::SETTINGS_AGENTS[0]);
+                self.config.default_agent = (*next).to_string();
+            }
+            3 => {
+                // Cycle the theme through the presets. Match the current theme
+                // by accent-hex equality (presets use distinct accents); if the
+                // user has a custom theme that matches no preset, start the
+                // cycle from index 0 (GitHub Dark).
+                let presets = Config::theme_presets();
+                let idx = presets
+                    .iter()
+                    .position(|(_, t)| t.accent.eq_ignore_ascii_case(&self.config.theme.accent))
+                    .map(|i| (i + 1) % presets.len())
+                    .unwrap_or(0);
+                self.config.theme = presets[idx].1.clone();
+            }
+            _ => {}
+        }
     }
 
     /// Normal-mode passthrough: forward the key to the focused agent's PTY as
@@ -2634,6 +3315,12 @@ mod tests {
                 last_status: Vec::new(),
                 sidebar_nav: 0,
                 pane_rects: Vec::new(),
+                tasks_repo_input: String::new(),
+                tasks_repo: None,
+                tasks_items: Vec::new(),
+                tasks_selected: 0,
+                tasks_error: None,
+                settings_cursor: 0,
             }
         }
     }
@@ -2842,27 +3529,80 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_enter_stub_shows_toast_and_closes() {
-        // Tasks (index 1).
-        {
-            let mut app = App::for_test(vec![pane(0, "a")]);
-            app.mode = InputMode::Sidebar;
-            app.sidebar_nav = 1;
-            assert!(app.toasts.is_empty(), "no toast before dispatch");
-            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-            assert_eq!(app.mode, InputMode::Normal, "Tasks closes the sidebar");
-            assert!(!app.toasts.is_empty(), "a 'coming soon' toast is queued");
-        }
-        // Settings (index 2).
-        {
-            let mut app = App::for_test(vec![pane(0, "a")]);
-            app.mode = InputMode::Sidebar;
-            app.sidebar_nav = 2;
-            assert!(app.toasts.is_empty(), "no toast before dispatch");
-            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-            assert_eq!(app.mode, InputMode::Normal, "Settings closes the sidebar");
-            assert!(!app.toasts.is_empty(), "a 'coming soon' toast is queued");
-        }
+    fn sidebar_enter_tasks_opens_repo_input() {
+        // Phase 2: Tasks (index 1) is implemented — Enter opens the repo-input
+        // modal (TasksRepo) and resets the Tasks state, with NO toast.
+        let mut app = App::for_test(vec![pane(0, "a")]);
+        app.mode = InputMode::Sidebar;
+        app.sidebar_nav = 1;
+        // Dirty the state first to prove Enter resets it.
+        app.tasks_repo_input = "stale".to_string();
+        app.tasks_selected = 9;
+        app.tasks_error = Some("stale error".to_string());
+        assert!(app.toasts.is_empty(), "no toast before dispatch");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.mode,
+            InputMode::TasksRepo,
+            "Tasks opens the repo-input modal"
+        );
+        assert!(
+            app.tasks_repo_input.is_empty(),
+            "repo input cleared on open"
+        );
+        assert_eq!(app.tasks_selected, 0, "selection reset on open");
+        assert!(app.tasks_error.is_none(), "error cleared on open");
+        assert!(app.toasts.is_empty(), "no toast for an implemented feature");
+    }
+
+    #[test]
+    fn sidebar_enter_settings_opens_overlay() {
+        // Phase 2: Settings (index 2) is implemented — Enter opens the settings
+        // overlay (cursor reset to row 0), with NO toast.
+        let mut app = App::for_test(vec![pane(0, "a")]);
+        app.mode = InputMode::Sidebar;
+        app.sidebar_nav = 2;
+        app.settings_cursor = 9; // dirty to prove Enter resets it
+        assert!(app.toasts.is_empty(), "no toast before dispatch");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.mode, InputMode::Settings, "Settings opens the overlay");
+        assert_eq!(app.settings_cursor, 0, "cursor reset to the first row");
+        assert!(app.toasts.is_empty(), "no toast for an implemented feature");
+    }
+
+    #[test]
+    fn settings_overlay_toggles_live_and_closes_on_esc() {
+        // Phase 2: Settings overlay applies each toggle LIVE to self.config.
+        // Toggling the status-bar row (cursor 1) flips show_status_bar; Esc
+        // persists (best-effort) and returns to Normal regardless of save
+        // outcome (the test env may lack a writable config dir, so only the
+        // mode transition — which always happens — is asserted).
+        let mut app = App::for_test(vec![pane(0, "a")]);
+        app.mode = InputMode::Settings;
+        app.settings_cursor = 1; // status bar row
+        assert!(
+            app.config.layout.show_status_bar,
+            "status bar on by default"
+        );
+        // Enter toggles the focused row live.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            !app.config.layout.show_status_bar,
+            "status bar toggled off live"
+        );
+        // Space also toggles (Enter | Space both map to toggle_setting).
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert!(
+            app.config.layout.show_status_bar,
+            "status bar toggled back on via Space"
+        );
+        // Esc persists (best-effort) and returns to Normal.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(
+            app.mode,
+            InputMode::Normal,
+            "Esc closes the overlay and returns to Normal"
+        );
     }
 
     #[test]
@@ -2982,17 +3722,23 @@ mod tests {
         // marks the selected one with the ▶ marker.
         let mut app = App::for_test(vec![pane(0, "alpha")]);
         app.mode = InputMode::Sidebar;
-        app.sidebar_nav = 1; // Tasks (a "coming soon" placeholder)
+        app.sidebar_nav = 1; // Tasks (now implemented in Phase 2)
         app.render().expect("render into TestBackend");
 
         let text = buffer_text(&app);
-        // Title + every item label, with placeholders tagged "(soon)".
+        // Title + every item label. Activity, Tasks, and Settings are all
+        // implemented in Phase 1/2 — none carry a "(soon)" tag.
         assert!(text.contains("Navigate"), "popup title rendered");
         assert!(text.contains("Activity"), "first item rendered");
-        assert!(text.contains("Tasks (soon)"), "Tasks placeholder rendered");
+        assert!(text.contains("Tasks"), "Tasks item rendered");
         assert!(
-            text.contains("Settings (soon)"),
-            "Settings placeholder rendered"
+            !text.contains("Tasks (soon)"),
+            "Tasks is implemented — no (soon) tag"
+        );
+        assert!(text.contains("Settings"), "Settings item rendered");
+        assert!(
+            !text.contains("Settings (soon)"),
+            "Settings is implemented — no (soon) tag"
         );
         // The selected row (index 1 → Tasks) carries the ▶ marker.
         assert!(
@@ -3949,5 +4695,43 @@ mod tests {
             InputMode::Normal,
             "Esc should cancel SpawnCustom back to Normal"
         );
+    }
+
+    #[test]
+    fn dashboard_groups_panes_by_status_bucket() {
+        // Three panes in distinct lifecycle states map to the three dashboard
+        // buckets: Running→Working, Done→done, Failed→needs-attention.
+        let mut working_pane = pane(0, "alpha");
+        working_pane.set_state(AgentState::Running); // Working bucket
+        let mut done_pane = pane(1, "beta");
+        done_pane.set_state(AgentState::Done(Some(0))); // done bucket
+        let mut failed_pane = pane(2, "gamma");
+        failed_pane.set_state(AgentState::Failed("boom".into())); // needs-attention bucket
+
+        let mut app = App::for_test(vec![working_pane, done_pane, failed_pane]);
+        app.mode = InputMode::Dashboard;
+        app.render().expect("render into TestBackend");
+
+        let text = buffer_text(&app);
+        // The overlay title + all three column headers render.
+        assert!(text.contains("Agent Dashboard"), "overlay title rendered");
+        assert!(
+            text.contains("needs-attention"),
+            "needs-attention column header rendered"
+        );
+        assert!(text.contains("working"), "working column header rendered");
+        assert!(text.contains("done"), "done column header rendered");
+        // Each pane name lands in its bucket: alpha (Working), beta (Done),
+        // gamma (Failed) all appear somewhere in the overlay text.
+        assert!(text.contains("alpha"), "Working pane name rendered");
+        assert!(text.contains("beta"), "Done pane name rendered");
+        assert!(text.contains("gamma"), "Failed pane name rendered");
+        // The counts appear in the headers: each bucket has exactly 1 member.
+        assert!(
+            text.contains("needs-attention (1)"),
+            "needs-attention count is 1"
+        );
+        assert!(text.contains("working (1)"), "working count is 1");
+        assert!(text.contains("done (1)"), "done count is 1");
     }
 }

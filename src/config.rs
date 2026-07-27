@@ -92,6 +92,125 @@ impl Config {
             .with_context(|| format!("reading config {}", path.display()))?;
         toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))
     }
+
+    /// Persist the full configuration to `config_path()` **atomically** so a
+    /// crash mid-write can never leave a half-written config behind.
+    ///
+    /// Writes to `<config_path>.tmp`, then `std::fs::rename`s it over the
+    /// target (rename is atomic on the same filesystem). The parent directory
+    /// is created first so a first-time save on a fresh machine works.
+    ///
+    /// Used by the Settings overlay (Esc closes + persists the live-mutated
+    /// config). Auth/token storage is NOT part of this schema (the `gh` CLI
+    /// owns credentials), so full serialization is safe — there are no secret
+    /// fields to skip.
+    ///
+    /// # Errors
+    /// Returns an error if no config directory can be resolved (neither
+    /// `$XDG_CONFIG_HOME` nor `$HOME` is set), or if serialization / the
+    /// temp-file write / the rename fails.
+    pub fn save(&self) -> Result<()> {
+        let path = config_path().ok_or_else(|| {
+            anyhow::anyhow!(
+                "no config directory (HOME/XDG_CONFIG_HOME unset) — cannot persist settings"
+            )
+        })?;
+        let text = toml::to_string(self).context("serializing config")?;
+        // Create the parent dir first so a first-time save on a machine with no
+        // ~/.config/orcatui/ works (create_dir_all is a no-op if it exists).
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating config dir {}", parent.display()))?;
+        }
+        // Atomic write: stage a sibling temp file, then rename over the target.
+        // `rename` is atomic when src + dst live on the same filesystem, which
+        // is guaranteed here because the temp file is in the same directory.
+        let tmp = path.with_extension("toml.tmp");
+        std::fs::write(&tmp, &text)
+            .with_context(|| format!("writing temp config {}", tmp.display()))?;
+        std::fs::rename(&tmp, &path)
+            .with_context(|| format!("renaming temp config into {}", path.display()))?;
+        Ok(())
+    }
+
+    /// Named theme presets offered by the Settings overlay, in a fixed order.
+    /// Each entry is `(display_name, fully-populated ThemeConfig)`. The first
+    /// entry (`"GitHub Dark"`) mirrors [`ThemeConfig::default`] so cycling back
+    /// to index 0 restores the out-of-the-box look.
+    ///
+    /// The Settings overlay matches the current theme against these presets by
+    /// accent-hex equality (a cheap identity proxy — the presets all use
+    /// distinct accents, so a custom theme with a coincidentally-matching
+    /// accent still lands on a sensible cycle position).
+    #[must_use]
+    pub fn theme_presets() -> Vec<(&'static str, ThemeConfig)> {
+        vec![
+            (
+                "GitHub Dark",
+                ThemeConfig {
+                    background: "#0d1117".into(),
+                    foreground: "#e6edf3".into(),
+                    accent: "#58a6ff".into(),
+                    success: "#3fb950".into(),
+                    warning: "#d29922".into(),
+                    error: "#f85149".into(),
+                    background_panel: "#161b22".into(),
+                    background_element: "#21262d".into(),
+                    border: "#30363d".into(),
+                    border_active: "#58a6ff".into(),
+                    text_muted: "#8b949e".into(),
+                },
+            ),
+            (
+                "GitHub Light",
+                ThemeConfig {
+                    background: "#ffffff".into(),
+                    foreground: "#1f2328".into(),
+                    accent: "#0969da".into(),
+                    success: "#1a7f37".into(),
+                    warning: "#9a6700".into(),
+                    error: "#cf222e".into(),
+                    background_panel: "#f6f8fa".into(),
+                    background_element: "#eaeef2".into(),
+                    border: "#d0d7de".into(),
+                    border_active: "#0969da".into(),
+                    text_muted: "#656d76".into(),
+                },
+            ),
+            (
+                "Dracula",
+                ThemeConfig {
+                    background: "#282a36".into(),
+                    foreground: "#f8f8f2".into(),
+                    accent: "#bd93f9".into(),
+                    success: "#50fa7b".into(),
+                    warning: "#f1fa8c".into(),
+                    error: "#ff5555".into(),
+                    background_panel: "#21222c".into(),
+                    background_element: "#2f313d".into(),
+                    border: "#44475a".into(),
+                    border_active: "#bd93f9".into(),
+                    text_muted: "#6272a4".into(),
+                },
+            ),
+            (
+                "Nord",
+                ThemeConfig {
+                    background: "#2e3440".into(),
+                    foreground: "#d8dee9".into(),
+                    accent: "#88c0d0".into(),
+                    success: "#a3be8c".into(),
+                    warning: "#ebcb8b".into(),
+                    error: "#bf616a".into(),
+                    background_panel: "#3b4252".into(),
+                    background_element: "#434c5e".into(),
+                    border: "#4c566a".into(),
+                    border_active: "#88c0d0".into(),
+                    text_muted: "#81a1c1".into(),
+                },
+            ),
+        ]
+    }
 }
 
 /// Layout options.
@@ -515,6 +634,122 @@ border = "#abcdef"
         assert_eq!(
             cfg_no_env.default_agent, "bash",
             "line 72: no HOME/XDG → config_path None → default"
+        );
+    }
+
+    #[test]
+    fn save_round_trips_through_load() {
+        // Mutate a Config to values that differ from the defaults, then verify
+        // a serialize → parse round-trip preserves them. This exercises the
+        // `save()` serialization shape without depending on a writable real
+        // config dir (the full save-to-disk path is covered by the env-scoped
+        // test below).
+        let mut cfg = Config::default();
+        cfg.theme.accent = "#ff00ff".into();
+        cfg.layout.sidebar_width = 30;
+        cfg.default_agent = "codex".into();
+        cfg.layout.show_status_bar = false;
+
+        let text = toml::to_string(&cfg).expect("serialize");
+        let back: Config = toml::from_str(&text).expect("parse");
+        assert_eq!(back.theme.accent, "#ff00ff", "custom accent round-trips");
+        assert_eq!(
+            back.theme.accent(),
+            Color::Rgb(0xff, 0x00, 0xff),
+            "round-tripped accent parses to the expected RGB"
+        );
+        assert_eq!(back.layout.sidebar_width, 30, "sidebar_width round-trips");
+        assert_eq!(back.default_agent, "codex", "default_agent round-trips");
+        assert!(!back.layout.show_status_bar, "show_status_bar round-trips");
+
+        // Full save() → load() on disk, scoped to a temp XDG dir so the
+        // developer's real config is never touched. Mirrors the env-manipulation
+        // style of `load_or_default_and_config_path_branches` (restore env
+        // BEFORE asserting so a panic can't leak the override).
+        let xdg_prev = std::env::var_os("XDG_CONFIG_HOME");
+        let temp = std::env::temp_dir().join(format!("orca-cfg-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::env::set_var("XDG_CONFIG_HOME", &temp);
+
+        let save_result = cfg.save();
+        let load_result = if save_result.is_ok() {
+            Some(Config::load_or_default())
+        } else {
+            None
+        };
+
+        // Restore env + clean up BEFORE asserting (panic-safe).
+        match &xdg_prev {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&temp);
+
+        save_result.expect("save() succeeded with XDG set to a temp dir");
+        let loaded = load_result.expect("load happened after a successful save");
+        assert_eq!(
+            loaded.theme.accent, "#ff00ff",
+            "save wrote the custom accent"
+        );
+        assert_eq!(loaded.layout.sidebar_width, 30, "save wrote sidebar_width");
+        assert_eq!(loaded.default_agent, "codex", "save wrote default_agent");
+    }
+
+    #[test]
+    fn save_returns_err_without_config_dir() {
+        // When neither HOME nor XDG_CONFIG_HOME is set, config_path() is None
+        // and save() must surface a clear error rather than panic. Env vars
+        // are restored before asserting (panic-safe).
+        let home_prev = std::env::var_os("HOME");
+        let xdg_prev = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::remove_var("XDG_CONFIG_HOME");
+        std::env::remove_var("HOME");
+
+        let result = Config::default().save();
+
+        match &home_prev {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        match &xdg_prev {
+            Some(x) => std::env::set_var("XDG_CONFIG_HOME", x),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+
+        assert!(
+            result.is_err(),
+            "save() errors when no config dir can be resolved"
+        );
+    }
+
+    #[test]
+    fn theme_presets_are_distinct_and_named() {
+        let presets = Config::theme_presets();
+        assert_eq!(presets.len(), 4, "exactly four presets ship");
+        // Names are unique.
+        let names: Vec<&str> = presets.iter().map(|(n, _)| *n).collect();
+        let unique: std::collections::HashSet<&str> = names.iter().copied().collect();
+        assert_eq!(names.len(), unique.len(), "preset names are unique");
+        // Order is part of the contract (the overlay cycles by index).
+        assert_eq!(
+            names,
+            vec!["GitHub Dark", "GitHub Light", "Dracula", "Nord"],
+            "preset order is the documented one"
+        );
+        // Every preset's accent differs from the others (the cycle match key).
+        let accents: Vec<String> = presets.iter().map(|(_, t)| t.accent.clone()).collect();
+        let unique_accents: std::collections::HashSet<&str> =
+            accents.iter().map(String::as_str).collect();
+        assert_eq!(
+            accents.len(),
+            unique_accents.len(),
+            "preset accents are pairwise distinct"
+        );
+        // The first preset reproduces the default theme exactly.
+        assert_eq!(
+            presets[0].1.accent,
+            ThemeConfig::default().accent,
+            "index 0 is the default theme"
         );
     }
 }
