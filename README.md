@@ -22,14 +22,17 @@ drives PTYs directly.
 
 ## Status
 
-**All 10 core features implemented** · 362 tests · 71% coverage · CI green ·
-opencode-inspired **box-form** UI (themed panel boxes, 3-level background
-palette, 2-line sidebar entries, Pinned section, jump palette) · **full
-agent-rendering compatibility** (synchronized-output mode 2026 batching +
+**All 10 core features + Phase 2 integration views implemented** · 416 tests ·
+CI green · opencode-inspired **box-form** UI (themed panel boxes, 3-level
+background palette, 2-line sidebar entries, Pinned section, jump palette) ·
+**full agent-rendering compatibility** (synchronized-output mode 2026 batching +
 terminal query responder + `TERM` injection, so sophisticated TUI agents like
 **opencode** render instead of going blank) · **Orca daemon client** (`--daemon`
-connects to a running Orca GUI for session persistence + multi-client) · powered
-by [`ratatui-ppalla`](https://crates.io/crates/ratatui-ppalla) 0.0.3
+connects to a running Orca GUI for session persistence + multi-client) ·
+**Phase 2 interactive overlays**: Tasks view (browse GitHub issues/PRs → dispatch
+an agent), Settings overlay (live theme/layout toggles, persisted to
+`config.toml`), Agent Dashboard (3-bucket status board) · powered by
+[`ratatui-ppalla`](https://crates.io/crates/ratatui-ppalla) 0.0.3
 (`PreparedBlock` cached borders).
 
 | # | Feature | Status |
@@ -45,6 +48,9 @@ by [`ratatui-ppalla`](https://crates.io/crates/ratatui-ppalla) 0.0.3
 | 9 | GitHub/Linear (`prs`/`issues` via `gh`; `orchestrate --issues`) | ✅ |
 | 10 | Mobile companion (WebSocket server, `--mobile <PORT>`) | ✅ server |
 | 11 | **Orca daemon client** (`--daemon`: session persistence, multi-client, auto-reconnect) | ✅ |
+| 12 | **Tasks view** (`s` → Tasks): browse GitHub issues/PRs → Enter dispatches an agent with the issue body | ✅ |
+| 13 | **Settings overlay** (`s` → Settings): live theme/layout toggles, persisted to `config.toml` | ✅ |
+| 14 | **Agent Dashboard** (`d`): 3-bucket status board (needs-attention / working / done) | ✅ |
 
 See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full architecture, performance
 measurements, and the opencode layout study.
@@ -243,6 +249,7 @@ to the agent. To control orcatui, enter Pane mode with `Ctrl+Alt+P`.
 | `b` | **Toggle the sidebar** (adaptive: auto-hides on narrow terminals) |
 | `s` | **Sidebar nav hub** — Activity / Tasks / Settings |
 | `a` | **Activity timeline** — fullscreen event log (state changes, errors) |
+| `d` | **Agent dashboard** — read-only 3-bucket status board (needs-attention / working / done) |
 | `/` | **Jump palette** — fuzzy-focus any agent (type to filter, Enter to focus) |
 | `?` | **Help** — full-screen keybindings reference (any key to close) |
 | `Esc` | Return to Normal (passthrough) |

@@ -4,7 +4,7 @@ Terminal multi-agent coding orchestration — a TUI port of
 [Orca GUI](https://github.com/stablyai/orca). Runs N coding agents side-by-side
 in split panes, each in its own PTY / git worktree.
 
-> orcatui roadmap · last updated 2026-07-27 · v0.3.x · 403 tests · CI green
+> orcatui roadmap · last updated 2026-07-27 · v0.4.0 · 416 tests · CI green
 
 **See also:** [README.md](../README.md) (install / usage) ·
 [architecture.md](architecture.md) (internals: data flow, modules, perf) ·
@@ -16,7 +16,8 @@ in split panes, each in its own PTY / git worktree.
 
 A compact index — each entry links to its detailed write-up. (Phase 1 of the
 former `ROADMAP-v2.md` — Interrupted status, granular tallies, activity timeline,
-sidebar nav — plus recent UX fixes are all shipped.)
+sidebar nav — plus recent UX fixes are all shipped. Phase 2 — Tasks view,
+Settings overlay, Agent Dashboard — shipped in v0.4.0.)
 
 ### Core
 
@@ -41,27 +42,27 @@ sidebar nav — plus recent UX fixes are all shipped.)
 ### UI & interaction
 
 - **Sidebar** — bordered panel, PINNED / IN PROGRESS sections, status dots, bottom tally summary. → [features.md](features.md#2-sidebar)
-- **Modes + `Ctrl+Alt+P` gateway** — Normal (passthrough) / Pane / Jump / Spawn / SpawnCustom / Activity / Sidebar. → [features.md](features.md#3-modes--keybindings)
+- **Modes + `Ctrl+Alt+P` gateway** — Normal (passthrough) / Pane / Jump / Spawn / SpawnCustom / Activity / Sidebar / TasksRepo / TasksList / Settings / Dashboard. → [features.md](features.md#3-modes--keybindings)
 - **Spawn picker** — `n` in Pane mode; agent list + Custom command modal. → [features.md](features.md#4-spawn-picker--custom-command)
 - **Activity timeline** — `a` in Pane mode; fullscreen event log (cap 500). → [features.md](features.md#6-activity-timeline)
-- **Sidebar nav hub** — `s` in Pane mode; Activity / Tasks / Settings. → [features.md](features.md#7-sidebar-navigation-hub)
+- **Sidebar nav hub** — `s` in Pane mode; Activity / Tasks / Settings (all implemented). → [features.md](features.md#7-sidebar-navigation-hub)
 - **Mouse + clipboard** — scroll scrollback; drag-select → copy via shell-out (zero-dep). → [features.md](features.md#8-mouse--clipboard)
 
 ### Daemon & orchestration
 
 - **Three daemon modes** — Standalone (`run`), built-in daemon (`daemon` + `attach`), Orca GUI client (`--daemon`). → [features.md](features.md#9-daemon-modes)
 
+### Integration views (Phase 2)
+
+- **Tasks view** — `s` → Tasks → type `owner/name` → browse open GitHub issues + PRs → Enter dispatches an agent pane with the issue body as the prompt (lazy `gh issue view` body fetch; sync fetch is v1, async is a follow-up). → [features.md](features.md#13-tasks-view)
+- **Settings overlay** — `s` → Settings → live toggle/cycle of sidebar, status bar, default agent, and theme preset (GitHub Dark / Light / Dracula / Nord); Esc persists the whole config atomically to `config.toml`. → [features.md](features.md#14-settings-overlay)
+- **Agent Dashboard** — `d` in Pane mode; read-only 3-bucket board (needs-attention / working / done) grouping live per-pane statuses. → [features.md](features.md#15-agent-dashboard)
+
 ---
 
 ## Future roadmap
 
 Condensed from the former `ROADMAP-v2.md` (merged here 2026-07-27).
-
-### Phase 2 — Integration views (2-3 weeks)
-*Goal: lift CLI-only features into interactive overlays.*
-- **Tasks view** — GitHub/GitLab issues + PR browser; select an item → dispatch an agent with the issue body as the prompt.
-- **Settings overlay** — live theme / layout / agent toggles, persisted to `config.toml`.
-- **Agent Dashboard** — 3-bucket board (needs-attention / working / done).
 
 ### Phase 3 — Agent advances (3-4 weeks)
 *Goal: accurate status tracking + session persistence.*
@@ -102,7 +103,7 @@ Orca-GUI features that don't fit a terminal character grid:
 | Phase | Timeframe | Headline deliverable | Effect |
 |-------|-----------|----------------------|--------|
 | ✅ Done (v0.3.x) | — | Core 10 features + Phase 1 (status, tallies, activity, sidebar nav) + UX fixes | Solid multi-agent TUI |
-| 2 | 2-3 wk | Tasks view + Settings overlay + Dashboard | CLI → interactive |
+| ✅ Done (v0.4.0) | — | Phase 2: Tasks view + Settings overlay + Agent Dashboard | CLI → interactive |
 | 3 | 3-4 wk | Hook system + hibernation + session persistence + keep-awake | Precise status + memory efficiency |
 | 4 | 4-6 wk | Automation + orchestration UI + profiles | Unattended operations |
 | 5 | as needed | Multi-integrations + lineage + i18n | Extensibility |

@@ -101,6 +101,7 @@ to drive orcatui itself.
 | `s` | Open the sidebar navigation hub |
 | `/` | Open the fuzzy-focus jump palette |
 | `a` | Open the activity timeline overlay |
+| `d` | Open the agent dashboard overlay (§15) |
 | `?` | Toggle the help overlay |
 | `Esc` | Return to Normal (passthrough) |
 
@@ -168,12 +169,12 @@ Press `s` in Pane mode to open the Navigate popup. It lists three items
 
 | Index | Item | Behavior |
 |-------|------|----------|
-| 0 | Activity | Opens the activity timeline overlay |
-| 1 | Tasks | Toasts *"Tasks — coming soon"* |
-| 2 | Settings | Toasts *"Settings — coming soon"* |
+| 0 | Activity | Opens the activity timeline overlay (§6) |
+| 1 | Tasks | Opens the **Tasks view** repo-input modal (§13) |
+| 2 | Settings | Opens the **Settings overlay** (§14) |
 
 `↑`/`↓` moves the selection, `Enter` dispatches, `Esc` returns to Normal.
-Only Activity is implemented; Tasks and Settings are placeholders.
+All three entries are implemented (Phase 1 Activity; Phase 2 Tasks + Settings).
 
 ## 8. Mouse & clipboard
 
@@ -271,5 +272,87 @@ hello_timeout_secs     = 5
   but it is deliberately **not wired** into the live key-forwarding path.
 - **Mobile client.** Only the WebSocket **server** (`src/mobile.rs`) is
   implemented; there is no iOS/Android companion app yet.
-- **Sidebar-nav placeholders.** The Tasks and Settings entries in the Navigate
-  hub (see §7) are "coming soon" stubs, not implemented views.
+- **Tasks view fetch is synchronous (v1).** Fetching open issues + PRs via the
+  `gh` CLI blocks the render loop for the duration of the call. `gh` is
+  normally sub-second, so this is acceptable for v1; a background async fetch
+  (tokio task → event-channel redraw) is a documented Phase-3 follow-up.
+- **PR dispatch is title-only.** Selecting a pull request dispatches an agent
+  with `#N title (PR)` as the prompt (no `gh pr view` body fetch). Issues are
+  lazily enriched with their full body via `gh issue view` on dispatch.
+
+## 13. Tasks view (Phase 2)
+
+An interactive GitHub issues + PR browser, reached from the sidebar nav hub:
+press `s` in Pane mode → select **Tasks** → `Enter` (see §7). GitHub-only
+(GitLab is out of scope; the `IssueSource` trait only stubs Linear).
+
+**Flow:**
+
+1. **Repo-input modal** — type `owner/name`, `Enter` parses it via
+   `RepoRef::parse`; `Backspace` edits, `Esc` cancels. On a parse error the
+   message is toasted and you stay in the modal.
+2. **Fetch** (v1: synchronous) — `gh issue list` + `gh pr list` are merged into
+   one list sorted by number ascending, each tagged `[issue]` or `[pr]`. On a
+   fetch error the list overlay shows the message + "press Esc".
+3. **Browser** — `↑`/`↓` moves the selection (scrollable with an `↑↓ more`
+   indicator when it overflows); `Enter` dispatches; `Esc` returns to Normal.
+
+**Dispatch (`Enter`):**
+
+- **Issue** → lazily fetches the full body via `gh issue view N --json
+  number,title,body` and hands the agent `issue_to_prompt(full_issue)` (the
+  `#N title\n\nbody` form). If the body fetch fails, it falls back to the
+  title-only prompt + a warning toast.
+- **PR** → dispatches with `pr_to_prompt(pr)` (`#N title (PR)`); PR bodies are
+  not fetched in v1.
+
+The dispatched agent is `config.default_agent` (so it respects your configured
+default), spawned into a new pane named `issue-#N` / `pr-#N` via the same
+`spawn_one` path as the spawn picker. The pane-size guard (`can_spawn_pane`)
+runs first; if the terminal is too small a toast warns and no dispatch happens.
+
+> The `fetch_issue` / `pr_to_prompt` helpers live in `src/integrations.rs`,
+> alongside the existing `list_issues` / `list_pull_requests` / `issue_to_prompt`.
+
+## 14. Settings overlay (Phase 2)
+
+A live settings overlay, reached from the sidebar nav hub: press `s` in Pane
+mode → select **Settings** → `Enter` (see §7).
+
+**Rows** (4, in fixed order). `↑`/`↓` moves the cursor; `Enter` **or** `Space`
+toggles/cycles the focused row **live** (the next frame reflects it
+immediately); `Esc` persists the whole config and returns to Normal.
+
+| # | Row | Action |
+|---|-----|--------|
+| 0 | Sidebar | Toggle visibility (`sidebar_width` 0 ↔ default 26). |
+| 1 | Status bar | Toggle `layout.show_status_bar`. |
+| 2 | Default agent | Cycle `default_agent` through `bash / opencode / claude / codex / gemini / aider` (wrap). |
+| 3 | Theme | Cycle `theme` through 4 presets (GitHub Dark / GitHub Light / Dracula / Nord), matched by accent hex; a custom theme restarts the cycle at GitHub Dark. |
+
+**Persistence:** `Esc` calls `Config::save()`, which serializes the whole
+config with `toml::to_string` and writes it **atomically** (temp file +
+`rename` over `~/.config/orcatui/config.toml`, with `create_dir_all` so a
+first-time save on a fresh machine works). On success a "Settings saved" toast
+appears; on failure a warning names the error but the overlay still closes (the
+user is never trapped). The schema contains **no secrets** — GitHub auth is
+handled by the `gh` CLI — so full serialization is safe.
+
+## 15. Agent Dashboard (Phase 2)
+
+A read-only 3-bucket board, opened with `d` in Pane mode. Any key dismisses it
+back to Normal (mirroring the Activity overlay's contract).
+
+The overlay splits into three columns, each showing a colored header
+`label (count)` and the agent names in that bucket:
+
+| Bucket | Statuses | Header color |
+|--------|----------|--------------|
+| **needs-attention** | Blocked, Interrupted, Failed | error (red) |
+| **working** | Working, Waiting, Idle | success (green) |
+| **done** | Done | muted |
+
+Empty buckets render a dimmed `(none)`. The status → bucket mapping is
+exhaustive (no `_` fallthrough), so adding an `AgentStatus` variant forces the
+compiler to assign it a bucket. The dashboard is read-only — it only reflects
+the live per-pane statuses derived via `AgentStatus::derive`.
