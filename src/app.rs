@@ -297,6 +297,12 @@ pub struct App<B: Backend = CrosstermBackend<Stdout>> {
     /// When true, the focused pane fills the entire content area (other panes
     /// keep running, just not visible). Toggled with `z` in Pane mode.
     zoomed: bool,
+    /// A human-readable reason set just before [`App::main_loop`] breaks on
+    /// auto-exit, so [`App::run`] can print it AFTER restoring the terminal
+    /// (printing during raw mode corrupts the display). `None` for an explicit
+    /// Ctrl+Q quit or a still-running loop. This is what tells the user WHY
+    /// orcatui closed (e.g. "all agents exited") instead of vanishing silently.
+    exit_reason: Option<&'static str>,
     /// When true, a full-screen help overlay is rendered. Toggled with `?` in
     /// Pane mode (or `F1`). Any key dismisses it.
     show_help: bool,
@@ -488,6 +494,7 @@ impl App {
             spawn_selected: 0,
             custom_cmd: String::new(),
             zoomed: false,
+            exit_reason: None,
             show_help: false,
             conn_state: ConnectionState::Standalone,
             toasts: crate::toast::ToastQueue::new(),
@@ -562,6 +569,14 @@ impl<B: Backend> App<B> {
                 return Err(restore_err);
             }
             eprintln!("orcatui: terminal restore failed: {restore_err:#}");
+        }
+        // After the terminal is restored (raw mode off, alt screen left), tell
+        // the user WHY the loop ended if it was an auto-exit — so a vanished
+        // session reads as "all agents exited" instead of an unexplained death.
+        // (A genuine panic prints its own `thread 'main' panicked` message, so
+        // it's never confused with this.)
+        if let Some(reason) = self.exit_reason {
+            eprintln!("orcatui: {reason}");
         }
         result
     }
@@ -654,11 +669,12 @@ impl<B: Backend> App<B> {
             }
             // Auto-exit once no agent process remains AND orchestration has no
             // pending/running tasks left AND no reconnect is awaiting its
-            // backoff. A user can also quit explicitly with Esc / Ctrl+C.
-            if self.all_sessions_gone()
-                && self.orchestration_drained()
-                && self.reconnect_due.iter().all(|d| d.is_none())
-            {
+            // backoff — BUT only once the user is back to a calm, unzoomed
+            // Normal state. See [`App::should_auto_exit`] for the "don't yank
+            // the rug out mid-interaction" rationale. `exit_reason` is printed
+            // by `run()` after the terminal is restored.
+            if self.should_auto_exit() {
+                self.exit_reason = Some("all agents exited \u{2014} re-run orcatui to start again");
                 break;
             }
         }
@@ -3125,6 +3141,7 @@ impl<B: Backend> App<B> {
         // Adjust focus to the previous pane (or wrap to the last).
         if self.panes.is_empty() {
             self.mode = InputMode::Normal;
+            self.zoomed = false; // nothing left to zoom — clear the stale flag
             self.focus = 0;
         } else if self.focus >= self.panes.len() {
             self.focus = self.panes.len() - 1;
@@ -3196,6 +3213,23 @@ impl<B: Backend> App<B> {
     /// For an empty session set this is vacuously true → the loop exits.
     fn all_sessions_gone(&self) -> bool {
         self.sessions.iter().all(|s| s.is_none())
+    }
+
+    /// Whether the main loop should auto-exit on this tick.
+    ///
+    /// All agents must be gone, orchestration drained, and no reconnect
+    /// pending — AND the user must be back to a calm, **unzoomed Normal**
+    /// state. The last two clauses are the fix for "I pressed Ctrl+Alt+P and
+    /// it died": a zoomed/active agent that just exited leaves its Done/Failed
+    /// pane visible so the user can react, instead of the app vanishing
+    /// mid-interaction. Once they unzoom and return to idle Normal, the loop
+    /// breaks (and [`App::run`] prints `exit_reason`).
+    fn should_auto_exit(&self) -> bool {
+        self.all_sessions_gone()
+            && self.orchestration_drained()
+            && self.reconnect_due.iter().all(|d| d.is_none())
+            && self.mode == InputMode::Normal
+            && !self.zoomed
     }
 }
 
@@ -3320,6 +3354,7 @@ mod tests {
                 spawn_selected: 0,
                 custom_cmd: String::new(),
                 zoomed: false,
+                exit_reason: None,
                 show_help: false,
                 conn_state: ConnectionState::Standalone,
                 toasts: crate::toast::ToastQueue::new(),
@@ -3420,6 +3455,48 @@ mod tests {
         assert!(!app.all_sessions_gone());
         app.sessions[1] = None;
         assert!(app.all_sessions_gone());
+    }
+
+    #[test]
+    fn should_auto_exit_waits_for_idle_unzoomed_normal() {
+        // No panes → all_sessions_gone is vacuously true; orchestration is
+        // drained and no reconnects are pending. So the decision hinges on the
+        // user's activity state.
+        let mut app = App::for_test(vec![]);
+
+        // Zoomed (the reported crash case: agent exited while zoomed) → do NOT
+        // auto-exit; leave the dead pane visible so the user can react.
+        app.zoomed = true;
+        app.mode = InputMode::Normal;
+        assert!(
+            !app.should_auto_exit(),
+            "zoomed: don't yank the app away mid-interaction"
+        );
+
+        // Pane mode (active control) → do NOT auto-exit.
+        app.zoomed = false;
+        app.mode = InputMode::Pane;
+        assert!(!app.should_auto_exit(), "Pane mode: active control");
+
+        // An overlay mode (e.g. Activity) → do NOT auto-exit.
+        app.mode = InputMode::Activity;
+        assert!(!app.should_auto_exit(), "overlay: active control");
+
+        // Calm Normal + unzoomed → auto-exit.
+        app.mode = InputMode::Normal;
+        assert!(
+            app.should_auto_exit(),
+            "idle + unzoomed + all gone → auto-exit"
+        );
+
+        // A live session suppresses auto-exit regardless of mode.
+        app.sessions.push(dummy_session());
+        app.panes.push(pane(0, "alive"));
+        app.mode = InputMode::Normal;
+        assert!(
+            !app.should_auto_exit(),
+            "a live agent still running → no auto-exit"
+        );
     }
 
     #[test]
@@ -4820,5 +4897,43 @@ mod tests {
         );
         assert!(text.contains("working (1)"), "working count is 1");
         assert!(text.contains("done (1)"), "done count is 1");
+    }
+
+    #[test]
+    fn zoom_then_esc_then_chat_then_gateway_does_not_panic() {
+        // Reproduces the reported crash: Ctrl+Alt+P → z (zoom) → Esc (Normal,
+        // zoom persists) → chat → Ctrl+Alt+P again → crash. If any step panics,
+        // this test fails with the panic location.
+        let mut app = App::for_test(vec![pane(0, "alpha")]);
+        // Ctrl+Alt+P → Pane mode.
+        app.handle_key(KeyEvent::new(
+            KeyCode::Char('p'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ));
+        assert_eq!(app.mode, InputMode::Pane);
+        // z → zoom on.
+        app.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+        assert!(app.zoomed);
+        app.render().expect("render: zoomed in Pane mode");
+        // Esc → Normal (zoom persists — interact with the agent while zoomed).
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.mode, InputMode::Normal);
+        assert!(app.zoomed, "zoom persists into Normal mode");
+        // Simulate chatting: the agent produces output into the focused pane.
+        app.panes[0].feed(b"agent reply line one\r\nagent reply line two\r\n");
+        app.render()
+            .expect("render: zoomed in Normal mode after chat");
+        // Ctrl+Alt+P again → back to Pane mode (the reported crash point).
+        app.handle_key(KeyEvent::new(
+            KeyCode::Char('p'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ));
+        assert_eq!(app.mode, InputMode::Pane);
+        app.render()
+            .expect("render after the second gateway must not panic");
+        // z again should unzoom cleanly (toggle contract).
+        app.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+        assert!(!app.zoomed);
+        app.render().expect("render unzoomed");
     }
 }
