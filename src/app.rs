@@ -2990,16 +2990,29 @@ impl<B: Backend> App<B> {
     /// Always includes `bash`; then all detected installed agents (deduped);
     /// then the configured default if not already present.
     fn spawn_options(&self) -> Vec<(String, Vec<String>)> {
+        // Detect installed agents ONCE per call (this only runs while the spawn
+        // picker is open, not every normal-mode frame) so each catalog entry can
+        // be marked with whether its binary is actually on $PATH.
+        let installed: Vec<&'static str> = AgentKind::detect_installed()
+            .iter()
+            .map(AgentKind::binary)
+            .collect();
         let mut opts: Vec<(String, Vec<String>)> = Vec::new();
         // Always-available: bash.
         opts.push(("bash".to_string(), vec!["bash".to_string()]));
-        // Detected agents.
-        for kind in AgentKind::detect_installed() {
-            let bin = kind.binary().to_string();
-            let name = kind.display_name().to_string();
-            if !opts.iter().any(|(n, _)| n == &name) {
-                opts.push((name, vec![bin]));
-            }
+        // The FULL agent catalog, not just the detected subset. A user can pick
+        // any known CLI agent; an uninstalled one is tagged "(not installed)"
+        // and, if selected, spawns into a Failed pane that surfaces the
+        // missing-binary error (so the catalog is always complete — matches the
+        // "run any CLI agent" philosophy and Orca's agent list).
+        for kind in AgentKind::all_known() {
+            let bin = kind.binary();
+            let name = if installed.contains(&bin) {
+                kind.display_name().to_string()
+            } else {
+                format!("{} (not installed)", kind.display_name())
+            };
+            opts.push((name, vec![bin.to_string()]));
         }
         // Configured default if not already listed.
         let default = &self.config.default_agent;
@@ -4656,6 +4669,80 @@ mod tests {
             last.1.is_empty(),
             "custom-command sentinel must have an empty command vector; got {:?}",
             last.1
+        );
+    }
+
+    #[test]
+    fn spawn_options_lists_all_known_agents() {
+        // The picker must show the FULL agent catalog (Claude, Gemini, Codex,
+        // …), not only the agents detected on this machine's $PATH. An
+        // uninstalled agent is suffixed "(not installed)" but is still listed
+        // so the user sees every option (the "run any CLI agent" philosophy).
+        let app = App::for_test(vec![pane(0, "a")]);
+        let opts = app.spawn_options();
+        let names: Vec<&str> = opts.iter().map(|(n, _)| n.as_str()).collect();
+        for kind in AgentKind::all_known() {
+            let display = kind.display_name();
+            assert!(
+                names.iter().any(|n| n.contains(display)),
+                "{display:?} should appear in the spawn options (installed or not): {names:?}"
+            );
+        }
+        // bash + 11 known agents + custom sentinel => at least 13 entries.
+        assert!(
+            opts.len() >= 13,
+            "expected bash + all known agents + custom; got {} entries: {opts:?}",
+            opts.len()
+        );
+        // The custom-command sentinel stays last.
+        assert!(
+            opts.last()
+                .map(|(n, _)| n.contains("Custom command"))
+                .unwrap_or(false),
+            "custom-command entry must be last: {opts:?}"
+        );
+    }
+
+    #[test]
+    fn spawn_options_marks_uninstalled_agents() {
+        // At least the structural contract: every entry's command is either the
+        // agent binary (non-empty) or the custom sentinel (empty). And entries
+        // whose binary is NOT on $PATH carry the "(not installed)" suffix on a
+        // machine where that binary is absent. We assert the suffix appears on
+        // SOME entry when not everything is installed (the common case in CI,
+        // where typically only `bash` and maybe one agent are present).
+        let app = App::for_test(vec![pane(0, "a")]);
+        let opts = app.spawn_options();
+        let installed_bins: Vec<&'static str> = AgentKind::detect_installed()
+            .iter()
+            .map(AgentKind::binary)
+            .collect();
+        let uninstalled_count = AgentKind::all_known()
+            .iter()
+            .filter(|k| !installed_bins.contains(&k.binary()))
+            .count();
+        let marked_not_installed = opts
+            .iter()
+            .filter(|(n, _)| n.contains("(not installed)"))
+            .count();
+        assert_eq!(
+            marked_not_installed, uninstalled_count,
+            "uninstalled agents ({uninstalled_count}) must each be marked; got {marked_not_installed} marked: {opts:?}"
+        );
+    }
+
+    #[test]
+    fn render_spawn_picker_does_not_panic() {
+        // Regression guard: opening the spawn picker (`n`) and rendering must
+        // never panic, regardless of how many agents are installed. This
+        // exercises the full render path (spawn_options → snapshot → overlay).
+        let mut app = App::for_test(vec![pane(0, "a")]);
+        app.mode = InputMode::Spawn;
+        app.render().expect("render in Spawn mode must not panic");
+        let text = buffer_text(&app);
+        assert!(
+            text.contains("New pane"),
+            "spawn picker title should render: {text}"
         );
     }
 
