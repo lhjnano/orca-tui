@@ -45,6 +45,14 @@ pub struct Config {
     pub theme: ThemeConfig,
     /// Orca daemon client settings (reconnection, timeouts).
     pub daemon: DaemonConfig,
+    /// Optional clipboard copy command, overriding the auto-detected tool.
+    ///
+    /// Shell-split on whitespace into program + args; the selected text is
+    /// piped to the program's stdin. Set this when the auto-detection
+    /// (xsel/xclip/wl-copy/pbcopy/clip.exe) doesn't pick the right tool for
+    /// your environment, e.g. `clipboard_command = "clip.exe"` on WSL or
+    /// `"termux-clipboard-set"` on Termux. `None` (default) = auto-detect.
+    pub clipboard_command: Option<String>,
 }
 
 impl Default for Config {
@@ -56,6 +64,7 @@ impl Default for Config {
             layout: LayoutConfig::default(),
             theme: ThemeConfig::default(),
             daemon: DaemonConfig::default(),
+            clipboard_command: None,
         }
     }
 }

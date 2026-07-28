@@ -164,6 +164,14 @@ impl Pane {
         self.emu.size()
     }
 
+    /// Whether the agent is rendering on the ALTERNATE screen (fullscreen TUI).
+    /// Used by the app to route mouse-wheel scroll: main screen → scroll our
+    /// own scrollback; alt screen → forward PageUp/Down to the agent.
+    #[must_use]
+    pub fn is_alternate_screen(&self) -> bool {
+        self.emu.is_alternate_screen()
+    }
+
     /// Replace the agent lifecycle state.
     pub fn set_state(&mut self, state: AgentState) {
         self.state = state;

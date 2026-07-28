@@ -168,6 +168,18 @@ impl TerminalEmulator {
         (cols, rows)
     }
 
+    /// Whether the agent has switched to the ALTERNATE screen buffer
+    /// (ESC[?1049h, as fullscreen TUIs like opencode/claude/vim do).
+    ///
+    /// The alt screen has no terminal scrollback of its own, so a pane uses
+    /// this to decide whether a mouse-wheel scroll should move orcatui's own
+    /// scrollback (main screen) or be forwarded to the agent as PageUp/Down so
+    /// the app scrolls itself (alt screen).
+    #[must_use]
+    pub fn is_alternate_screen(&self) -> bool {
+        self.parser.screen().alternate_screen()
+    }
+
     /// Read the cell at `(col, row)`, or `None` if out of bounds.
     ///
     /// Returns an [`EmuCell`] value-copy. A blank/never-written cell yields a

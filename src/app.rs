@@ -325,6 +325,11 @@ pub struct App<B: Backend = CrosstermBackend<Stdout>> {
     /// by [`App::render`] for mouse hit-testing in [`App::handle_mouse`].
     /// Empty until the first frame is drawn.
     pane_rects: Vec<Rect>,
+    /// The pane index + inner `(col, row)` where the left button went DOWN,
+    /// so a drag-selection only materializes on actual movement (a plain click
+    /// just focuses — no selection, no copy). Cleared on button-up. `None`
+    /// whenever no left-drag is in progress.
+    drag_origin: Option<(usize, u16, u16)>,
     /// Phase 2 — Tasks view: the in-progress `owner/name` repo string the user
     /// is typing in [`InputMode::TasksRepo`].
     tasks_repo_input: String,
@@ -503,6 +508,7 @@ impl App {
             last_status: Vec::new(),
             sidebar_nav: 0,
             pane_rects: Vec::new(),
+            drag_origin: None,
             tasks_repo_input: String::new(),
             tasks_repo: None,
             tasks_items: Vec::new(),
@@ -2857,56 +2863,86 @@ impl<B: Backend> App<B> {
         let (col, row) = (mouse.column, mouse.row);
         match mouse.kind {
             MouseEventKind::ScrollUp => {
-                if let Some(p) = self.focused_pane_mut() {
+                // A fullscreen/redraw agent (opencode, claude, …) runs in the
+                // ALTERNATE screen, which has no terminal scrollback — so scroll
+                // OUR buffer would do nothing. Instead forward a PageUp to the
+                // agent and let IT scroll its own content (the mouse-friendly
+                // path for redraw TUIs). Main-screen panes (bash) scroll our
+                // own scrollback as before.
+                let in_alt = self
+                    .panes
+                    .get(self.focus)
+                    .map_or(false, |p| p.is_alternate_screen());
+                if in_alt {
+                    self.send_to_focused(b"\x1b[5~"); // PageUp
+                } else if let Some(p) = self.focused_pane_mut() {
                     p.scroll_up(3);
                 }
             }
             MouseEventKind::ScrollDown => {
-                if let Some(p) = self.focused_pane_mut() {
+                let in_alt = self
+                    .panes
+                    .get(self.focus)
+                    .map_or(false, |p| p.is_alternate_screen());
+                if in_alt {
+                    self.send_to_focused(b"\x1b[6~"); // PageDown
+                } else if let Some(p) = self.focused_pane_mut() {
                     p.scroll_down(3);
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(idx) = self.pane_at(col, row) {
-                    // Clear any selection on other panes, then start a new one here.
+                    // Clear any selection on other panes. We do NOT start a
+                    // selection on Down — a plain click should only FOCUS the
+                    // pane. The selection starts lazily on the first Drag move
+                    // (see the Drag arm), so a click without movement selects
+                    // nothing and copies nothing.
                     for (i, p) in self.panes.iter_mut().enumerate() {
                         if i != idx {
                             p.clear_selection();
                         }
                     }
                     self.focus = idx;
-                    if let Some((c, r)) = self.map_to_inner(idx, col, row) {
-                        if let Some(p) = self.panes.get_mut(idx) {
-                            p.start_selection(c, r);
-                        }
-                    }
+                    self.drag_origin = self
+                        .map_to_inner(idx, col, row)
+                        .map(|inner| (idx, inner.0, inner.1));
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
-                if let Some(idx) = self.pane_at(col, row) {
-                    if self.panes.get(idx).map_or(false, |p| p.has_selection()) {
-                        if let Some((c, r)) = self.map_to_inner(idx, col, row) {
-                            if let Some(p) = self.panes.get_mut(idx) {
-                                p.extend_selection(c, r);
+                // Start the selection (at the Down point) on the FIRST move,
+                // then extend it to the current cell. Belongs to the pane where
+                // the button went down, so dragging across panes keeps the
+                // selection in its origin pane.
+                if let Some((origin_idx, oc, or)) = self.drag_origin {
+                    if let Some((c, r)) = self.map_to_inner(origin_idx, col, row) {
+                        if let Some(p) = self.panes.get_mut(origin_idx) {
+                            if !p.has_selection() {
+                                p.start_selection(oc, or);
                             }
+                            p.extend_selection(c, r);
                         }
                     }
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => {
-                // Copy the focused pane's selection (if any), then clear it.
+                // Only copy when a real DRAG produced a selection. A plain click
+                // (Down with no Drag) leaves no selection, so this is a no-op
+                // and the user isn't bombarded with "Copied"/"No clipboard" on
+                // every click.
                 let text = self.panes.get(self.focus).and_then(|p| p.selected_text());
                 if let Some(t) = text {
-                    match crate::clipboard::copy(&t) {
+                    match crate::clipboard::copy_with(&t, self.config.clipboard_command.as_deref())
+                    {
                         Ok(()) => self.toasts.push(crate::toast::Toast::info("Copied")),
                         Err(_) => self.toasts.push(crate::toast::Toast::warning(
-                            "No clipboard tool (xclip/xsel/wl-copy/pbcopy)",
+                            "No clipboard tool — set [clipboard] in config (e.g. clip.exe on WSL)",
                         )),
                     }
                 }
                 if let Some(p) = self.panes.get_mut(self.focus) {
                     p.clear_selection();
                 }
+                self.drag_origin = None;
             }
             _ => {}
         }
@@ -3363,6 +3399,7 @@ mod tests {
                 last_status: Vec::new(),
                 sidebar_nav: 0,
                 pane_rects: Vec::new(),
+                drag_origin: None,
                 tasks_repo_input: String::new(),
                 tasks_repo: None,
                 tasks_items: Vec::new(),
@@ -4042,6 +4079,41 @@ mod tests {
     }
 
     #[test]
+    fn handle_mouse_scroll_forwards_pageup_in_alt_screen() {
+        // A fullscreen agent (opencode/claude) lives in the ALTERNATE screen,
+        // which has no terminal scrollback. So the wheel must NOT scroll our
+        // buffer (pane.scroll stays 0) — it forwards a PageUp to the agent so
+        // the app scrolls its own content. (We can't assert the bytes were sent
+        // without a live PTY, but pane.scroll not changing proves the buffer-
+        // scroll branch was NOT taken → the forward branch was.)
+        use crossterm::event::MouseEvent;
+        let mut app = App::for_test(vec![pane(0, "alt")]);
+        // Enter the alternate screen, like a fullscreen TUI does.
+        app.panes[0].feed(b"\x1b[?1049h");
+        assert!(
+            app.panes[0].is_alternate_screen(),
+            "test precondition: pane is in the alt screen"
+        );
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(
+            app.panes[0].scroll(),
+            0,
+            "alt-screen wheel must forward to the agent, not move our scrollback"
+        );
+    }
+
+    #[test]
     fn handle_mouse_does_not_panic_when_focus_is_out_of_range() {
         use crossterm::event::MouseEvent;
         let mut app = App::for_test(vec![pane(0, "a")]);
@@ -4069,10 +4141,11 @@ mod tests {
     }
 
     #[test]
-    fn mouse_down_starts_selection_in_hit_pane() {
+    fn mouse_down_focuses_without_starting_a_selection() {
         use crossterm::event::MouseEvent;
         let mut app = App::for_test(vec![pane(0, "a")]);
-        // Give the pane some content so a selection has something to anchor on.
+        // Give the pane some content so a selection would have something to
+        // anchor on if it started.
         app.apply_update(AgentUpdate::Output {
             pane_id: 0,
             bytes: b"hello world".to_vec(),
@@ -4086,11 +4159,50 @@ mod tests {
             row: 1,
             modifiers: KeyModifiers::NONE,
         });
+        assert_eq!(app.focus, 0, "Down moves focus to the hit pane");
         assert!(
-            app.panes[0].has_selection(),
-            "Down inside a pane starts a selection"
+            !app.panes[0].has_selection(),
+            "a plain Down must NOT start a selection — only a Drag should"
         );
-        assert_eq!(app.focus, 0, "Down also moves focus to the hit pane");
+        // The drag origin is recorded so the first Drag move can anchor it.
+        assert!(app.drag_origin.is_some(), "Down records the drag origin");
+    }
+
+    #[test]
+    fn mouse_click_without_drag_does_not_select_or_copy() {
+        // Regression for "selection too sensitive — a plain click triggers it".
+        // Down immediately followed by Up (no movement) must produce NO
+        // selection and therefore NO clipboard attempt (no toast).
+        use crossterm::event::MouseEvent;
+        let mut app = App::for_test(vec![pane(0, "a")]);
+        app.apply_update(AgentUpdate::Output {
+            pane_id: 0,
+            bytes: b"hello world".to_vec(),
+        });
+        app.pane_rects = vec![Rect::new(0, 0, 40, 12)];
+        let toasts_before = app.toasts.len();
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 5,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(
+            !app.panes[0].has_selection(),
+            "click with no drag must not select"
+        );
+        assert_eq!(
+            app.toasts.len(),
+            toasts_before,
+            "click with no drag must not attempt a copy (no toast)"
+        );
+        assert!(app.drag_origin.is_none(), "Up clears the drag origin");
     }
 
     #[test]

@@ -78,31 +78,67 @@ impl std::error::Error for CopyError {}
 /// Copy `text` to the system clipboard by shelling out to the first available
 /// platform tool. Zero-dependency; graceful error if none is present.
 ///
+/// Auto-detection order (first executable on `$PATH` wins):
 /// - macOS: `pbcopy`
 /// - Windows: `clip`
 /// - Linux/BSD: `xsel --clipboard --input`, else `xclip -selection clipboard`,
-///   else `wl-copy`
+///   else `wl-copy`, else **`clip.exe`** (WSL → Windows clipboard via interop),
+///   else `powershell.exe -Command "$input | Set-Clipboard"` (WSL fallback).
+///
+/// Pass `command = Some("…")` to override the auto-detection (e.g. force
+/// `clip.exe` on WSL, or `termux-clipboard-set` on Termux). The override is
+/// shell-split on whitespace into program + args; the text is piped to stdin.
 pub fn copy(text: &str) -> Result<(), CopyError> {
-    let (program, args): (&str, Vec<&str>) = if cfg!(target_os = "macos") {
-        ("pbcopy", Vec::new())
+    copy_with(text, None)
+}
+
+/// Like [`copy`], but with an optional user-configured command override.
+pub fn copy_with(text: &str, command: Option<&str>) -> Result<(), CopyError> {
+    let (program, args): (String, Vec<String>) = if let Some(cmd) = command {
+        // User override: shell-split into program + args (whitespace, v1).
+        let mut parts = cmd.split_whitespace();
+        let program = parts.next().ok_or(CopyError::NoClipboardTool)?.to_string();
+        let args = parts.map(String::from).collect();
+        (program, args)
+    } else if cfg!(target_os = "macos") {
+        ("pbcopy".to_string(), Vec::new())
     } else if cfg!(target_os = "windows") {
-        ("clip", Vec::new())
+        ("clip".to_string(), Vec::new())
     } else if which("xsel") {
-        ("xsel", vec!["--clipboard", "--input"])
+        (
+            "xsel".to_string(),
+            vec!["--clipboard".to_string(), "--input".to_string()],
+        )
     } else if which("xclip") {
-        ("xclip", vec!["-selection", "clipboard"])
+        (
+            "xclip".to_string(),
+            vec!["-selection".to_string(), "clipboard".to_string()],
+        )
     } else if which("wl-copy") {
-        ("wl-copy", Vec::new())
+        ("wl-copy".to_string(), Vec::new())
+    } else if which("clip.exe") {
+        // WSL: pipe stdin to Windows' clip.exe (Windows clipboard via interop).
+        ("clip.exe".to_string(), Vec::new())
+    } else if which("powershell.exe") {
+        // WSL fallback when clip.exe is absent.
+        (
+            "powershell.exe".to_string(),
+            vec![
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                "$input | Set-Clipboard".to_string(),
+            ],
+        )
     } else {
         return Err(CopyError::NoClipboardTool);
     };
-    let mut child = std::process::Command::new(program)
+    let mut child = std::process::Command::new(&program)
         .args(&args)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .map_err(|e| CopyError::Spawn(program.to_string(), e.to_string()))?;
+        .map_err(|e| CopyError::Spawn(program.clone(), e.to_string()))?;
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(text.as_bytes());
     }
