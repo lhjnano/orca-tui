@@ -325,6 +325,11 @@ pub struct App<B: Backend = CrosstermBackend<Stdout>> {
     /// by [`App::render`] for mouse hit-testing in [`App::handle_mouse`].
     /// Empty until the first frame is drawn.
     pane_rects: Vec<Rect>,
+    /// The working directory agents are spawned in (the explicit `--cwd`, else
+    /// the directory orcatui was launched from). Captured once at construction
+    /// and reused by `spawn_one_local` / `respawn` so newly-spawned panes don't
+    /// fall back to $HOME (portable-pty's default when no cwd is set).
+    launch_cwd: PathBuf,
     /// The pane index + inner `(col, row)` where the left button went DOWN,
     /// so a drag-selection only materializes on actual movement (a plain click
     /// just focuses — no selection, no copy). Cleared on button-up. `None`
@@ -377,6 +382,16 @@ impl App {
 
         let (bus_tx, bus_rx) = bus::channel();
 
+        // The working directory agents open in. portable-pty 0.9 falls back to
+        // $HOME when no cwd is set (cmdbuilder.rs as_command), so we MUST pass
+        // the real launch directory explicitly — otherwise agents open in HOME
+        // instead of the directory orcatui was started from. Honor an explicit
+        // `--cwd`; otherwise use the current directory. Stored on the App so
+        // spawn_one_local (`n` picker) and respawn use the same directory.
+        let launch_cwd: PathBuf = cwd
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+
         // In worktree-isolation mode, create one git worktree per agent from
         // the repo at `cwd` (or the current directory). Fail fast: a worktree
         // creation failure aborts the whole run, and `OwnedWorktrees`'s `Drop`
@@ -421,7 +436,7 @@ impl App {
                     (Some(wt.path.clone()), Some(wt.branch.clone()))
                 } else {
                     (
-                        cwd.map(PathBuf::from),
+                        Some(launch_cwd.clone()),
                         spec.worktree.as_ref().map(|p| p.display().to_string()),
                     )
                 };
@@ -509,6 +524,7 @@ impl App {
             sidebar_nav: 0,
             pane_rects: Vec::new(),
             drag_origin: None,
+            launch_cwd,
             tasks_repo_input: String::new(),
             tasks_repo: None,
             tasks_items: Vec::new(),
@@ -1038,7 +1054,7 @@ impl<B: Backend> App<B> {
         let command = spec.command.clone();
         let cols = self.cols;
         let rows = self.rows;
-        match PtySession::spawn(spec.command, None, cols, rows) {
+        match PtySession::spawn(spec.command, Some(&self.launch_cwd), cols, rows) {
             Ok((session, rx)) => {
                 let mut pane = Pane::new(idx, &name, cols, rows);
                 pane.set_state(AgentState::Running);
@@ -1191,7 +1207,7 @@ impl<B: Backend> App<B> {
         };
         let cols = self.cols;
         let rows = self.rows;
-        match PtySession::spawn(command, None, cols, rows) {
+        match PtySession::spawn(command, Some(&self.launch_cwd), cols, rows) {
             Ok((session, rx)) => {
                 if let Some(slot) = self.sessions.get_mut(i) {
                     *slot = Some(session);
@@ -3400,6 +3416,7 @@ mod tests {
                 sidebar_nav: 0,
                 pane_rects: Vec::new(),
                 drag_origin: None,
+                launch_cwd: std::env::current_dir().unwrap_or_default(),
                 tasks_repo_input: String::new(),
                 tasks_repo: None,
                 tasks_items: Vec::new(),
