@@ -330,6 +330,12 @@ pub struct App<B: Backend = CrosstermBackend<Stdout>> {
     /// and reused by `spawn_one_local` / `respawn` so newly-spawned panes don't
     /// fall back to $HOME (portable-pty's default when no cwd is set).
     launch_cwd: PathBuf,
+    /// Monotonic counter for the next [`Pane::id`]. Each pane gets a fresh id
+    /// at spawn (never reused), so the bus forwarder — which reports
+    /// `AgentUpdate::Output { pane_id }` by id — keeps targeting the RIGHT pane
+    /// even after `close_focused_pane` shifts vec positions. Resolved back to a
+    /// position via [`App::idx_of_pane`] in `apply_update`.
+    next_pane_id: usize,
     /// The pane index + inner `(col, row)` where the left button went DOWN,
     /// so a drag-selection only materializes on actual movement (a plain click
     /// just focuses — no selection, no copy). Cleared on button-up. `None`
@@ -422,7 +428,16 @@ impl App {
         // before `specs.into_iter()` moves it.
         let pinned: Vec<bool> = vec![false; specs.len()];
 
+        // Monotonic pane-id allocator: each pane gets a globally-unique id
+        // (never reused across close+spawn cycles), so the bus forwarder keeps
+        // targeting the RIGHT pane after positions shift. `idx` below is still
+        // the spawn-time vec position (used for the parallel-vec pushes), but
+        // the forwarder is handed the stable `id`, not `idx`.
+        let mut next_id = 0usize;
+
         for (idx, spec) in specs.into_iter().enumerate() {
+            let id = next_id;
+            next_id += 1;
             let name = spec.name.clone();
             let command = spec.command.clone();
             // Per-agent cwd + header branch: an isolated worktree when in
@@ -442,7 +457,7 @@ impl App {
                 };
             match PtySession::spawn(command.clone(), agent_cwd.as_deref(), cols, rows) {
                 Ok((session, rx)) => {
-                    let mut pane = Pane::new(idx, &name, cols, rows);
+                    let mut pane = Pane::new(id, &name, cols, rows);
                     pane.set_state(AgentState::Running);
                     if let Some(branch) = branch_label {
                         pane.set_branch(Some(branch));
@@ -453,15 +468,19 @@ impl App {
                     // sender this forwarder holds; when it returns, that clone
                     // drops and (once all forwarders are gone) the receiver
                     // observes disconnect — the UI's "all agents gone" signal.
+                    // NOTE: `forward_session` is given the stable `id`, not the
+                    // spawn position `idx`, so an `AgentUpdate::Output` for a
+                    // survivor still routes correctly after a close shifts vec
+                    // positions.
                     let tx = bus_tx.clone();
                     let _ = thread::Builder::new()
                         .name(format!("orca-bus-fwd({name})"))
-                        .spawn(move || bus::forward_session(idx, rx, tx));
+                        .spawn(move || bus::forward_session(id, rx, tx));
                     sessions.push(Some(session));
                 }
                 Err(err) => {
                     eprintln!("orcatui: failed to spawn {name:?}: {err:#}");
-                    let mut pane = Pane::new(idx, &name, cols, rows);
+                    let mut pane = Pane::new(id, &name, cols, rows);
                     pane.set_state(AgentState::Failed(format!("{err:#}")));
                     panes.push(pane);
                     sessions.push(None);
@@ -525,6 +544,7 @@ impl App {
             pane_rects: Vec::new(),
             drag_origin: None,
             launch_cwd,
+            next_pane_id: next_id,
             tasks_repo_input: String::new(),
             tasks_repo: None,
             tasks_items: Vec::new(),
@@ -830,6 +850,11 @@ impl<B: Backend> App<B> {
             .iter()
             .map(|p| matches!(p.state(), AgentState::Done(_) | AgentState::Failed(_)))
             .collect();
+        // Stable pane ids, in vec order. `apply_update`'s `Exit` arm resolves
+        // the incoming `pane_id` back to a position via `idx_of_pane`, so we
+        // send the stable id here — NOT the position `i` (which would go stale
+        // if another pane closes between this reap and the next apply).
+        let ids: Vec<usize> = self.panes.iter().map(|p| p.id()).collect();
 
         // Pass 2 (mutable `sessions`): non-blocking `try_wait` on each live,
         // non-terminal child; collect the codes.
@@ -842,7 +867,7 @@ impl<B: Backend> App<B> {
                 continue;
             };
             match session.try_wait() {
-                Ok(Some(code)) => reaped.push((i, code)),
+                Ok(Some(code)) => reaped.push((ids[i], code)),
                 Ok(None) => {} // still running — leave it
                 Err(_) => {}   // poll error (e.g. already-reaped fd); leave it
             }
@@ -859,10 +884,29 @@ impl<B: Backend> App<B> {
         }
     }
 
+    /// Resolve a stable [`Pane::id`] back to its current vec position. Used by
+    /// [`App::apply_update`] to route bus updates by id (stable across
+    /// close/shift) rather than by position (which goes stale the instant a
+    /// pane closes and the survivors slide down). Returns `None` if the id no
+    /// longer maps to a pane (it was closed) — callers treat that as "no-op".
+    fn idx_of_pane(&self, id: usize) -> Option<usize> {
+        self.panes.iter().position(|p| p.id() == id)
+    }
+
     /// Apply a single update to the matching pane/session.
     fn apply_update(&mut self, update: AgentUpdate) {
         match update {
             AgentUpdate::Output { pane_id, bytes } => {
+                // The forwarder (and daemon stream reader) report the pane by
+                // its STABLE id; resolve to a position before indexing the
+                // parallel vecs. After a close, positions shift, so indexing
+                // by the stale id-as-position would target the wrong pane (or
+                // drop the update entirely). A closed pane's updates are
+                // silently dropped — the forwarder will exit on its own once
+                // the killed session's PTY EOFs.
+                let Some(pane_id) = self.idx_of_pane(pane_id) else {
+                    return;
+                };
                 // Answer the agent's terminal-capability queries (OSC color,
                 // DECRQM, DA, DCS terminfo) so probing agents (opencode/OpenTUI)
                 // render instead of going blank waiting for a reply. The bytes
@@ -903,11 +947,20 @@ impl<B: Backend> App<B> {
                 }
             }
             AgentUpdate::State { pane_id, state } => {
+                let Some(pane_id) = self.idx_of_pane(pane_id) else {
+                    return;
+                };
                 if let Some(pane) = self.panes.get_mut(pane_id) {
                     pane.set_state(state);
                 }
             }
             AgentUpdate::Exit { pane_id, code } => {
+                // Resolve the stable id to a position ONCE; every parallel-vec
+                // access below uses this resolved position. If the pane is gone
+                // (closed), the exit is a no-op.
+                let Some(pane_id) = self.idx_of_pane(pane_id) else {
+                    return;
+                };
                 // Feature 8: if this pane is reconnect-eligible and still has
                 // retries left, schedule a backoff respawn instead of marking
                 // it terminal. (Reconnect is for `run --remote`, not orchestrate,
@@ -1008,13 +1061,18 @@ impl<B: Backend> App<B> {
     fn spawn_one_daemon(&mut self, spec: AgentSpec) -> usize {
         use crate::orca_daemon::DaemonError;
         let idx = self.panes.len();
+        // Stable pane id (never reused). The daemon stream reader reports
+        // `AgentUpdate`s by this id; `apply_update` resolves it back to a
+        // position via `idx_of_pane`.
+        let id = self.next_pane_id;
+        self.next_pane_id += 1;
         let name = spec.name.clone();
         let command = spec.command.clone();
         let cols = self.cols;
         let rows = self.rows;
         let session_id = format!(
             "orcatui-{}-{}",
-            idx,
+            id,
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -1032,7 +1090,7 @@ impl<B: Backend> App<B> {
             }),
         ) {
             Ok(resp) => {
-                let mut pane = Pane::new(idx, &name, cols, rows);
+                let mut pane = Pane::new(id, &name, cols, rows);
                 pane.set_state(AgentState::Running);
                 // Feed the snapshot (if any) to restore the terminal state.
                 if let Some(snap) = resp.get("snapshot").and_then(|v| v.as_str()) {
@@ -1041,9 +1099,11 @@ impl<B: Backend> App<B> {
                 self.panes.push(pane);
                 self.sessions.push(None); // no local PTY in daemon mode
                 self.daemon_session_ids.push(Some(session_id.clone()));
-                // Register in the stream reader's session map.
+                // Register the session id → stable pane id in the stream
+                // reader's map (NOT the position), so the reader's
+                // `AgentUpdate::Output { pane_id }` carries the stable id.
                 if let Some(map) = &self.daemon_session_map {
-                    map.lock().unwrap().insert(session_id, idx);
+                    map.lock().unwrap().insert(session_id, id);
                 }
             }
             Err(e) => {
@@ -1061,7 +1121,7 @@ impl<B: Backend> App<B> {
                 self.toasts.push(crate::toast::Toast::error(format!(
                     "Failed to create daemon session: {reason}"
                 )));
-                let mut pane = Pane::new(idx, &name, cols, rows);
+                let mut pane = Pane::new(id, &name, cols, rows);
                 pane.set_state(AgentState::Failed(reason));
                 self.panes.push(pane);
                 self.sessions.push(None);
@@ -1080,26 +1140,31 @@ impl<B: Backend> App<B> {
     /// Standalone-mode spawn: creates a local PTY via portable-pty.
     fn spawn_one_local(&mut self, spec: AgentSpec) -> usize {
         let idx = self.panes.len();
+        // Stable pane id (never reused); the forwarder is handed this id so an
+        // `AgentUpdate::Output` keeps targeting the right pane after positions
+        // shift on a later close. `idx` below is still the vec position.
+        let id = self.next_pane_id;
+        self.next_pane_id += 1;
         let name = spec.name.clone();
         let command = spec.command.clone();
         let cols = self.cols;
         let rows = self.rows;
         match PtySession::spawn(spec.command, Some(&self.launch_cwd), cols, rows) {
             Ok((session, rx)) => {
-                let mut pane = Pane::new(idx, &name, cols, rows);
+                let mut pane = Pane::new(id, &name, cols, rows);
                 pane.set_state(AgentState::Running);
                 self.panes.push(pane);
                 let tx = self.bus_tx.clone();
                 let _ = thread::Builder::new()
                     .name(format!("orca-bus-fwd({name})"))
-                    .spawn(move || bus::forward_session(idx, rx, tx));
+                    .spawn(move || bus::forward_session(id, rx, tx));
                 self.sessions.push(Some(session));
             }
             Err(err) => {
                 // Do NOT eprintln here — we are inside the raw-mode TUI, so a
                 // stderr write would corrupt the display. The Failed pane state
                 // below carries the error into the header + sidebar instead.
-                let mut pane = Pane::new(idx, &name, cols, rows);
+                let mut pane = Pane::new(id, &name, cols, rows);
                 pane.set_state(AgentState::Failed(format!("{err:#}")));
                 self.panes.push(pane);
                 self.sessions.push(None);
@@ -1136,12 +1201,16 @@ impl<B: Backend> App<B> {
             Some(Ok(mut client)) => {
                 let pid = client.identity().pid;
 
-                // Build the session-ID → pane-index map for the stream reader.
+                // Build the session-ID → stable-pane-id map for the stream
+                // reader. We store the pane's STABLE id (not its position `i`),
+                // so the reader's `AgentUpdate::Output { pane_id }` survives a
+                // position shift when another pane closes.
                 let session_map: Arc<Mutex<HashMap<String, usize>>> =
                     Arc::new(Mutex::new(HashMap::new()));
                 for (i, sid) in self.daemon_session_ids.iter().enumerate() {
                     if let Some(sid) = sid {
-                        session_map.lock().unwrap().insert(sid.clone(), i);
+                        let pane_id = self.panes.get(i).map(|p| p.id()).unwrap_or(i);
+                        session_map.lock().unwrap().insert(sid.clone(), pane_id);
                     }
                 }
 
@@ -1235,6 +1304,12 @@ impl<B: Backend> App<B> {
         let Some(command) = self.pane_command.get(i).cloned() else {
             return;
         };
+        // The pane already has a stable id — re-use it for the new forwarder
+        // thread so `apply_update` keeps routing to THIS pane (not whatever slid
+        // into position `i` after a close elsewhere).
+        let Some(pane_id) = self.panes.get(i).map(|p| p.id()) else {
+            return;
+        };
         let cols = self.cols;
         let rows = self.rows;
         match PtySession::spawn(command, Some(&self.launch_cwd), cols, rows) {
@@ -1247,8 +1322,8 @@ impl<B: Backend> App<B> {
                 }
                 let tx = self.bus_tx.clone();
                 let _ = thread::Builder::new()
-                    .name(format!("orca-reconnect({i})"))
-                    .spawn(move || bus::forward_session(i, rx, tx));
+                    .name(format!("orca-reconnect({pane_id})"))
+                    .spawn(move || bus::forward_session(pane_id, rx, tx));
             }
             Err(err) => {
                 // No eprintln (would corrupt the TUI); the Failed state carries it.
@@ -1331,12 +1406,14 @@ impl<B: Backend> App<B> {
             Some(Ok(mut client)) => {
                 let pid = client.identity().pid;
 
-                // Rebuild the session-ID → pane-index map.
+                // Rebuild the session-ID → stable-pane-id map (stable id, not
+                // position — see `try_connect_daemon`).
                 let session_map: Arc<Mutex<HashMap<String, usize>>> =
                     Arc::new(Mutex::new(HashMap::new()));
                 for (i, sid) in self.daemon_session_ids.iter().enumerate() {
                     if let Some(sid) = sid {
-                        session_map.lock().unwrap().insert(sid.clone(), i);
+                        let pane_id = self.panes.get(i).map(|p| p.id()).unwrap_or(i);
+                        session_map.lock().unwrap().insert(sid.clone(), pane_id);
                     }
                 }
 
@@ -3220,6 +3297,14 @@ impl<B: Backend> App<B> {
         self.reconnect_due.remove(idx);
         self.pinned.remove(idx);
         self.daemon_session_ids.remove(idx);
+        // `last_status` is a parallel Vec too — keep it in lockstep with the
+        // rest so its length never desyncs from `panes.len()`. It's lazily
+        // resized in `record_activity` (not grown at spawn), so guard the
+        // remove: when it hasn't been populated yet this is a no-op, and the
+        // next `record_activity` call resizes it to the new `panes.len()`.
+        if idx < self.last_status.len() {
+            self.last_status.remove(idx);
+        }
         // Adjust focus to the previous pane (or wrap to the last).
         if self.panes.is_empty() {
             self.mode = InputMode::Normal;
@@ -3447,6 +3532,7 @@ mod tests {
                 pane_rects: Vec::new(),
                 drag_origin: None,
                 launch_cwd: std::env::current_dir().unwrap_or_default(),
+                next_pane_id: 0,
                 tasks_repo_input: String::new(),
                 tasks_repo: None,
                 tasks_items: Vec::new(),
@@ -3475,6 +3561,131 @@ mod tests {
         assert_eq!(cell.chars, "h");
         // Pane 0 untouched.
         assert!(!app.panes[0].emulator().cell(0, 0).unwrap().has_contents());
+    }
+
+    /// Regression: closing the first pane must NOT freeze the survivor's output.
+    /// Before the stable-id fix, the survivor's forwarder kept reporting its OLD
+    /// spawn position (`pane_id: 1`); after the close, position 1 no longer
+    /// existed (the survivor had slid to position 0), so `apply_update` did
+    /// `panes.get_mut(1)` → `None` → output silently DROPPED. The survivor's
+    /// pane appeared frozen even though its agent was still producing bytes.
+    /// Also asserts `close_focused_pane` keeps ALL parallel vecs in lockstep
+    /// (the `last_status` desync was a latent sibling bug fixed alongside).
+    #[test]
+    fn close_first_pane_survivor_still_receives_output_by_stable_id() {
+        let mut app = App::for_test(vec![pane(0, "a"), pane(1, "b")]);
+        // Sanity: two panes with stable ids 0 and 1.
+        assert_eq!(app.panes.len(), 2);
+        assert_eq!(app.panes[0].id(), 0);
+        assert_eq!(app.panes[1].id(), 1);
+
+        // Populate `last_status` (lazily resized in `record_activity`) so the
+        // parallel-vec lockstep assertion below is meaningful. This also
+        // exercises the guarded-remove path in `close_focused_pane`.
+        app.record_activity();
+        assert_eq!(app.last_status.len(), app.panes.len());
+
+        // Close the focused (first) pane — the survivor (id 1) slides to pos 0.
+        app.focus = 0;
+        app.close_focused_pane();
+
+        // Survivor is now the only pane, at position 0, retaining its stable id.
+        assert_eq!(app.panes.len(), 1);
+        assert_eq!(app.panes[0].id(), 1);
+
+        // Parallel-vec consistency: every parallel Vec must now be length 1 too.
+        // (The `last_status` desync would have left it at length 2 here.)
+        assert_eq!(app.sessions.len(), app.panes.len());
+        assert_eq!(app.pane_task.len(), app.panes.len());
+        assert_eq!(app.pane_command.len(), app.panes.len());
+        assert_eq!(app.reconnect.len(), app.panes.len());
+        assert_eq!(app.reconnect_due.len(), app.panes.len());
+        assert_eq!(app.pinned.len(), app.panes.len());
+        assert_eq!(app.daemon_session_ids.len(), app.panes.len());
+        assert_eq!(app.last_status.len(), app.panes.len());
+
+        // The survivor's forwarder is still alive and reports by its STABLE id
+        // (1). `apply_update` must resolve id→position (1→0) and deliver.
+        // Before the fix this was dropped: `get_mut(1)` was out of range.
+        app.apply_update(AgentUpdate::Output {
+            pane_id: 1,
+            bytes: b"survivor-live".to_vec(),
+        });
+        let cell = app.panes[0].emulator().cell(0, 0).expect("cell");
+        assert_eq!(cell.chars, "s", "survivor received output by stable id");
+
+        // An update for the CLOSED pane's id (0) is a clean no-op (no panic,
+        // no misrouting into the survivor's pane).
+        app.apply_update(AgentUpdate::Output {
+            pane_id: 0,
+            bytes: b"ghost".to_vec(),
+        });
+        // Survivor's first cell is still the 's' from above, not 'g'.
+        assert_eq!(
+            app.panes[0].emulator().cell(0, 0).unwrap().chars,
+            "s",
+            "closed pane's update did not bleed into the survivor"
+        );
+    }
+
+    /// Regression for "when another agent is closed, the remaining (idle) agent
+    /// shows a bigger window but its content stays stale (doesn't update)."
+    ///
+    /// Hypothesis (verified): this was a SYMPTOM of the pane-id staleness bug
+    /// fixed by the stable-id routing in [`App::apply_update`] (`idx_of_pane`).
+    /// Before that fix, closing pane 0 shifted indices and the survivor's
+    /// forwarder kept reporting its OLD position; `apply_update` then dropped
+    /// the survivor's post-resize output (via `get_mut(1)` → `None`), so its
+    /// content appeared frozen. With stable-id routing the survivor's output is
+    /// delivered, and `render()` → `resize_viewport` already invalidates the
+    /// grid cache, so the content refreshes at the new size.
+    #[test]
+    fn close_pane_then_resize_survivor_content_refreshes() {
+        let mut app = App::for_test(vec![pane(0, "a"), pane(1, "b")]);
+        app.sidebar_hidden = true; // deterministic, full-width pane math
+                                   // Lay both panes out at the default 80x24 so each has a known size.
+        app.render().expect("initial render");
+
+        // Close the focused first pane. The survivor (stable id 1) is IDLE and
+        // slides to position 0, now filling the whole pane area.
+        app.focus = 0;
+        app.close_focused_pane();
+        assert_eq!(app.panes.len(), 1);
+        assert_eq!(app.panes[0].id(), 1);
+
+        // Grow the terminal and render. render() computes each pane's target
+        // size from its rect and must call resize_viewport when it changes —
+        // growing the emulator and marking the grid cache dirty.
+        let (pre_w, pre_h) = app.panes[0].size();
+        app.terminal
+            .resize(Rect::new(0, 0, 120, 40))
+            .expect("resize backend bigger");
+        app.render().expect("render after close + resize");
+        let (post_w, post_h) = app.panes[0].size();
+        assert!(
+            (post_w, post_h) > (pre_w, pre_h),
+            "survivor emulator grew after the resize: {pre_w}x{pre_h} -> {post_w}x{post_h}"
+        );
+
+        // The survivor's forwarder reports by its STABLE id (1). After the close
+        // it lives at position 0; apply_update must resolve 1 -> 0 and deliver.
+        app.apply_update(AgentUpdate::Output {
+            pane_id: 1,
+            bytes: b"after-resize-content".to_vec(),
+        });
+        app.render().expect("render after post-resize output");
+
+        // The post-resize output reached the survivor's emulator...
+        assert_eq!(
+            app.panes[0].emulator().cell(0, 0).expect("cell").chars,
+            "a",
+            "survivor received post-resize output by stable id"
+        );
+        // ...and is painted into the rendered buffer (NOT stale).
+        assert!(
+            buffer_text(&app).contains("after-resize-content"),
+            "survivor content refreshed at the new size (no stale freeze)"
+        );
     }
 
     #[test]
@@ -5124,5 +5335,180 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
         assert!(!app.zoomed);
         app.render().expect("render unzoomed");
+    }
+
+    /// Assert every parallel per-pane Vec on `App` is exactly `panes.len()`
+    /// long. A desync here is the root cause of "close freezes a survivor" and
+    /// "wrong-pane updates". `last_status` is deliberately excluded — it's
+    /// lazily grown in `record_activity` (not by `spawn_one`), so its length
+    /// legitimately lags behind; the close path guards its remove instead.
+    fn assert_parallel_lockstep(app: &App<TestBackend>) {
+        let n = app.panes.len();
+        assert_eq!(app.sessions.len(), n, "sessions out of lockstep");
+        assert_eq!(app.pane_task.len(), n, "pane_task out of lockstep");
+        assert_eq!(app.pane_command.len(), n, "pane_command out of lockstep");
+        assert_eq!(app.reconnect.len(), n, "reconnect out of lockstep");
+        assert_eq!(app.reconnect_due.len(), n, "reconnect_due out of lockstep");
+        assert_eq!(app.pinned.len(), n, "pinned out of lockstep");
+        assert_eq!(
+            app.daemon_session_ids.len(),
+            n,
+            "daemon_session_ids out of lockstep"
+        );
+    }
+
+    /// Close a pane, then spawn a fresh one. The new pane MUST receive a
+    /// brand-new stable id from the monotonic counter — never the freed id of
+    /// the closed pane. (Before stable-id routing, reusing a freed id would
+    /// route one agent's output into another's pane.) `for_test` builds panes
+    /// directly, bypassing `spawn_one`, so we advance `next_pane_id` to mirror
+    /// the real runtime where the existing ids were already issued.
+    #[test]
+    fn close_then_spawn_assigns_fresh_pane_id_from_counter() {
+        let mut app = App::for_test(vec![pane(0, "a"), pane(1, "b"), pane(2, "c")]);
+        app.next_pane_id = app.panes.len(); // 3 ids already issued → counter at 3
+                                            // Close pane 0; survivors slide to positions 0,1 carrying ids 1,2.
+        app.focus = 0;
+        app.close_focused_pane();
+        assert_eq!(app.panes.len(), 2);
+        assert_eq!(app.panes[0].id(), 1);
+        assert_eq!(app.panes[1].id(), 2);
+
+        // Spawn a new pane. Its id comes from the counter (>= 3), NOT the
+        // freed id 0 nor either surviving id (1, 2).
+        let idx = app.spawn_one(AgentSpec::from_command(vec!["bash".to_string()]));
+        let new_id = app.panes[idx].id();
+        assert!(new_id >= 3, "spawned pane got a fresh counter id: {new_id}");
+        assert_ne!(new_id, 0, "did not reuse the closed pane's freed id");
+        assert_ne!(new_id, 1, "did not collide with a surviving id");
+        assert_ne!(new_id, 2, "did not collide with a surviving id");
+        assert_eq!(
+            app.next_pane_id,
+            new_id + 1,
+            "counter advanced past the new id"
+        );
+
+        // The new pane's forwarder reports by this stable id; an Output for it
+        // must resolve to the new position (not silently drop or misroute).
+        app.apply_update(AgentUpdate::Output {
+            pane_id: new_id,
+            bytes: b"fresh-pane-live".to_vec(),
+        });
+        assert_eq!(
+            app.panes[idx].emulator().cell(0, 0).expect("cell").chars,
+            "f",
+            "new pane received output by its fresh stable id"
+        );
+        assert_parallel_lockstep(&app);
+    }
+
+    /// Closing the LAST pane (focus = len-1) exercises the
+    /// `focus >= panes.len()` clamp branch distinctly from closing the first
+    /// pane. Focus must land on the new last pane and survivors keep their ids.
+    #[test]
+    fn close_last_pane_clamps_focus_to_new_last() {
+        let mut app = App::for_test(vec![pane(0, "a"), pane(1, "b"), pane(2, "c")]);
+        app.focus = 2; // the last pane
+        app.close_focused_pane();
+        assert_eq!(app.panes.len(), 2);
+        // Survivors keep their stable ids [0, 1].
+        assert_eq!(app.panes[0].id(), 0);
+        assert_eq!(app.panes[1].id(), 1);
+        // focus was 2; after the remove panes.len()==2, so it clamps to 1.
+        assert_eq!(app.focus, 1, "focus clamped to the new last pane");
+        assert_parallel_lockstep(&app);
+    }
+
+    /// Closing every pane must fully drain the parallel vecs and reset the app
+    /// to a sane empty state (Normal mode, zoom cleared) so a later spawn or
+    /// render doesn't index into stale state.
+    #[test]
+    fn close_all_panes_empties_state_and_resets_mode() {
+        let mut app = App::for_test(vec![pane(0, "a"), pane(1, "b")]);
+        app.zoomed = true;
+        app.mode = InputMode::Pane;
+        app.focus = 0;
+        app.close_focused_pane();
+        assert_eq!(app.panes.len(), 1);
+        // Mode/zoom persist while a pane remains.
+        assert_eq!(app.mode, InputMode::Pane);
+        assert!(app.zoomed);
+        app.close_focused_pane(); // close the survivor
+        assert!(app.panes.is_empty(), "all panes closed");
+        assert!(app.sessions.is_empty(), "sessions drained");
+        assert!(app.pane_task.is_empty(), "pane_task drained");
+        assert!(
+            app.daemon_session_ids.is_empty(),
+            "daemon_session_ids drained"
+        );
+        assert_eq!(
+            app.mode,
+            InputMode::Normal,
+            "mode reset to Normal when empty"
+        );
+        assert!(!app.zoomed, "zoom flag cleared with no panes left");
+        assert_eq!(app.focus, 0);
+    }
+
+    /// Zoom mode fills the whole pane area with one pane. At a degenerate 5×2
+    /// size the inner area collapses, but `render()` must still not panic
+    /// (saturating math clamps to MIN_COLS/MIN_ROWS) and must paint something.
+    #[test]
+    fn zoom_render_at_degenerate_size_does_not_panic() {
+        let mut app = App::for_test(vec![pane(0, "solo")]);
+        app.sidebar_hidden = true; // deterministic: pane gets the full width
+        app.panes[0].feed(b"X");
+        app.zoomed = true;
+        app.terminal
+            .resize(Rect::new(0, 0, 5, 2))
+            .expect("resize backend to degenerate 5x2");
+        app.render().expect("zoom render at 5x2 must not panic");
+        let text = buffer_text(&app);
+        assert!(
+            text.chars().any(|c| !c.is_whitespace()),
+            "zoomed pane painted border/content even at degenerate 5x2"
+        );
+    }
+
+    /// Blast-radius test: a close → spawn → close sequence must keep ALL
+    /// parallel per-pane Vecs the same length at every step. A single desync
+    /// (the historical `last_status` bug) leaves stale slots that misroute
+    /// updates or panic on indexed access. `last_status` is lazily grown in
+    /// `record_activity`, so grow it first to make its close-time remove
+    /// observable, and assert it never exceeds `panes.len()`.
+    #[test]
+    fn parallel_vecs_stay_in_lockstep_across_close_spawn_close() {
+        let mut app = App::for_test(vec![pane(0, "a"), pane(1, "b"), pane(2, "c"), pane(3, "d")]);
+        app.next_pane_id = app.panes.len(); // 4 ids issued
+                                            // Grow last_status so it's a real parallel vec we can watch desync.
+        app.record_activity();
+        assert_eq!(app.last_status.len(), app.panes.len());
+
+        // Step 1: close idx 1.
+        app.focus = 1;
+        app.close_focused_pane();
+        assert_eq!(app.panes.len(), 3);
+        assert_eq!(app.last_status.len(), 3, "last_status shrunk with panes");
+        assert_parallel_lockstep(&app);
+
+        // Step 2: spawn a fresh pane (id from the counter, pushes every vec).
+        app.spawn_one(AgentSpec::from_command(vec!["bash".to_string()]));
+        assert_eq!(app.panes.len(), 4);
+        assert_parallel_lockstep(&app);
+
+        // Step 3: close idx 0 — exercises the guarded `last_status.remove`
+        // and keeps every other vec in lockstep.
+        app.focus = 0;
+        app.close_focused_pane();
+        assert_eq!(app.panes.len(), 3);
+        assert_parallel_lockstep(&app);
+        // last_status is lazily grown and guard-removed: it must NEVER exceed
+        // panes.len() (no stale slots leak through any operation sequence).
+        assert!(
+            app.last_status.len() <= app.panes.len(),
+            "last_status never outgrows panes: {} vs {}",
+            app.last_status.len(),
+            app.panes.len()
+        );
     }
 }
