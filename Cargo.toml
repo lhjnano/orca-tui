@@ -1,6 +1,6 @@
 [package]
 name = "orcatui"
-version = "0.4.3"
+version = "0.4.4"
 edition = "2021"
 description = "Terminal multi-agent coding orchestrator — TUI port of Orca GUI (stablyai/orca). Runs N coding agents side-by-side in split panes, monitored from one screen."
 license = "MIT OR Apache-2.0"
