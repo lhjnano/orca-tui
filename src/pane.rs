@@ -75,6 +75,14 @@ pub struct Pane {
     /// Active in-pane text selection (visible-grid col,row coordinates), if any.
     /// Rendered as a reverse-video highlight; extracted by [`Pane::selected_text`].
     selection: Option<Selection>,
+    /// Reused grid snapshot buffer (zero-alloc steady state). Rebuilt only when
+    /// [`Pane::grid_dirty`] is set (feed / resize / scroll change), so an idle
+    /// pane pays no per-frame snapshot cost.
+    grid_cache: Vec<Vec<EmuCell>>,
+    /// Whether [`Pane::grid_cache`] is stale and must be re-snapshotted before
+    /// the next paint. Set by [`Pane::feed`] / [`Pane::resize_viewport`] / the
+    /// scroll mutators; cleared by [`Pane::paint_grid`].
+    grid_dirty: bool,
 }
 
 impl fmt::Debug for Pane {
@@ -111,6 +119,8 @@ impl Pane {
             block: PreparedBlockState::default(),
             last_title: String::new(),
             selection: None,
+            grid_cache: Vec::new(),
+            grid_dirty: true,
         }
     }
 
@@ -140,12 +150,13 @@ impl Pane {
         // that fires mid-batch sees the previous frame, not the half-cleared one.
         let batched = self.sync_scanner.process(&clean);
         self.emu.feed(&batched);
-        // New agent output → jump back to the latest line (the conventional
-        // terminal behaviour: scrolling up then receiving output snaps you to
-        // the bottom). Without this, a user scrolled back through history would
-        // be stuck viewing old content while fresh output flows below.
+        // New agent output → the cached grid snapshot is now stale, and we jump
+        // back to the latest line (terminal convention). Without the rebuild
+        // flag the cached snapshot would paint stale content; without the
+        // scroll reset, a scrolled-back user would be stuck on old output.
         if !bytes.is_empty() {
             self.scroll = 0;
+            self.grid_dirty = true;
         }
     }
 
@@ -156,6 +167,7 @@ impl Pane {
     /// cannot reach `vt100`.
     pub fn resize_viewport(&mut self, cols: u16, rows: u16) {
         self.emu.resize(cols.max(MIN_COLS), rows.max(MIN_ROWS));
+        self.grid_dirty = true; // dimensions changed → re-snapshot
     }
 
     /// Current `(cols, rows)` viewport size.
@@ -216,16 +228,19 @@ impl Pane {
     /// Scroll back `n` lines (towards older output). Saturates; never panics.
     pub fn scroll_up(&mut self, n: usize) {
         self.scroll = self.scroll.saturating_add(n);
+        self.grid_dirty = true; // scroll offset changes the visible window
     }
 
     /// Scroll forward `n` lines (towards newer output). Clamps at 0.
     pub fn scroll_down(&mut self, n: usize) {
         self.scroll = self.scroll.saturating_sub(n);
+        self.grid_dirty = true;
     }
 
     /// Reset scroll to the latest line.
     pub fn scroll_reset(&mut self) {
         self.scroll = 0;
+        self.grid_dirty = true;
     }
 
     /// Current scroll offset (lines from the bottom). 0 = latest.
@@ -421,12 +436,18 @@ impl Pane {
         if area.width == 0 || area.height == 0 {
             return;
         }
-        // Apply the user's scroll offset (mouse-wheel / scroll API) BEFORE
-        // snapshotting the grid. vt015 clamps it to the available history, so
-        // `grid()` then returns the scrolled-back view (older lines) instead of
-        // always the live screen. `self.scroll == 0` is the normal latest view.
-        self.emu.set_scroll(self.scroll);
-        let grid = self.emu.grid();
+        // Reuse the cached grid snapshot, rebuilding ONLY when something
+        // changed (new bytes / resize / scroll). This is the hot-path
+        // optimization: an idle pane pays zero snapshot cost per frame, and the
+        // rebuild (grid_into) reuses the Vec buffer instead of reallocating.
+        // The scroll offset is applied inside the rebuild so the cached window
+        // matches the user's scroll position.
+        if self.grid_dirty {
+            self.emu.set_scroll(self.scroll);
+            self.emu.grid_into(&mut self.grid_cache);
+            self.grid_dirty = false;
+        }
+        let grid = &self.grid_cache;
         let max_rows = usize::from(area.height);
         let max_cols = usize::from(area.width);
         // Normalize the active selection once (top-left .. bottom-right) so the

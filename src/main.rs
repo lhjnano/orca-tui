@@ -7,6 +7,11 @@
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    // Install the crash-logging panic hook FIRST, before anything that can
+    // panic, so an edge-case crash (e.g. shrinking the window past a layout
+    // underflow) leaves a detailed report in last-crash.log instead of dying
+    // silently.
+    orcatui::crashlog::install();
     match orcatui::cli::run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {

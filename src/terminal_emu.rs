@@ -215,6 +215,37 @@ impl TerminalEmulator {
         out
     }
 
+    /// Snapshot the visible grid into the REUSED buffer `out` (zero new
+    /// allocation after the first call: the outer `Vec` and each row `Vec` are
+    /// resized in place, so a steady-state render doesn't churn the allocator).
+    ///
+    /// This is the zero-alloc fast path a `Pane` uses every frame — it caches
+    /// the snapshot and only re-runs this when the pane is dirty (new bytes /
+    /// resize / scroll change), so idle frames don't snapshot at all.
+    pub fn grid_into(&self, out: &mut Vec<Vec<EmuCell>>) {
+        let (rows, cols) = self.parser.screen().size();
+        let rows = usize::from(rows);
+        let cols = usize::from(cols);
+        // Resize the outer vector in place (no realloc once it's stable-sized).
+        if out.len() != rows {
+            out.resize_with(rows, || Vec::with_capacity(cols));
+        }
+        for row in 0..rows {
+            let line = &mut out[row];
+            if line.len() != cols {
+                line.resize(cols, EmuCell::default());
+            }
+            for col in 0..cols {
+                line[col] = self
+                    .parser
+                    .screen()
+                    .cell(row as u16, col as u16)
+                    .map(convert_cell)
+                    .unwrap_or_default();
+            }
+        }
+    }
+
     /// The cursor position as `(col, row)`, or `None` if the agent has hidden
     /// the cursor (ESC[?25l). Used by the pane to render a visible cursor.
     #[must_use]

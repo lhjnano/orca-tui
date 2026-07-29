@@ -18,6 +18,7 @@ pub mod cli;
 pub mod clipboard;
 pub mod config;
 pub mod coordinator;
+pub mod crashlog;
 pub mod daemon_server;
 pub mod hangul;
 pub mod integrations;

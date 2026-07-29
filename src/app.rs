@@ -631,6 +631,11 @@ impl<B: Backend> App<B> {
     /// every agent has exited. Feature 5's [`FrameScheduler`] drives the render
     /// rate (skip on backlog) and the poll timeout (idle backoff).
     fn main_loop(&mut self) -> Result<()> {
+        // Consecutive render-panic counter. A single render panic (e.g. a
+        // degenerate layout/crossterm state during a rapid window resize) is
+        // caught, logged by the crash hook, and that frame is skipped — the app
+        // keeps running. Only a PERSISTENT render failure bails out.
+        let mut render_panic_streak = 0u32;
         while !self.quit {
             // Reap FIRST: poll each still-tracked child's real exit code before
             // draining the bus. The forwarder only knows the child is "gone"
@@ -657,8 +662,33 @@ impl<B: Backend> App<B> {
             // Render only when the frame budget allows; otherwise note a skip
             // (backpressure: render the latest state next frame, never catch up).
             if self.scheduler.should_render(now) {
-                self.render()?;
-                self.scheduler.record_render(now);
+                // catch_unwind: an edge-case render panic (e.g. a transient
+                // degenerate state during a rapid window resize) is logged by
+                // the crash hook and this frame is SKIPPED instead of killing
+                // the whole app. A genuine IO error still propagates. Only
+                // persistent (≥10 in a row) render failures give up.
+                let attempted =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.render()));
+                match attempted {
+                    Ok(Ok(())) => {
+                        self.scheduler.record_render(now);
+                        render_panic_streak = 0;
+                    }
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => {
+                        render_panic_streak = render_panic_streak.saturating_add(1);
+                        self.scheduler.note_skipped();
+                        self.toasts.push(crate::toast::Toast::warning(
+                            "render skipped a frame — see last-crash.log".to_string(),
+                        ));
+                        if render_panic_streak >= 10 {
+                            return Err(anyhow::anyhow!(
+                                "render panicked {render_panic_streak} frames in a row — \
+                                 giving up (details in last-crash.log)"
+                            ));
+                        }
+                    }
+                }
             } else {
                 self.scheduler.note_skipped();
             }
@@ -3858,6 +3888,36 @@ mod tests {
         // The footer key-hints are drawn on the reserved last line.
         assert!(text.contains("Ctrl+Alt+P"), "footer rendered");
         assert!(text.contains("quit"));
+    }
+
+    #[test]
+    fn render_does_not_panic_when_terminal_shrinks_tiny() {
+        // Regression for "shrinking the window while agents run kills orcatui".
+        // Drive the terminal down to degenerate sizes and render at each — none
+        // may panic (the layout must degrade gracefully, clamping/omitting
+        // pieces instead of underflowing). Two panes so the grid math is
+        // exercised, plus a cursor + content so the paint path is too.
+        let mut app = App::for_test(vec![pane(0, "a"), pane(1, "b")]);
+        app.panes[0].feed(b"hello-world");
+        app.panes[0].set_state(AgentState::Running);
+        for (w, h) in [
+            (80, 24),
+            (50, 16),
+            (30, 10),
+            (20, 6),
+            (12, 4),
+            (8, 3),
+            (5, 2),
+            (3, 2),
+            (2, 2),
+            (1, 1),
+        ] {
+            app.terminal
+                .resize(Rect::new(0, 0, w, h))
+                .expect("resize backend");
+            app.render()
+                .unwrap_or_else(|e| panic!("render panicked at {w}x{h}: {e:#}"));
+        }
     }
 
     #[test]
