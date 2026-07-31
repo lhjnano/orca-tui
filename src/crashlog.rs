@@ -13,14 +13,21 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Where crash reports are written. `~/.local/share/orcatui/last-crash.log`,
-/// or `/tmp/orcatui-last-crash.log` if no data dir is resolvable.
-fn crash_log_path() -> PathBuf {
+/// Where crash reports are written. Each crash gets its OWN timestamped file
+/// (`crash-<unix_secs>.log`) so multiple crashes in a session are all
+/// preserved (the old `last-crash.log` only kept the most recent). A
+/// `last-crash.log` symlink/copy is also written for convenience.
+fn crash_log_paths() -> (PathBuf, PathBuf) {
     let mut base = dirs::data_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
     base.push("orcatui");
     let _ = std::fs::create_dir_all(&base);
-    base.push("last-crash.log");
-    base
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let timestamped = base.join(format!("crash-{secs}.log"));
+    let latest = base.join("last-crash.log");
+    (timestamped, latest)
 }
 
 /// Install the crash-logging panic hook. Call once at startup, before anything
@@ -46,16 +53,19 @@ pub fn install() {
              {bt}"
         );
 
-        let path = crash_log_path();
-        match std::fs::File::create(&path).and_then(|mut f| f.write_all(report.as_bytes())) {
-            Ok(()) => eprintln!(
+        let path = crash_log_paths();
+        let report_written = std::fs::File::create(&path.0)
+            .and_then(|mut f| f.write_all(report.as_bytes()))
+            .is_ok();
+        // Also copy to last-crash.log for convenience.
+        let _ = std::fs::write(&path.1, &report);
+        if report_written {
+            eprintln!(
                 "orcatui: panicked — crash log written to {}",
-                path.display()
-            ),
-            Err(e) => eprintln!(
-                "orcatui: panicked — could not write crash log to {}: {e}",
-                path.display()
-            ),
+                path.0.display()
+            )
+        } else {
+            eprintln!("orcatui: panicked — could not write crash log");
         }
         eprintln!("{report}");
 

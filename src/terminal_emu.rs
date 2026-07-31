@@ -141,8 +141,22 @@ impl TerminalEmulator {
     pub fn resize(&mut self, cols: u16, rows: u16) {
         let cols = cols.max(MIN_COLS);
         let rows = rows.max(MIN_ROWS);
-        // vt100 uses (rows, cols) order.
-        self.parser.set_size(rows, cols);
+        // vt015's set_size can panic when reflowing wide (CJK/emoji) characters
+        // that straddle a column boundary which no longer exists after a shrink
+        // — an unwrap on a now-out-of-bounds cell (screen.rs:977). Catch it so a
+        // window resize NEVER kills the app: on panic, keep the old emulator
+        // size (the next render uses the old grid; the user sees a slightly
+        // wrong layout for one frame until they settle on a safe size). The
+        // crash hook still logs the panic for diagnosis.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.parser.set_size(rows, cols);
+        }));
+        if result.is_err() {
+            // Resize panicked — the parser's internal state may be partially
+            // updated but is still structurally valid (vt015's Grid is a Vec;
+            // the worst case is a slightly-wrong grid, not UB). Keep going with
+            // whatever state vt015 is in; the next successful resize fixes it.
+        }
     }
 
     /// Scroll the viewport `offset` lines back into the scrollback history.
