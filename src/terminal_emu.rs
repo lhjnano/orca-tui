@@ -129,7 +129,14 @@ impl TerminalEmulator {
     /// Feed a chunk of raw PTY bytes (ANSI escape sequences + printable text)
     /// into the emulator, updating its in-memory cell grid.
     pub fn feed(&mut self, bytes: &[u8]) {
-        self.parser.process(bytes);
+        // vt015's process can panic when printing a wide character (CJK/emoji)
+        // whose second half lands past the last column (screen.rs:977 unwrap).
+        // Catch it so agent output (which we don't control) never kills the app;
+        // the bytes that were processed before the panic are kept, and the rest
+        // are silently dropped (the next chunk resumes normally).
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.parser.process(bytes);
+        }));
     }
 
     /// Resize the terminal. `cols` × `rows` is the new visible viewport; the
